@@ -93,6 +93,7 @@ demo/
 # a release.
 agent/tests/e2e_*.py
 agent/tests/test_e2e_*.py
+.playwright-mcp
 
 # Local working notes
 NOTES.md

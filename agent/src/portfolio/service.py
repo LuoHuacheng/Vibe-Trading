@@ -13,6 +13,48 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
+import time as _time
+
+#: testnet top-N 成交额列表的缓存 TTL（秒）—— 估值用动态 top30 而非静态白名单，
+#: 与信号循环的开仓品种保持一致。
+_TESTNET_TOP_CACHE_TTL = 600
+_TESTNET_TOP_CACHE: dict[str, Any] = {"at": 0.0, "symbols": frozenset()}
+
+#: 高价赠送币显式排除名单：testnet 给这些币"每币 1 个"的赠送仓位，
+#: 按主网价估值会把总资产抬到几十万美元（即使它们成交额不低）。
+_EXCLUDED_TESTNET_GIFTS = frozenset(
+    {"WBTC", "XAUT", "WBETH", "YFI", "PAXG", "GOLD", "ASMLB", "SNDKB"}
+)
+
+
+def _testnet_top_symbols() -> frozenset[str]:
+    """Binance testnet 当前成交额 top30 的 USDT 计价对（带短缓存）。
+
+    拉取失败时回退到静态白名单 ``MAINSTREAM_CRYPTO``，保证估值永远可用。
+    """
+    now = _time.time()
+    if now - _TESTNET_TOP_CACHE["at"] < _TESTNET_TOP_CACHE_TTL and _TESTNET_TOP_CACHE["symbols"]:
+        return _TESTNET_TOP_CACHE["symbols"]
+    try:
+        from src.trading.connectors.binance.sdk import build_config, _exchange
+
+        ex = _exchange(build_config({"profile": "paper"}))
+        tickers = ex.fetch_tickers()
+        rows = [
+            (s, t.get("quoteVolume") or 0)
+            for s, t in tickers.items()
+            if s.endswith("/USDT") and (t.get("quoteVolume") or 0) > 0
+        ]
+        rows.sort(key=lambda r: -r[1])
+        stable = {"USDC", "USDT", "FDUSD", "TUSD", "DAI", "BUSD", "EUR", "AEUR"}
+        picked = frozenset(
+            s for s, _ in rows[:30] if s.split("/")[0] not in stable
+        )
+        _TESTNET_TOP_CACHE["symbols"] = picked
+        _TESTNET_TOP_CACHE["at"] = now
+        return picked
+    except Exception:  # noqa: BLE001 — 拉取失败回退静态白名单
+        return frozenset(f"{s}/USDT" for s in MAINSTREAM_CRYPTO)
 
 from src.portfolio.config import (
     PortfolioSettingsStore,
@@ -25,6 +67,7 @@ from src.portfolio.compatibility import (
     profile_compatibility,
 )
 from src.portfolio.normalization import (
+    MAINSTREAM_CRYPTO,
     STABLECOINS,
     account_cash_usd,
     account_total_usd,
@@ -827,6 +870,7 @@ class PortfolioService:
                 longbridge_price_error = str(exc)[:160]
 
         rows = []
+        is_testnet_paper = profile.environment == "paper"
         for normalized in normalized_rows:
             quantity = _decimal(normalized["quantity"])
             if quantity == 0:
@@ -866,6 +910,22 @@ class PortfolioService:
                     price = _quote_price(quote)
                     normalized["market_price"] = _number(price) if price else None
                     normalized["price_currency"] = normalized["currency"]
+                    # Testnet 赠送币过滤：先定价再决定是否保留。价格虽镜像主网，
+                    # 仓位本身是测试赠品，估值只会虚高总资产。判定 = 动态 top30
+                    # （覆盖信号循环开仓品种）∪ 静态白名单；高价赠送币即使成交额
+                    # 高也显式排除（否则 WBTC/PAXG 的"每币 1 个"赠送仓位会把总
+                    # 资产抬到几十万美元）。
+                    if (
+                        broker in {"binance", "okx"}
+                        and is_testnet_paper
+                        and normalized["symbol"] not in MAINSTREAM_CRYPTO
+                        and (
+                            normalized["symbol"] in _EXCLUDED_TESTNET_GIFTS
+                            or f"{normalized['symbol']}/USDT" not in _testnet_top_symbols()
+                        )
+                    ):
+                        normalized["market_price"] = None
+                        normalized["pricing_basis"] = "excluded (testnet non-mainstream)"
             except Exception as exc:
                 normalized["price_error"] = str(exc)[:160]
             rows.append(normalized)

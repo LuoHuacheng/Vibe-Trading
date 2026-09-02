@@ -25,6 +25,20 @@ from src.trading.types import TradingProfile
 
 STABLECOINS = frozenset({"USDT", "USDC", "FDUSD", "TUSD", "BUSD"})
 
+#: 主网高流动性币种白名单。Binance testnet 会赠送全部币种的测试仓位
+#: （高价币各 1 个、低价币各数千），价格虽镜像主网但仓位本身是测试
+#: 赠品；testnet（paper）估值只信任这些主流币 + 稳定币的价格，其余币种
+#: 不参与定价，避免总资产被赠送仓位虚高。
+MAINSTREAM_CRYPTO = frozenset(
+    {
+        "BTC", "ETH", "SOL", "BNB", "XRP", "LINK", "SUI", "XLM", "TRX",
+        "DOGE", "ADA", "AVAX", "DOT", "LTC", "BCH", "ETC", "UNI", "AAVE",
+        "NEAR", "APT", "ARB", "OP", "TON", "PEPE", "SHIB", "INJ", "TIA",
+        "SEI", "FIL", "ATOM", "LDO", "RNDR", "FET", "TAO", "HBAR",
+        "ALGO", "VET", "ICP", "EGLD", "EOS", "XTZ", "ZEC", "DASH",
+    }
+)
+
 _TRANSPORT_AUTH = {
     "remote_mcp": ("OAuth", "automatic"),
     "local_tws": ("Local broker session", "session"),
