@@ -266,9 +266,10 @@ def last_price_usd(symbol: str, asset_class: AssetClass) -> float | None:
         return None
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=_QUOTE_WINDOW_DAYS)
+    loader_sym = loader_symbol(symbol, asset_class)
     try:
         frames = loader.fetch(
-            [symbol],
+            [loader_sym],
             start.isoformat(),
             end.isoformat(),
             interval="1D",
@@ -276,7 +277,7 @@ def last_price_usd(symbol: str, asset_class: AssetClass) -> float | None:
     except Exception as exc:  # loader / network failure → fail-closed
         logger.warning("quote fetch failed for %s via %s: %s", symbol, loader.name, exc)
         return None
-    frame = frames.get(symbol) if isinstance(frames, dict) else None
+    frame = frames.get(loader_sym) if isinstance(frames, dict) else None
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         return None
     if "close" not in frame.columns:
@@ -597,12 +598,17 @@ def check_mandate(
         )
 
     # 8. Funding (defense-in-depth; broker is the real ceiling). Only a buy can
-    #    push us past funding — never block a sell on this.
-    if intent.side == "buy" and post_exposure > caps.account_funding_usd:
+    #    push us past funding — never block a sell on this. The mirrored broker
+    #    ceiling is buying power, not bare funding: for a margin-capable mandate
+    #    (max_leverage > 1.0, e.g. crypto USDⓈ-M perps) exposure up to
+    #    funding × max_leverage is already bounded by the leverage check above
+    #    and is broker-permissible, so the 1× cash-only mirror must not veto it.
+    funding_ceiling = caps.account_funding_usd * max(1.0, caps.max_leverage)
+    if intent.side == "buy" and post_exposure > funding_ceiling:
         return _breach(
             broker=broker, remote_tool=remote_tool, intent=intent,
             kind=BREACH_KIND_QUANTITATIVE, limit="account_funding_usd",
-            limit_value=caps.account_funding_usd, attempted_value=post_exposure,
+            limit_value=funding_ceiling, attempted_value=post_exposure,
             detail="post-trade exposure exceeds mirrored funding ceiling",
         )
 
@@ -693,6 +699,21 @@ _ADV_WINDOW_DAYS = 45
 _QUOTE_WINDOW_DAYS = 10
 
 
+def loader_symbol(symbol: str, asset_class: AssetClass) -> str:
+    """Normalize a symbol to the convention the data loaders speak.
+
+    USDⓈ-M perpetual symbols carry their settlement currency as a suffix
+    (``BTC/USDT:USDT``), but the existing crypto loader chain speaks the spot
+    convention and cannot resolve the suffixed form. When the asset class is
+    CRYPTO and the symbol carries a ``:`` settlement suffix, the suffix is
+    stripped before any loader query (``BTC/USDT:USDT`` → ``BTC/USDT``, the
+    spot-proxy convention); every other symbol passes through unchanged.
+    """
+    if asset_class is AssetClass.CRYPTO and ":" in symbol:
+        return symbol.split(":", 1)[0]
+    return symbol
+
+
 def _resolve_loader(asset_class: AssetClass):
     """Return the first available data loader for ``asset_class``.
 
@@ -730,9 +751,10 @@ def avg_daily_dollar_volume(symbol: str, asset_class: AssetClass) -> float | Non
     loader = _resolve_loader(asset_class)
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=_ADV_WINDOW_DAYS)
+    loader_sym = loader_symbol(symbol, asset_class)
     try:
         frames = loader.fetch(
-            [symbol],
+            [loader_sym],
             start.isoformat(),
             end.isoformat(),
             interval="1D",
@@ -740,7 +762,7 @@ def avg_daily_dollar_volume(symbol: str, asset_class: AssetClass) -> float | Non
     except Exception as exc:  # loader / network failure → fail-closed
         logger.warning("ADV fetch failed for %s via %s: %s", symbol, loader.name, exc)
         return None
-    frame = frames.get(symbol) if isinstance(frames, dict) else None
+    frame = frames.get(loader_sym) if isinstance(frames, dict) else None
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         return None
     if "close" not in frame.columns or "volume" not in frame.columns:
