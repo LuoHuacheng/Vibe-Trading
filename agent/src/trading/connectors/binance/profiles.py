@@ -71,4 +71,34 @@ BINANCE_PROFILES: tuple[TradingProfile, ...] = (
             "orders.place.requires_mandate capability signals that requirement upstream."
         ),
     ),
+    TradingProfile(
+        id="binance-futures-paper-trade",
+        connector="binance",
+        label="Binance USDⓈ-M Testnet · ccxt Trading",
+        environment="paper",
+        transport="broker_sdk",
+        capabilities=READ_CAPABILITIES + ("orders.place",),
+        readonly=False,
+        config={"profile": "paper", "market_type": "usdm"},
+        notes=(
+            "Places and cancels orders on a Binance USDⓈ-M futures testnet account "
+            "(testnet.binancefuture.com) via ccxt. Testnet keys cannot reach the live "
+            "host, so no order from this profile can touch real funds."
+        ),
+    ),
+    TradingProfile(
+        id="binance-futures-live-trade",
+        connector="binance",
+        label="Binance USDⓈ-M Live · ccxt Trading",
+        environment="live",
+        transport="broker_sdk",
+        capabilities=READ_CAPABILITIES + ("orders.place.requires_mandate",),
+        readonly=False,
+        config={"profile": "live", "market_type": "usdm"},
+        notes=(
+            "Places and cancels orders on a Binance USDⓈ-M live account (fapi.binance.com) "
+            "via ccxt. Live order placement must be gated by the user's mandate; the "
+            "orders.place.requires_mandate capability signals that requirement upstream."
+        ),
+    ),
 )

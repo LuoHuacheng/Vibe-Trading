@@ -191,6 +191,11 @@ def build_config(profile_config: Mapping[str, Any] | None = None, overrides: Map
     ``~/.vibe-trading/binance.json``; the selected connector profile supplies the
     ``profile`` intent; CLI/tool overrides win last.
 
+    Every non-None key in ``profile_config`` is copied over the saved file the
+    same way, so a futures profile config such as ``{"profile": "paper",
+    "market_type": "usdm"}`` reaches the final BinanceConfig that
+    ``service._sdk_config`` builds from ``TradingProfile.config`` for reads and
+    order placement.
     """
     base = asdict(load_config())
     for key, value in dict(profile_config or {}).items():
