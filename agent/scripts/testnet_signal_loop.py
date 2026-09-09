@@ -156,12 +156,39 @@ def fetch_top_symbols(ex) -> list[str]:
     return picked
 
 
-def build_market_snapshot(symbols: list[str]) -> str:
+def build_market_snapshot(symbols: list[str], ex=None) -> str:
+    """逐 symbol 拉 5m K 线压缩成一行快照文本。
+
+    ex: 已 load_markets 的 ccxt 客户端。传入时直接 fetch_ohlcv（复用
+    元数据缓存，每个 symbol 只发一次 klines 请求）；否则回退
+    ``service.get_history``（每次新建客户端+重拉 exchangeInfo，慢）。
+    单 symbol 失败只跳过该行，不影响整轮。
+    """
+    if ex is not None:
+        lines = []
+        for sym in symbols:
+            try:
+                bars = ex.fetch_ohlcv(sym, timeframe="5m", limit=20)
+                if not bars:
+                    continue
+                closes = [b[4] for b in bars]
+                vol = sum(b[5] for b in bars)
+                lines.append(
+                    f"{sym}: last={closes[-1]:.4f} prev20_min={closes[0]:.4f} "
+                    f"chg%={(closes[-1]/closes[0]-1)*100:+.2f} vol20={vol:.0f}"
+                )
+            except Exception:  # noqa: BLE001 — 单币拉取失败跳过，不拖垮整轮
+                continue
+        return "\n".join(lines)
+
     from src.trading.service import get_history
 
     lines = []
     for sym in symbols:
-        h = get_history(sym, PROFILE, period="5m", limit=20)
+        try:
+            h = get_history(sym, PROFILE, period="5m", limit=20)
+        except Exception:  # noqa: BLE001
+            continue
         rows = h.get("bars") or h.get("data") or []
         if not rows:
             continue
@@ -324,7 +351,7 @@ def run_round(ex, llm, *, trade: bool, stop_loss: float, take_profit: float, tra
 
     state = load_state()
     symbols = fetch_top_symbols(ex)
-    snapshot = build_market_snapshot(symbols)
+    snapshot = build_market_snapshot(symbols, ex)
     if not snapshot:
         _log({"ts": _now(), "round": "error", "detail": "no market data"})
         return
@@ -450,7 +477,19 @@ def _selftest() -> None:
     print("selftest OK")
 
 
+# 单轮硬超时（秒）：防止单轮内任意网络/LLM 调用永久挂起拖死整个循环。
+# 必须小于轮询间隔 interval。alarm 信号会中断阻塞中的 socket 调用。
+class _RoundTimeout(Exception):
+    """单轮超过硬时限。"""
+
+
+def _round_timeout_handler(signum, frame):  # noqa: ARG001
+    raise _RoundTimeout(f"round exceeded {signum} timeout")
+
+
 def main() -> int:
+    import signal
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trade", action="store_true", help="真实下单（默认 dry-run 只记录信号）")
     parser.add_argument("--interval", type=int, default=300, help="轮询间隔秒（默认 300）")
@@ -475,14 +514,23 @@ def main() -> int:
     print(f"[signal-loop] 日志: {LOG_PATH}")
     print(f"[signal-loop] 持仓状态: {STATE_PATH}")
 
+    round_timeout = max(10, args.interval - 30)  # 预留 sleep 余量，不超 interval
+    signal.signal(signal.SIGALRM, _round_timeout_handler)
+
     try:
         for i in range(args.runs):
             try:
+                signal.alarm(round_timeout)
                 run_round(ex, llm, trade=args.trade,
                           stop_loss=args.stop_loss, take_profit=args.take_profit, trailing=args.trailing)
+            except _RoundTimeout as exc:
+                _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})
+                tg_send(f"⚠️ 第 {i + 1} 轮超时（已跳过）：{exc}")
             except Exception as exc:  # noqa: BLE001 — 单轮任何异常（网络/交易所）都不能终止循环
                 _log({"ts": _now(), "round": "error", "detail": f"round failed: {exc}"})
                 tg_send(f"⚠️ 第 {i + 1} 轮异常（已跳过）：{exc}")
+            finally:
+                signal.alarm(0)
             if i < args.runs - 1:
                 time.sleep(args.interval)
     except KeyboardInterrupt:
