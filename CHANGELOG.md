@@ -5,6 +5,43 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Binance USDⓈ-M perpetual futures trading surface** — `market_type="usdm"` on the
+  Binance connector is no longer Shadow-observation-only: two new profiles,
+  `binance-futures-paper-trade` (testnet, `testnet.binancefuture.com`) and
+  `binance-futures-live-trade` (live, gated by the existing
+  `orders.place.requires_mandate` mandate flow), place and cancel USDT-settled
+  linear-perp orders with `margin_mode` (isolated/cross), `leverage` and
+  `reduce_only`; margin presets are synced before each order (never re-applied
+  to a symbol that already carries a matching position, which Binance rejects
+  with -4067; a mismatched mode fails closed). Account/balance/position/quote/
+  open-order reads dispatch by profile so the strict USD-M Shadow observation
+  (live-readonly) keeps its exact behaviour. Mandate enforcement is reused
+  wholesale (CRYPTO instrument/asset-class bucket, daily counts, kill switch,
+  audit): perpetual symbols strip their `:USDT` settlement suffix for loader
+  liquidity/quote lookups, and the step-8 funding mirror is scaled by
+  `max(1.0, max_leverage)` so a margin-capable mandate is not vetoed by the
+  1x cash-only ceiling (cash mandates behave identically). Testnet endpoint
+  guarding and the ccxt >= 4.5.76 futures-testnet deprecation are handled
+  explicitly per environment. Live order placement is not yet exercised: the
+  enablement entry `agent/scripts/binance_futures_live_setup.py` provides
+  `status`/`check`/`activate` (with config backup)/`restore`. Spot behaviour
+  and the portfolio panel are untouched; the testnet loop (limit place ->
+  open-order read -> cancel, market open, reduce_only close, net-zero account
+  impact) was verified against the live testnet endpoint.
+
+### Fixed
+
+- Binance USD-M endpoint allowlist (`assert_exchange_endpoints`) now accepts
+  the futures testnet host for paper profiles instead of hard-coding
+  `fapi.binance.com`.
+- Futures `fetch_open_orders` without a symbol no longer surfaces ccxt's
+  stricter-rate-limit warning as a hard failure on tradable USD-M clients
+  (`fetchOpenOrders.warnWithoutSymbol=False`, documented opt-in).
+- Paper USD-M clients explicitly opt into ccxt's deprecated futures-testnet
+  sandbox gate (`disableFuturesSandboxWarning`) after host verification.
+
 ## [0.1.15] — 2026-09-09
 
 Rolls up 551 commits / 162 merged pull requests since 0.1.14, from 35
