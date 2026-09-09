@@ -34,7 +34,7 @@ from src.trading.connectors.binance.usdm import (
     DEFAULT_OBSERVATION_ABSOLUTE_TOLERANCE,
     UsdMObservationError,
     assert_exchange_endpoints,
-    read_account_observation,
+    read_account_observation as _read_usdm_observation,
 )
 
 CONFIG_FILENAME = "binance.json"
@@ -299,8 +299,34 @@ def get_account_snapshot(config: BinanceConfig | None = None) -> dict[str, Any]:
     cfg = config or load_config()
     _assert_host(cfg)
     ex = _exchange(cfg)
+    if is_usdm_shadow(cfg):
+        # Strict Shadow observation surface: signed account + position evidence.
+        return read_account_observation(cfg, ex)
     if cfg.market_type == "usdm":
-        return _get_usdm_observation(cfg, ex)
+        balance = ex.fetch_balance()
+        rows = [
+            {
+                "symbol": row["asset"],
+                "free": row["free"],
+                "used": row["used"],
+                "total": row["total"],
+            }
+            for row in _nonzero_balances(balance)
+        ]
+        equity_usd = next(
+            (row["total"] for row in rows if row["symbol"] == "USDT"),
+            None,
+        )
+        return {
+            "status": "ok",
+            "profile": cfg.profile,
+            "is_testnet": cfg.is_testnet,
+            "host": cfg.host,
+            "paper_guard": "host_separated",
+            "balances": rows,
+            "equity_usd": equity_usd,
+            "market_type": "usdm",
+        }
     balance = ex.fetch_balance()
     rows = _nonzero_balances(balance)
     return {
@@ -326,8 +352,25 @@ def get_positions(config: BinanceConfig | None = None) -> dict[str, Any]:
     cfg = config or load_config()
     _assert_host(cfg)
     ex = _exchange(cfg)
+    if is_usdm_shadow(cfg):
+        # Strict Shadow observation surface: signed account + position evidence.
+        return read_account_observation(cfg, ex)
     if cfg.market_type == "usdm":
-        return _get_usdm_observation(cfg, ex)
+        # Tradable USDⓈ-M surface: direct ccxt position rows (no spot
+        # Simple Earn / cost-basis semantics apply to futures).
+        positions = []
+        for item in _as_iter(ex.fetch_positions()):
+            row = futures_position_row(item)
+            if row is not None:
+                positions.append(row)
+        return {
+            "status": "ok",
+            "profile": cfg.profile,
+            "is_testnet": cfg.is_testnet,
+            "paper_guard": "host_separated",
+            "positions": positions,
+            "market_type": "usdm",
+        }
     balance = ex.fetch_balance()
     spot_balances = _nonzero_balances(balance)
     earn_rows: list[dict[str, Any]] = []
@@ -524,6 +567,11 @@ def get_traded_stats(
         ``{"status": "ok", "assets": [...]}``.
     """
     cfg = config or load_config()
+    if cfg.market_type == "usdm":
+        # myTrades aggregation is spot semantics only: USD-M trade history
+        # (fapi userTrades) has a different shape and is out of scope, so a
+        # futures config short-circuits to empty rather than misuse spot reads.
+        return {"status": "ok", "assets": []}
     _assert_host(cfg)
     if not assets:
         return {"status": "ok", "assets": []}
@@ -561,7 +609,7 @@ def get_open_orders(config: BinanceConfig | None = None, *, include_executions: 
     symbol, so it is also wrapped and degrades to an empty list with a note.
     """
     cfg = config or load_config()
-    _reject_unsupported_usdm_surface(cfg)
+    reject_shadow_surface(cfg)
     _assert_host(cfg)
     ex = _exchange(cfg)
     symbol_required = _symbol_required_errors()
@@ -593,12 +641,21 @@ def get_open_orders(config: BinanceConfig | None = None, *, include_executions: 
 def get_quote(symbol: str, *, config: BinanceConfig | None = None, **_: Any) -> dict[str, Any]:
     """Fetch a latest ticker snapshot for ``symbol`` (ccxt unified format)."""
     cfg = config or load_config()
-    _reject_unsupported_usdm_surface(cfg)
+    reject_shadow_surface(cfg)
     _assert_host(cfg)
     ex = _exchange(cfg)
-    clean = normalize_symbol(symbol)
+    if cfg.market_type == "usdm":
+        # Tradable USDⓈ-M surface expects a ccxt unified perp symbol
+        # (``BASE/USDT:USDT``); anything else is rejected up front.
+        clean = normalize_futures_symbol(symbol)
+        if clean is None:
+            raise BinanceConfigError(
+                f"could not resolve a USDT-settled USDⓈ-M symbol from '{symbol}'."
+            )
+    else:
+        clean = normalize_symbol(symbol)
     ticker = ex.fetch_ticker(clean)
-    return {
+    result = {
         "status": "ok",
         "symbol": clean,
         "quote": {
@@ -611,6 +668,11 @@ def get_quote(symbol: str, *, config: BinanceConfig | None = None, **_: Any) -> 
             "time": str(_obj_get(ticker, "timestamp", "")),
         },
     }
+    if cfg.market_type == "usdm":
+        # Futures consumers also read the last price at the envelope top level.
+        result["last"] = _obj_get(ticker, "last")
+        result["market_type"] = "usdm"
+    return result
 
 
 def search_instruments(
@@ -940,6 +1002,63 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def normalize_futures_symbol(symbol: str) -> str | None:
+    """Normalize a USDⓈ-M perpetual symbol to ccxt unified format.
+
+    Accepts BTC/USDT:USDT, BTC/USDT and BTC-USDT and returns the canonical
+    BTC/USDT:USDT. Only USDT-settled linear perps are supported (no COIN-M);
+    an empty or unresolvable input returns None.
+    """
+    clean = (symbol or "").strip().upper().replace("-", "/")
+    if not clean:
+        return None
+    if ":" in clean:
+        main, _, settlement = clean.partition(":")
+        if settlement != "USDT":
+            return None
+        clean = main
+    if "/" not in clean:
+        return None
+    base, quote = clean.split("/", 1)
+    if not base or "/" in quote or quote != "USDT":
+        return None
+    return f"{base}/USDT:USDT"
+
+
+def futures_position_row(row: Any) -> dict[str, Any] | None:
+    """Map one ccxt fetch_positions row to a futures trade-read row.
+
+    Fields: symbol (ccxt unified), quantity signed so a short is negative
+    (falls back to contracts signed by side), side (long/short), price and
+    mark_price from the row's mark price, plus unrealized_pnl, leverage and
+    margin_mode as reported by ccxt. Returns None when the row carries no
+    usable symbol or quantity.
+    """
+    symbol = str(_obj_get(row, "symbol") or "").strip()
+    side = str(_obj_get(row, "side") or "").strip().lower()
+    quantity = _to_float(_obj_get(row, "quantity"))
+    if quantity is None:
+        contracts = _to_float(_obj_get(row, "contracts"))
+        if contracts is None:
+            return None
+        # ccxt positions report unsigned contracts + a side; keep the quantity
+        # signed so a short position reads negative.
+        quantity = -contracts if side == "short" else contracts
+    if not symbol or not quantity:
+        return None
+    mark_price = _to_float(_obj_get(row, "markPrice"))
+    return {
+        "symbol": symbol,
+        "quantity": quantity,
+        "side": side,
+        "price": mark_price,
+        "mark_price": mark_price,
+        "unrealized_pnl": _to_float(_obj_get(row, "unrealizedPnl")),
+        "leverage": _obj_get(row, "leverage"),
+        "margin_mode": _obj_get(row, "marginMode"),
+    }
+
+
 def _reject_unsupported_usdm_surface(cfg: BinanceConfig) -> None:
     if cfg.market_type == "usdm":
         raise BinanceConfigError(
@@ -947,9 +1066,17 @@ def _reject_unsupported_usdm_surface(cfg: BinanceConfig) -> None:
         )
 
 
-def _get_usdm_observation(cfg: BinanceConfig, exchange: Any) -> dict[str, Any]:
+def read_account_observation(cfg: BinanceConfig, exchange: Any) -> dict[str, Any]:
+    """USD-M Shadow Account observation for a live-readonly (Shadow) config.
+
+    SDK-level, config-first adapter over the low-level usdm reader (imported
+    here as _read_usdm_observation): it derives the observation's source
+    profile / host / tolerance from the connector config and translates
+    incoherent-state errors into BinanceConfigError. Only the strict Shadow
+    profile (is_usdm_shadow) reaches this path.
+    """
     try:
-        return read_account_observation(
+        return _read_usdm_observation(
             exchange,
             source_profile="binance-live-sdk-readonly",
             host=cfg.host,
