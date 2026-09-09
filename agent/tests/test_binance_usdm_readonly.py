@@ -577,3 +577,31 @@ def test_paper_usdm_exchange_accepts_sandbox_testnet_host(monkeypatch) -> None:
         {"profile": "paper", "market_type": "usdm", "api_key": "k", "api_secret": "s"}
     ))
     assert ex is not None
+
+
+def test_paper_usdm_exchange_accepts_futures_sandbox_warning(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeUsdM:
+        def __init__(self, config: dict[str, object]) -> None:
+            captured["config"] = config
+            captured["sandbox"] = None
+            self.urls = {
+                "api": {
+                    "fapiPrivateV2": "https://testnet.binancefuture.com/fapi/v2",
+                    "fapiPrivateV3": "https://testnet.binancefuture.com/fapi/v3",
+                }
+            }
+
+        def set_sandbox_mode(self, enabled: bool) -> None:
+            captured["sandbox"] = enabled
+
+    monkeypatch.setattr(bn, "_require_ccxt", lambda: SimpleNamespace(binanceusdm=FakeUsdM))
+    monkeypatch.setattr(bn, "getproxies", lambda: {})
+
+    ex = bn._exchange(bn.BinanceConfig.from_mapping(
+        {"profile": "paper", "market_type": "usdm", "api_key": "k", "api_secret": "s"}
+    ))
+    assert ex is not None
+    opts = captured["config"]["options"]  # type: ignore[index]
+    assert opts["disableFuturesSandboxWarning"] is True  # type: ignore[index]

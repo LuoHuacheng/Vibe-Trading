@@ -1290,6 +1290,13 @@ def _exchange(cfg: BinanceConfig):
             "recvWindow": 10_000,
         },
     }
+    if cfg.market_type == "usdm" and cfg.is_testnet:
+        # ccxt >= 4.5.76 gates the legacy USD-M testnet host behind an explicit
+        # opt-out of its deprecation warning (t.me/ccxt_announcements/92; ccxt
+        # suggests demo trading). Paper/futures profiles target
+        # testnet.binancefuture.com, so accepting the warning is the required,
+        # documented opt-in for this supported testnet flow.
+        client_config["options"]["disableFuturesSandboxWarning"] = True
     # ``requests``/ccxt does not consistently inherit the macOS System Proxy.
     # urllib resolves both conventional proxy environment variables and the
     # active macOS network proxy, so local desktop connectors follow the same
