@@ -1,8 +1,10 @@
-"""Binance ccxt connector with host-separated spot profiles.
+"""Binance ccxt connector with host-separated spot and USD-M futures profiles.
 
-The live read-only profile may opt into ``market_type="usdm"`` for strict
-Shadow Account evidence. USD-M permits only signed account and position reads
-against ``fapi.binance.com``; all order and market-data surfaces are rejected.
+``market_type="usdm"`` is dual-purpose: under the ``live-readonly`` profile it
+is a strict Shadow Account observation surface (signed account and position
+reads against ``fapi.binance.com`` only), while under the ``paper``/``live``
+profiles it is a tradable USDⓈ-M market. Paper USD-M trades against the futures
+testnet (``testnet.binancefuture.com``); live USD-M trades on ``fapi.binance.com``.
 """
 
 from __future__ import annotations
@@ -47,6 +49,30 @@ PROFILE_ENVIRONMENTS = {
 DEFAULT_TESTNET_HOST = "https://testnet.binance.vision"
 LIVE_HOST = "https://api.binance.com"
 USDM_LIVE_HOST = "https://fapi.binance.com"
+USDM_TESTNET_HOST = "https://testnet.binancefuture.com"
+
+
+def is_usdm_shadow(cfg: BinanceConfig) -> bool:
+    """Return whether a usdm config is a strict Shadow observation profile.
+
+    market_type="usdm" is dual-purpose: live-readonly is the strict Shadow
+    Account observation surface (unchanged), while paper/live are tradable
+    USDⓈ-M surfaces. Only the Shadow combination is read-only.
+    """
+    return cfg.market_type == "usdm" and cfg.profile == "live-readonly"
+
+
+def reject_shadow_surface(cfg: BinanceConfig) -> None:
+    """Reject a Shadow-only usdm config from order and market-data surfaces.
+
+    Supersedes the old blanket _reject_unsupported_usdm_surface rejection by
+    narrowing it to the Shadow profile: tradable USDⓈ-M profiles pass.
+    """
+    if is_usdm_shadow(cfg):
+        raise BinanceConfigError(
+            "Binance USD-M Shadow Account is read-only; it observes account and "
+            "position evidence only"
+        )
 
 class BinanceDependencyError(RuntimeError):
     """Raised when the optional ``ccxt`` package is not installed."""
@@ -80,10 +106,8 @@ class BinanceConfig:
         market_type = str(payload.get("market_type") or "spot").strip().lower()
         if market_type not in {"spot", "usdm"}:
             raise BinanceConfigError("market_type must be 'spot' or 'usdm'")
-        if market_type == "usdm" and profile != "live-readonly":
-            raise BinanceConfigError(
-                "market_type 'usdm' is available only through the live-readonly profile"
-            )
+        # usdm admits any profile: live-readonly is the strict Shadow
+        # observation surface; paper/live are tradable USDⓈ-M profiles.
         raw_tolerance = payload.get("observation_absolute_tolerance")
         try:
             tolerance = float(
@@ -150,7 +174,7 @@ class BinanceConfig:
     def host(self) -> str:
         """Return the REST host this profile connects to."""
         if self.market_type == "usdm":
-            return USDM_LIVE_HOST
+            return USDM_TESTNET_HOST if self.is_testnet else USDM_LIVE_HOST
         return self.testnet_host if self.is_testnet else LIVE_HOST
 
 
@@ -985,7 +1009,13 @@ def _assert_host(cfg: BinanceConfig) -> None:
     """
     host = (urlparse(cfg.host).hostname or cfg.host or "").lower()
     if cfg.is_testnet:
-        expected = (urlparse(cfg.testnet_host).hostname or cfg.testnet_host or "").lower()
+        # Paper host expectations split by market: USD-M paper always targets the
+        # futures testnet constant (spot testnet_host must not leak in), while
+        # spot paper compares against its own configured testnet host.
+        if cfg.market_type == "usdm":
+            expected = (urlparse(USDM_TESTNET_HOST).hostname or USDM_TESTNET_HOST or "").lower()
+        else:
+            expected = (urlparse(cfg.testnet_host).hostname or cfg.testnet_host or "").lower()
         if host != expected:
             raise BinanceConfigError(
                 f"Configured profile is paper, but the resolved host '{host}' is not the testnet host '{expected}'."
