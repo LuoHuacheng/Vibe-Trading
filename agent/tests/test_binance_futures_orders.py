@@ -18,8 +18,13 @@ def _cfg(**kw):
 
 
 class FakeUsdmOrders:
-    def __init__(self):
+    def __init__(self, positions=None):
         self.calls = []
+        self.positions = positions or []
+
+    def fetch_positions(self, symbols=None):
+        self.calls.append(("fetch_positions", symbols))
+        return self.positions
 
     def set_margin_mode(self, margin_mode, symbol=None, params=None):
         self.calls.append(("set_margin_mode", margin_mode, symbol))
@@ -112,3 +117,21 @@ def test_futures_cancel_ok(fake):
     out = bn.cancel_order(_cfg(), "o1", symbol="BTC/USDT:USDT")
     assert out["status"] == "ok"
     assert ("cancel_order", "o1", "BTC/USDT:USDT") in fake.calls
+
+
+def test_futures_place_skips_margin_set_when_position_matches(fake):
+    fake.positions = [{"symbol": "BTC/USDT:USDT", "marginMode": "cross"}]
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         margin_mode="cross", leverage=5)
+    assert out["status"] == "ok"
+    assert not [c for c in fake.calls if c[0] == "set_margin_mode"]
+    assert ("set_leverage", 5, "BTC/USDT:USDT") in fake.calls
+    assert len([c for c in fake.calls if c[0] == "create_order"]) == 1
+
+
+def test_futures_place_rejects_margin_mismatch_with_position(fake):
+    fake.positions = [{"symbol": "BTC/USDT:USDT", "marginMode": "isolated"}]
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         margin_mode="cross", leverage=5)
+    assert out["status"] == "error" and "isolated" in out["error"]
+    assert not [c for c in fake.calls if c[0] == "create_order"]

@@ -605,3 +605,4 @@ def test_paper_usdm_exchange_accepts_futures_sandbox_warning(monkeypatch) -> Non
     assert ex is not None
     opts = captured["config"]["options"]  # type: ignore[index]
     assert opts["disableFuturesSandboxWarning"] is True  # type: ignore[index]
+    assert opts["fetchOpenOrders"] == {"warnWithoutSymbol": False}  # type: ignore[index]

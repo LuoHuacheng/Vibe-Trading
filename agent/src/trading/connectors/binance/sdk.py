@@ -1062,7 +1062,12 @@ def _place_usdm_order(
 
     try:
         ex = _exchange(cfg)
-        ex.set_margin_mode(margin_clean, clean_symbol)
+    except Exception as exc:  # noqa: BLE001 - host/endpoint guard failures are fail-closed
+        return {"status": "error", "error": str(exc)}
+    margin_error = _ensure_futures_margin(ex, clean_symbol, margin_clean)
+    if margin_error is not None:
+        return {"status": "error", "error": margin_error}
+    try:
         ex.set_leverage(leverage, clean_symbol)
         order = ex.create_order(clean_symbol, type_clean, side_clean, amount, price, params)
     except Exception as exc:  # noqa: BLE001 - surface any ccxt/auth/network error as fail-closed
@@ -1083,6 +1088,44 @@ def _place_usdm_order(
         "price": _obj_get(order, "price"),
         "market_type": "usdm",
     }
+
+
+def _ensure_futures_margin(ex: Any, symbol: str, margin_mode: str) -> str | None:
+    """Verify or apply the symbol margin type without tripping Binance -4067.
+
+    Binance rejects setMarginType (-4067, reported as "Position side cannot be
+    changed...") whenever the symbol already has an open position, even when the
+    requested type matches the current one. When a position exists this helper
+    verifies the position's current margin type and skips the call; only
+    position-less symbols actually call set_margin_mode. A failed position
+    read fails closed.
+    """
+    rows: list[Any] = []
+    try:
+        raw = ex.fetch_positions([symbol])
+        rows = list(_as_iter(raw))
+    except Exception:  # noqa: BLE001 - cannot verify consistency without the read
+        return "could not read existing positions to verify margin mode for " + symbol
+    current: str | None = None
+    for row in rows:
+        if str(_obj_get(row, "symbol") or "").strip().upper() != symbol.upper():
+            continue
+        mode = str(_obj_get(row, "marginMode") or "").strip().lower()
+        if mode:
+            current = mode
+            break
+    if current is not None:
+        if current != margin_mode:
+            return (
+                "symbol " + symbol + " already trades on " + current + " margin; "
+                "refusing requested " + margin_mode + ". Flatten first or pass " + current + "."
+            )
+        return None
+    try:
+        ex.set_margin_mode(margin_mode, symbol)
+    except Exception as exc:  # noqa: BLE001 - e.g. resting orders block the change
+        return "could not set margin mode " + margin_mode + " on " + symbol + ": " + str(exc)
+    return None
 
 
 def cancel_order(
@@ -1297,6 +1340,12 @@ def _exchange(cfg: BinanceConfig):
         # testnet.binancefuture.com, so accepting the warning is the required,
         # documented opt-in for this supported testnet flow.
         client_config["options"]["disableFuturesSandboxWarning"] = True
+    if cfg.market_type == "usdm" and not is_usdm_shadow(cfg):
+        # fetch_open_orders without a symbol raises a loud warning on futures
+        # (stricter rate limits). The connector deliberately calls it symbol-
+        # less and degrades symbol-required failures to a note, so acknowledge
+        # the warning explicitly on the tradable futures client.
+        client_config["options"]["fetchOpenOrders"] = {"warnWithoutSymbol": False}
     # ``requests``/ccxt does not consistently inherit the macOS System Proxy.
     # urllib resolves both conventional proxy environment variables and the
     # active macOS network proxy, so local desktop connectors follow the same
