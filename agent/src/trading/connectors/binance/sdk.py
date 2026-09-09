@@ -341,6 +341,14 @@ def get_positions(config: BinanceConfig | None = None) -> dict[str, Any]:
         for row in spot_balances
         if str(_obj_get(row, "asset", "")).upper() not in earn_wrappers
     ] + earn_rows
+    # Binance spot balances carry no cost basis, so the portfolio cannot show
+    # cost or unrealized P/L on its own. Derive a weighted-average entry price
+    # per asset from the account's own trade history; a myTrades failure
+    # degrades the row to an unknown cost instead of failing the whole read.
+    for row in rows:
+        cost = _spot_average_cost(ex, str(row.get("symbol") or ""))
+        if cost is not None:
+            row["cost_price"] = cost
     result = {
         "status": "ok",
         "profile": cfg.profile,
@@ -351,6 +359,172 @@ def get_positions(config: BinanceConfig | None = None) -> dict[str, Any]:
     if earn_note:
         result["note"] = earn_note
     return result
+
+
+#: How far back spot trade history is scanned for cost basis. Positions opened
+#: before this window (with no later fills) keep an unknown cost.
+# ponytail: 180-day/1000-trade window; fetch-and-paginate from account
+# creation if a position ever predates the window.
+_COST_BASIS_LOOKBACK_DAYS = 180
+_COST_BASIS_MAX_TRADES = 1000
+
+
+def _spot_average_cost(ex: Any, asset: str) -> float | None:
+    """Weighted-average entry price for one spot asset from trade history.
+
+    Binance spot balances do not report cost basis, so the average is rebuilt
+    from ``myTrades`` (ccxt unified trades). Sells reduce quantity at the
+    running average — the standard average-cost method — and a fully closed
+    position resets so a later re-entry starts fresh.
+
+    Args:
+        ex: The ccxt exchange client.
+        asset: The base asset, e.g. ``"UNI"``.
+
+    Returns:
+        The average entry price in the quote asset, or ``None`` when there is
+        no usable history (fresh/untraded balance, or a myTrades failure).
+    """
+    if not asset:
+        return None
+    try:
+        since = int((datetime.now(timezone.utc).timestamp() - _COST_BASIS_LOOKBACK_DAYS * 86400) * 1000)
+        trades = ex.fetch_my_trades(f"{asset}/USDT", since=since, limit=_COST_BASIS_MAX_TRADES)
+    except Exception:  # noqa: BLE001 — cost basis is best-effort, never fatal
+        return None
+    qty = 0.0
+    avg = 0.0
+    for trade in sorted(trades, key=lambda item: _obj_get(item, "timestamp", 0) or 0):
+        amount = _to_float(_obj_get(trade, "amount"))
+        price = _to_float(_obj_get(trade, "price"))
+        if not amount or not price or amount <= 0 or price <= 0:
+            continue
+        signed = amount if str(_obj_get(trade, "side", "")).lower() == "buy" else -amount
+        if signed > 0:
+            avg = price if qty <= 0 else (avg * qty + price * signed) / (qty + signed)
+            qty += signed
+        else:
+            qty = max(0.0, qty + signed)
+            if qty <= 0:
+                avg = 0.0
+    return avg if qty > 0 and avg > 0 else None
+
+
+def _spot_trade_stats(ex: Any, asset: str) -> dict[str, Any] | None:
+    """Lifetime trade statistics for one spot asset from ``myTrades``.
+
+    Buys accumulate quantity at the weighted-average cost; sells reduce
+    quantity at the running average and bank realized P/L (only when a cost
+    basis exists — gifted balances that are simply sold have none). A plain
+    sell-only history (e.g. a testnet gift being flushed) yields no cost and
+    no realized P/L.
+
+    Args:
+        ex: The ccxt exchange client.
+        asset: The base asset, e.g. ``"UNI"``.
+
+    Returns:
+        Aggregate stats, or ``None`` when the history could not be read.
+    """
+    if not asset:
+        return None
+    try:
+        since = int((datetime.now(timezone.utc).timestamp() - _COST_BASIS_LOOKBACK_DAYS * 86400) * 1000)
+        trades = ex.fetch_my_trades(f"{asset}/USDT", since=since, limit=_COST_BASIS_MAX_TRADES)
+    except Exception:  # noqa: BLE001 — trade history is best-effort, never fatal
+        return None
+    buys = 0
+    sells = 0
+    buy_amount = 0.0
+    sell_amount = 0.0
+    qty = 0.0
+    avg = 0.0
+    realized = 0.0
+    first_ts: int | None = None
+    last_ts: int | None = None
+    for trade in sorted(trades, key=lambda item: _obj_get(item, "timestamp", 0) or 0):
+        ts = _obj_get(trade, "timestamp")
+        amount = _to_float(_obj_get(trade, "amount"))
+        price = _to_float(_obj_get(trade, "price"))
+        if not amount or not price or amount <= 0 or price <= 0:
+            continue
+        first_ts = first_ts if first_ts is not None else (int(ts) if ts else None)
+        last_ts = int(ts) if ts else last_ts
+        if str(_obj_get(trade, "side", "")).lower() == "buy":
+            buys += 1
+            buy_amount += amount * price
+            avg = price if qty <= 0 else (avg * qty + price * amount) / (qty + amount)
+            qty += amount
+        else:
+            sells += 1
+            sell_amount += amount * price
+            if qty > 0 and avg > 0:
+                realized += (price - avg) * min(amount, qty)
+            qty = max(0.0, qty - amount)
+
+    def _iso(ms: int | None) -> str | None:
+        if not ms:
+            return None
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+    return {
+        "symbol": asset,
+        "trades": buys + sells,
+        "buys": buys,
+        "sells": sells,
+        "buy_amount_usd": round(buy_amount, 2),
+        "sell_amount_usd": round(sell_amount, 2),
+        "net_qty": round(qty, 8),
+        "avg_cost": round(avg, 8) if qty > 0 and avg > 0 else None,
+        "realized_pnl_usd": round(realized, 2) if buys > 0 else None,
+        "first_trade_at": _iso(first_ts),
+        "last_trade_at": _iso(last_ts),
+    }
+
+
+def get_traded_stats(
+    config: BinanceConfig | None = None,
+    assets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Aggregate spot trade statistics for a list of base assets.
+
+    A per-asset read failure degrades that asset to an empty stats row rather
+    than failing the whole call, so a rate-limit or network hiccup never
+    blanks the entire trade history panel.
+
+    Args:
+        config: Binance connector settings.
+        assets: Base assets (e.g. ``"UNI"``); ``None``/empty yields no rows.
+
+    Returns:
+        ``{"status": "ok", "assets": [...]}``.
+    """
+    cfg = config or load_config()
+    _assert_host(cfg)
+    if not assets:
+        return {"status": "ok", "assets": []}
+    ex = _exchange(cfg)
+    rows = []
+    for asset in assets:
+        if not asset:
+            continue
+        stats = _spot_trade_stats(ex, asset)
+        if stats is None:
+            stats = {
+                "symbol": asset,
+                "trades": 0,
+                "buys": 0,
+                "sells": 0,
+                "buy_amount_usd": 0.0,
+                "sell_amount_usd": 0.0,
+                "net_qty": 0.0,
+                "avg_cost": None,
+                "realized_pnl_usd": None,
+                "first_trade_at": None,
+                "last_trade_at": None,
+            }
+        rows.append(stats)
+    return {"status": "ok", "assets": rows}
 
 
 def get_open_orders(config: BinanceConfig | None = None, *, include_executions: bool = False) -> dict[str, Any]:

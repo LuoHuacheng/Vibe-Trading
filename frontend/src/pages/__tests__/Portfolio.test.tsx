@@ -24,6 +24,7 @@ vi.mock("@/lib/api", async () => {
       deleteConnection: vi.fn(),
       getPortfolioHistory: vi.fn(),
       downloadPortfolioCsv: vi.fn(),
+      getTradedAssets: vi.fn(),
     },
   };
 });
@@ -43,6 +44,7 @@ const mocked = api as unknown as {
   deleteConnection: ReturnType<typeof vi.fn>;
   getPortfolioHistory: ReturnType<typeof vi.fn>;
   downloadPortfolioCsv: ReturnType<typeof vi.fn>;
+  getTradedAssets: ReturnType<typeof vi.fn>;
 };
 
 const snapshot = {
@@ -58,7 +60,7 @@ const snapshot = {
     { broker: "binance", status: "ok" as const, total_usd: 100, total_cny: 720, position_count: 1, last_success_at: "2026-08-09T00:00:00Z", portfolio_compatibility: { level: "native" as const, contract_version: 1, asset_scope: "spot", note: "Dedicated mapping." } },
   ],
   positions: [{
-    broker: "ibkr", symbol: "AAPL", name: "Apple", asset_type: "stock", market: "US",
+    broker: "ibkr", symbol: "AAPL", name: "Apple", asset_type: "crypto", market: "US",
     currency: "USD", quantity: 2, cost_price: 100, market_price: 150,
     market_value_usd: 300, market_value_cny: 2160, unrealized_pnl_usd: 100,
     priced: true, updated_at: "2026-08-09T00:00:00Z",
@@ -70,6 +72,22 @@ const snapshot = {
 // last_success_at that is history only. It contributes nothing to the totals,
 // which is why `complete` is false while the totals stay at the readable 1000.
 const FAILED_LAST_SUCCESS = "2026-08-08T09:30:00Z";
+// A snapshot mixing one priced position (AAPL) with an unpriced one (SHIB):
+// the unpriced row has no market price, so the backend reports no value and
+// no unrealized P/L for it.
+const snapshotWithUnpriced = {
+  ...snapshot,
+  positions: [
+    ...snapshot.positions,
+    {
+      broker: "binance", symbol: "SHIB", name: "Shiba", asset_type: "crypto", market: "BINANCE",
+      currency: "USD", quantity: 100000, cost_price: null, market_price: null,
+      market_value_usd: 0, market_value_cny: 0, unrealized_pnl_usd: null,
+      priced: false, updated_at: "2026-08-09T00:00:00Z",
+    },
+  ],
+};
+
 const snapshotWithFailedSource = {
   ...snapshot,
   complete: false,
@@ -160,6 +178,7 @@ describe("Portfolio page", () => {
         },
       },
     });
+    mocked.getTradedAssets.mockResolvedValue({ status: "ok", assets: [] });
     mocked.getConnections.mockResolvedValue({
       status: "ok",
       connections: portfolioConfiguration.catalog,
@@ -191,6 +210,99 @@ describe("Portfolio page", () => {
 
     fireEvent.click(screen.getByRole("button", { name: i18n.t("portfolio.page.refreshAll") }));
     await waitFor(() => expect(mocked.refreshPortfolio).toHaveBeenCalledTimes(1));
+  });
+
+  it("renders cost and unrealized P/L for a priced holding", async () => {
+    // Distinct values so the cost cell and the P/L cell are unambiguous.
+    const pricedRow = { ...snapshot.positions[0], cost_price: 95, unrealized_pnl_usd: 150 };
+    mocked.getPortfolio.mockResolvedValue({ status: "ok", snapshot: { ...snapshot, positions: [pricedRow] } });
+    render(<Portfolio />);
+    await screen.findByText("AAPL");
+    // The priced row shows its cost basis and its unrealized P/L, not "—".
+    expect(screen.getByText("95.00")).toBeInTheDocument();
+    expect(screen.getByText("$150.00", { selector: ".text-positive" })).toBeInTheDocument();
+  });
+
+  it("hides unpriced holdings by default and shows them when toggled off", async () => {
+    mocked.getPortfolio.mockResolvedValue({ status: "ok", snapshot: snapshotWithUnpriced });
+    render(<Portfolio />);
+    await screen.findByText("AAPL");
+    // "Hide unpriced" is on by default, so the unpriced SHIB row is hidden.
+    expect(screen.queryByText("SHIB")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: i18n.t("portfolio.holdings.hideUnpriced") }));
+    expect(screen.getByText("SHIB")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: i18n.t("portfolio.holdings.hideUnpriced") }));
+    expect(screen.queryByText("SHIB")).not.toBeInTheDocument();
+  });
+
+  it("filters holdings by asset type, defaulting to crypto", async () => {
+    const stockRow = { ...snapshot.positions[0], symbol: "MSFT", asset_type: "stock" };
+    const cryptoRow = { ...snapshot.positions[0], symbol: "BTC", asset_type: "crypto" };
+    mocked.getPortfolio.mockResolvedValue({
+      status: "ok",
+      snapshot: { ...snapshot, positions: [stockRow, cryptoRow] },
+    });
+    render(<Portfolio />);
+    await screen.findByText("BTC");
+    // Default filter is crypto: only the crypto row shows.
+    expect(screen.getByText("BTC")).toBeInTheDocument();
+    expect(screen.queryByText("MSFT")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: i18n.t("portfolio.holdings.colType") }), {
+      target: { value: "all" },
+    });
+    expect(screen.getByText("MSFT")).toBeInTheDocument();
+    expect(screen.getByText("BTC")).toBeInTheDocument();
+  });
+
+  it("reloads the stored snapshot from the holdings refresh button", async () => {
+    render(<Portfolio />);
+    await screen.findByText("AAPL");
+
+    // Lightweight refresh: re-read the latest snapshot without re-pulling brokers.
+    const button = screen.getAllByRole("button", { name: i18n.t("portfolio.holdings.refresh") })[0];
+    fireEvent.click(button);
+    await waitFor(() => expect(mocked.getPortfolio).toHaveBeenCalledTimes(2));
+    expect(mocked.refreshPortfolio).not.toHaveBeenCalled();
+  });
+
+  it("lists traded assets with closed positions flagged", async () => {
+    mocked.getTradedAssets.mockResolvedValue({
+      status: "ok",
+      assets: [
+        { symbol: "TRX", trades: 4, buys: 2, sells: 2, buy_amount_usd: 999.96, sell_amount_usd: 1505.34, net_qty: 0, avg_cost: null, realized_pnl_usd: -0.45, first_trade_at: "2026-09-01T06:27:13Z", last_trade_at: "2026-09-01T07:32:15Z", closed: true, broker: "binance" },
+        { symbol: "UNI", trades: 16, buys: 14, sells: 2, buy_amount_usd: 6499.66, sell_amount_usd: 1214.61, net_qty: 1022.11, avg_cost: 5.86, realized_pnl_usd: -7.71, first_trade_at: "2026-09-01T07:32:20Z", last_trade_at: "2026-09-02T03:28:41Z", closed: false, broker: "binance" },
+      ],
+    });
+    render(<Portfolio />);
+    await screen.findByText("AAPL");
+
+    // The trade history lives on its own tab; switch to it.
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("portfolio.traded.title") }));
+
+    expect(await screen.findByText(i18n.t("portfolio.traded.closed"))).toBeInTheDocument();
+    expect(screen.getByText(i18n.t("portfolio.traded.open"))).toBeInTheDocument();
+    // Closed position sorts first, before the open one.
+    const rows = screen.getAllByRole("row");
+    const trxRow = rows.find((row) => row.textContent?.includes("TRX"));
+    const uniRow = rows.find((row) => row.textContent?.includes("UNI"));
+    expect(trxRow && uniRow ? rows.indexOf(trxRow) < rows.indexOf(uniRow) : false).toBe(true);
+  });
+
+  it("switches between holdings and trade-history tabs", async () => {
+    render(<Portfolio />);
+    await screen.findByText("AAPL");
+    // Default tab is holdings; the traded panel has not been fetched.
+    expect(mocked.getTradedAssets).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("portfolio.traded.title") }));
+    expect(await screen.findByText(i18n.t("portfolio.traded.empty"))).toBeInTheDocument();
+    expect(mocked.getTradedAssets).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("portfolio.holdings.title") }));
+    expect(screen.getByText("AAPL")).toBeInTheDocument();
   });
 
   it("keeps rendering when a legacy refresh response has a malformed source", async () => {

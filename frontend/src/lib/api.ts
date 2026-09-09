@@ -162,6 +162,27 @@ export interface PortfolioHistoryPoint {
   total_cny: string;
 }
 
+/**
+ * Lifetime trade statistics for one asset, from the broker's trade history.
+ * ``closed`` is true when the asset has no current position.
+ */
+export interface PortfolioTradedAsset {
+  symbol: string;
+  trades: number;
+  buys: number;
+  sells: number;
+  buy_amount_usd: number;
+  sell_amount_usd: number;
+  net_qty: number;
+  avg_cost?: number | null;
+  realized_pnl_usd?: number | null;
+  first_trade_at?: string | null;
+  last_trade_at?: string | null;
+  closed: boolean;
+  broker?: string;
+  market?: string;
+}
+
 export interface PortfolioRefreshState {
   running: boolean;
   current: string | null;
@@ -389,6 +410,7 @@ export const api = {
     ),
   getPortfolioHistory: (limit = 180) =>
     request<{ status: string; history: PortfolioHistoryPoint[] }>(`/api/portfolio/history?limit=${encodeURIComponent(String(limit))}`),
+  getTradedAssets: () => request<{ status: string; assets: PortfolioTradedAsset[] }>("/api/portfolio/traded-assets"),
   downloadPortfolioCsv: async () => {
     const response = await fetch(`${BASE}/api/portfolio/export.csv`, { headers: authHeaders() });
     if (!response.ok) throw await errorFromResponse(response);

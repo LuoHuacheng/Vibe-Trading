@@ -15,6 +15,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 import time as _time
 
+from src.config.paths import get_runtime_root
+
 #: testnet top-N 成交额列表的缓存 TTL（秒）—— 估值用动态 top30 而非静态白名单，
 #: 与信号循环的开仓品种保持一致。
 _TESTNET_TOP_CACHE_TTL = 600
@@ -84,6 +86,10 @@ from src.trading.types import TradingProfile
 # not (see ``src.market_data._SOURCE_PATTERNS``).
 _RISK_XRAY_MAX_SYMBOLS = 50
 PORTFOLIO_VALUATION_VERSION = 2
+
+#: Trade-history cache TTL. Served from the local DB within this window;
+#: re-pulled from Binance myTrades (concurrent, a few seconds) once stale.
+_TRADED_ASSETS_CACHE_TTL_SECONDS = 1800
 _LOADER_MARKET_SUFFIXES = frozenset({"US", "HK", "SZ", "SH", "BJ", "KS", "KQ", "NS", "BO", "TO", "V"})
 _NON_EQUITY_ASSET_TYPES = frozenset({"crypto", "stablecoin", "cash"})
 
@@ -410,6 +416,131 @@ class PortfolioService:
         }
         self.store.save_snapshot(payload)
         return payload
+
+    def traded_assets(self) -> list[dict[str, Any]]:
+        """Lifetime trade statistics per traded asset, DB-cached.
+
+        A fresh local cache is served without touching the broker; once the
+        cache is older than the TTL (or empty), the statistics are re-pulled
+        from Binance ``myTrades`` and persisted before returning.
+
+        Returns:
+            One row per traded asset; empty list when no Binance source is
+            enabled or the history cannot be read.
+        """
+        cached = self.store.load_traded_assets()
+        if cached:
+            newest = max(row.get("updated_at") or "" for row in cached)
+            try:
+                age = (
+                    datetime.now(timezone.utc) - datetime.fromisoformat(newest)
+                ).total_seconds()
+            except (ValueError, TypeError):
+                age = _TRADED_ASSETS_CACHE_TTL_SECONDS + 1
+            if age < _TRADED_ASSETS_CACHE_TTL_SECONDS:
+                return cached
+        fresh = self._collect_traded_assets()
+        if fresh:
+            self.store.save_traded_assets(fresh)
+        return fresh
+
+    def _collect_traded_assets(self) -> list[dict[str, Any]]:
+        """Pull lifetime trade statistics from the broker (no cache)."""
+        sources = self.settings_store.load().sources
+        enabled = [item for item in sources if item.enabled]
+        source = None
+        profile = None
+        for item in enabled:
+            try:
+                _, candidate = self._connection_profile(item)
+            except Exception:  # noqa: BLE001 — a broken source is skipped
+                continue
+            if candidate.connector == "binance":
+                source = item
+                profile = candidate
+                break
+        if source is None or profile is None:
+            return []
+        connection, _ = self._connection_profile(source)
+        held: set[str] = set()
+        try:
+            account_payload = self._get_account(
+                profile.id,
+                connection_id=connection.id,
+            )
+            held = {
+                str(row.get("asset") or "").upper()
+                for row in account_payload.get("balances") or []
+                if row and row.get("asset")
+            }
+        except Exception:  # noqa: BLE001 — holdings only affect the closed flag
+            pass
+        # Only pull history for assets that can possibly have fills: the
+        # signal-loop log plus current holdings whose snapshot shows a cost
+        # basis (= traded). Untraded testnet gift balances skip the per-symbol
+        # myTrades call entirely — they are rate-limit tokens, not history.
+        cost_known: set[str] = set()
+        latest = self.store.latest()
+        if latest is not None:
+            cost_known = {
+                str(row.get("symbol") or "")
+                for row in latest.get("positions", [])
+                if row.get("cost_price")
+            }
+        assets = sorted(self._traded_symbol_seed() | cost_known)
+        if not assets:
+            return []
+        try:
+            from src.trading import service as trading
+
+            payload = trading.get_traded_assets(
+                profile.id,
+                assets=assets,
+                connection_id=connection.id,
+            )
+        except Exception:  # noqa: BLE001 — the panel degrades to empty
+            return []
+        rows = []
+        for row in payload.get("assets") or []:
+            # Only assets with actual fills belong in the traded list; untraded
+            # gift balances are visible on the holdings table already.
+            if not row.get("trades"):
+                continue
+            row["closed"] = str(row.get("symbol") or "") not in held
+            row["source_id"] = source.id
+            row["profile_id"] = connection.profile_id
+            row["broker"] = profile.connector
+            row["market"] = "BINANCE"
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _traded_symbol_seed() -> set[str]:
+        """Base assets that ever appeared in the signal-loop order log.
+
+        Binance has no "all my symbols" trade-history endpoint, so the seed
+        universe comes from the testnet signal loop's own order log; the live
+        broker balance is unioned on top, catching anything traded outside the
+        loop. A missing or unreadable log simply yields an empty seed.
+        """
+        symbols: set[str] = set()
+        path = get_runtime_root() / "testnet_signal_log.jsonl"
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("status") != "order":
+                        continue
+                    symbol = str(entry.get("symbol") or "").strip().upper()
+                    base = symbol.rsplit("/", 1)[0] if "/" in symbol else symbol
+                    if base:
+                        symbols.add(base)
+        except OSError:
+            pass
+        return symbols
 
     def _failed_account(
         self,

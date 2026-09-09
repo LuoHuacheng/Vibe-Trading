@@ -1531,7 +1531,10 @@
       "colPnl": "評価損益",
       "colData": "データ",
       "priced": "評価済み",
-      "unpriced": "未評価"
+      "unpriced": "未評価",
+      "hideUnpriced": "未評価を隠す",
+      "allTypes": "すべてのタイプ",
+      "refresh": "更新"
     },
     "history": {
       "title": "資産推移",
@@ -1621,6 +1624,22 @@
       "unknownTestError": "コネクターが不明なエラーを返しました。",
       "delete": "削除",
       "configured": "必要な認証情報は設定済みです"
+    },
+    "traded": {
+      "title": "取引履歴",
+      "subtitle": "この口座で取引した全銘柄（クローズ済みを先頭に）",
+      "refresh": "更新",
+      "empty": "取引履歴はありません",
+      "colSymbol": "銘柄",
+      "colStatus": "状態",
+      "colTrades": "約定数",
+      "colBuy": "累計買い",
+      "colSell": "累計売り",
+      "colRealized": "実現損益",
+      "colLast": "最終取引",
+      "open": "保有中",
+      "closed": "クローズ済み",
+      "fillsDetail": "買 {{buys}} / 売 {{sells}}"
     }
   }
 }

@@ -1531,7 +1531,10 @@
       "colPnl": "Nicht realisierte G/V",
       "colData": "Daten",
       "priced": "Bewertet",
-      "unpriced": "Ohne Kurs"
+      "unpriced": "Ohne Kurs",
+      "hideUnpriced": "Unbewertete ausblenden",
+      "allTypes": "Alle Typen",
+      "refresh": "Aktualisieren"
     },
     "history": {
       "title": "Vermögensverlauf",
@@ -1621,6 +1624,22 @@
       "unknownTestError": "Der Connector hat einen unbekannten Fehler zurückgegeben.",
       "delete": "Löschen",
       "configured": "Erforderliche Zugangsdaten konfiguriert"
+    },
+    "traded": {
+      "title": "Handelsverlauf",
+      "subtitle": "Alle gehandelten Assets — geschlossene zuerst.",
+      "refresh": "Aktualisieren",
+      "empty": "Noch keine gehandelten Assets",
+      "colSymbol": "Symbol",
+      "colStatus": "Status",
+      "colTrades": "Ausführungen",
+      "colBuy": "Kauf gesamt",
+      "colSell": "Verkauf gesamt",
+      "colRealized": "Real. P/L",
+      "colLast": "Letzter Handel",
+      "open": "Offen",
+      "closed": "Geschlossen",
+      "fillsDetail": "{{buys}} Käufe / {{sells}} Verkäufe"
     }
   }
 }

@@ -259,6 +259,11 @@ def register_portfolio_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail="no portfolio snapshot exists")
         return {"status": "ok", "context": context}
 
+    @app.get("/api/portfolio/traded-assets", dependencies=[Depends(require_auth)])
+    def portfolio_traded_assets():
+        """Lifetime trade statistics per asset (current + closed positions)."""
+        return {"status": "ok", "assets": service().traded_assets()}
+
     @app.get("/api/portfolio/export.csv", dependencies=[Depends(require_auth)])
     def export_portfolio_csv():
         content = service().export_csv()

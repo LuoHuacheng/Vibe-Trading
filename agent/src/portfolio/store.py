@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from src.config.paths import get_runtime_root
+
+
+def _now_iso() -> str:
+    """Current UTC time as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class PortfolioStore:
@@ -49,6 +55,23 @@ class PortfolioStore:
                     rate TEXT NOT NULL,
                     fetched_at TEXT NOT NULL,
                     PRIMARY KEY (base, quote)
+                );
+                CREATE TABLE IF NOT EXISTS portfolio_traded_assets (
+                    symbol TEXT PRIMARY KEY,
+                    trades INTEGER NOT NULL,
+                    buys INTEGER NOT NULL,
+                    sells INTEGER NOT NULL,
+                    buy_amount_usd REAL NOT NULL,
+                    sell_amount_usd REAL NOT NULL,
+                    net_qty REAL NOT NULL,
+                    avg_cost REAL,
+                    realized_pnl_usd REAL,
+                    first_trade_at TEXT,
+                    last_trade_at TEXT,
+                    closed INTEGER NOT NULL,
+                    broker TEXT,
+                    market TEXT,
+                    updated_at TEXT NOT NULL
                 );
                 """)
 
@@ -229,3 +252,73 @@ class PortfolioStore:
                 (base, quote),
             ).fetchone()
         return (str(row["rate"]), str(row["fetched_at"])) if row else None
+
+    def save_traded_assets(self, rows: list[dict[str, Any]]) -> None:
+        """Upsert the per-asset trade statistics snapshot.
+
+        Rows replace the previous cache wholesale (DELETE + INSERT) so a
+        closed or vanished asset never lingers as stale data.
+
+        Args:
+            rows: Trade statistics rows as produced by
+                :meth:`src.portfolio.service.PortfolioService.traded_assets`.
+        """
+        with self._connect() as db:
+            db.execute("DELETE FROM portfolio_traded_assets")
+            db.executemany(
+                """
+                INSERT INTO portfolio_traded_assets (
+                    symbol, trades, buys, sells, buy_amount_usd, sell_amount_usd,
+                    net_qty, avg_cost, realized_pnl_usd, first_trade_at,
+                    last_trade_at, closed, broker, market, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(row["symbol"]),
+                        int(row.get("trades") or 0),
+                        int(row.get("buys") or 0),
+                        int(row.get("sells") or 0),
+                        float(row.get("buy_amount_usd") or 0),
+                        float(row.get("sell_amount_usd") or 0),
+                        float(row.get("net_qty") or 0),
+                        row.get("avg_cost"),
+                        row.get("realized_pnl_usd"),
+                        row.get("first_trade_at"),
+                        row.get("last_trade_at"),
+                        int(bool(row.get("closed"))),
+                        row.get("broker"),
+                        row.get("market"),
+                        row.get("updated_at") or _now_iso(),
+                    )
+                    for row in rows
+                ],
+            )
+
+    def load_traded_assets(self) -> list[dict[str, Any]]:
+        """Read the cached per-asset trade statistics.
+
+        Returns:
+            Rows with an ``updated_at`` ISO timestamp, empty list when the
+            table has never been populated.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT symbol, trades, buys, sells, buy_amount_usd, sell_amount_usd,
+                       net_qty, avg_cost, realized_pnl_usd, first_trade_at,
+                       last_trade_at, closed, broker, market, updated_at
+                FROM portfolio_traded_assets
+                """
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "closed": bool(row["closed"]),
+                # Cache rows keep the client shape stable but don't persist
+                # source linkage; the live pull always carries it.
+                "source_id": None,
+                "profile_id": None,
+            }
+            for row in rows
+        ]

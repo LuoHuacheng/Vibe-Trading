@@ -1531,7 +1531,10 @@
       "colPnl": "Unrealized P/L",
       "colData": "Data",
       "priced": "Priced",
-      "unpriced": "Unpriced"
+      "unpriced": "Unpriced",
+      "hideUnpriced": "Hide unpriced",
+      "allTypes": "All types",
+      "refresh": "Refresh"
     },
     "history": {
       "title": "Asset history",
@@ -1621,6 +1624,22 @@
       "unknownTestError": "The connector returned an unknown error.",
       "delete": "Delete",
       "configured": "Required credentials configured"
+    },
+    "traded": {
+      "title": "Trade history",
+      "subtitle": "Every asset this account has traded — closed positions first.",
+      "refresh": "Refresh",
+      "empty": "No traded assets yet",
+      "colSymbol": "Symbol",
+      "colStatus": "Status",
+      "colTrades": "Fills",
+      "colBuy": "Buy total",
+      "colSell": "Sell total",
+      "colRealized": "Realized P/L",
+      "colLast": "Last trade",
+      "open": "Open",
+      "closed": "Closed",
+      "fillsDetail": "{{buys}} buys / {{sells}} sells"
     }
   }
 }

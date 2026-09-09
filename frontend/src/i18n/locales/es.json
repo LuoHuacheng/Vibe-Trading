@@ -1531,7 +1531,10 @@
       "colPnl": "P/G no realizada",
       "colData": "Datos",
       "priced": "Con precio",
-      "unpriced": "Sin precio"
+      "unpriced": "Sin precio",
+      "hideUnpriced": "Ocultar sin precio",
+      "allTypes": "Todos los tipos",
+      "refresh": "Actualizar"
     },
     "history": {
       "title": "Histórico de activos",
@@ -1621,6 +1624,22 @@
       "unknownTestError": "El conector devolvió un error desconocido.",
       "delete": "Eliminar",
       "configured": "Credenciales necesarias configuradas"
+    },
+    "traded": {
+      "title": "Historial de operaciones",
+      "subtitle": "Todos los activos operados — cerrados primero.",
+      "refresh": "Actualizar",
+      "empty": "Aún no hay activos operados",
+      "colSymbol": "Símbolo",
+      "colStatus": "Estado",
+      "colTrades": "Ejecuciones",
+      "colBuy": "Compras totales",
+      "colSell": "Ventas totales",
+      "colRealized": "P/L realizado",
+      "colLast": "Última operación",
+      "open": "Abierto",
+      "closed": "Cerrado",
+      "fillsDetail": "{{buys}} compras / {{sells}} ventas"
     }
   }
 }

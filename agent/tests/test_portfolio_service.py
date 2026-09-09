@@ -649,3 +649,40 @@ def test_reconnect_contains_callback_server_system_exit(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="stopped safely"):
         _reconnect_service(tmp_path).reconnect_source("ibkr")
+
+
+def test_traded_assets_cache_roundtrip(tmp_path):
+    store = PortfolioStore(tmp_path / "portfolio.sqlite3")
+    rows = [
+        {
+            "symbol": "UNI", "trades": 16, "buys": 14, "sells": 2,
+            "buy_amount_usd": 6499.66, "sell_amount_usd": 1214.61, "net_qty": 1022.11,
+            "avg_cost": 5.86, "realized_pnl_usd": -7.71,
+            "first_trade_at": "2026-09-01T07:32:20+00:00",
+            "last_trade_at": "2026-09-02T03:28:41+00:00",
+            "closed": False, "broker": "binance", "market": "BINANCE",
+        },
+        {
+            "symbol": "TRX", "trades": 4, "buys": 2, "sells": 2,
+            "buy_amount_usd": 999.96, "sell_amount_usd": 1505.34, "net_qty": 0.0,
+            "avg_cost": None, "realized_pnl_usd": -0.45,
+            "first_trade_at": "2026-09-01T06:27:13+00:00",
+            "last_trade_at": "2026-09-01T07:32:15+00:00",
+            "closed": True, "broker": "binance", "market": "BINANCE",
+        },
+    ]
+    store.save_traded_assets(rows)
+
+    loaded = store.load_traded_assets()
+    assert len(loaded) == 2
+    by_symbol = {row["symbol"]: row for row in loaded}
+    assert by_symbol["UNI"]["closed"] is False
+    assert by_symbol["TRX"]["closed"] is True
+    assert by_symbol["UNI"]["realized_pnl_usd"] == -7.71
+    assert by_symbol["UNI"]["updated_at"]
+    # Client shape is stable whether rows come from cache or a live pull.
+    assert "source_id" in by_symbol["UNI"] and "profile_id" in by_symbol["UNI"]
+
+    # A subsequent save replaces the previous cache entirely.
+    store.save_traded_assets([rows[0]])
+    assert len(store.load_traded_assets()) == 1

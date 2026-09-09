@@ -1531,7 +1531,10 @@
       "colPnl": "未实现盈亏",
       "colData": "数据状态",
       "priced": "已定价",
-      "unpriced": "未定价"
+      "unpriced": "未定价",
+      "hideUnpriced": "隐藏未定价",
+      "allTypes": "全部类别",
+      "refresh": "刷新"
     },
     "history": {
       "title": "资产历史",
@@ -1621,6 +1624,22 @@
       "unknownTestError": "连接器返回了未知错误。",
       "delete": "删除",
       "configured": "所需凭证已配置"
+    },
+    "traded": {
+      "title": "交易记录",
+      "subtitle": "该账户交易过的全部品种，已清仓排前",
+      "refresh": "刷新",
+      "empty": "暂无交易记录",
+      "colSymbol": "品种",
+      "colStatus": "状态",
+      "colTrades": "成交笔数",
+      "colBuy": "累计买入",
+      "colSell": "累计卖出",
+      "colRealized": "已实现盈亏",
+      "colLast": "最后成交",
+      "open": "持仓中",
+      "closed": "已清仓",
+      "fillsDetail": "买 {{buys}} / 卖 {{sells}}"
     }
   }
 }

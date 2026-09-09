@@ -250,6 +250,39 @@ def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, 
     )
 
 
+def get_traded_assets(
+    profile_id: str | None = None,
+    assets: list[str] | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Aggregate spot trade statistics for a list of base assets.
+
+    Only the Binance spot SDK connector exposes lifetime trade history; other
+    connectors reject the call so the portfolio panel degrades cleanly.
+
+    Args:
+        profile_id: The connector profile id.
+        assets: Base assets to summarize (e.g. ``"UNI"``).
+        overrides: Connector config overrides (connection scoping etc.).
+
+    Returns:
+        The connector payload ``{"status": "ok", "assets": [...]}``.
+
+    Raises:
+        RuntimeError: For connectors without trade-history support.
+    """
+    profile = profile_by_id(profile_id)
+    if profile.connector == "binance" and profile.transport == "broker_sdk":
+        module = _sdk_module(profile.connector)
+        return _with_profile(
+            profile,
+            module.get_traded_stats(_sdk_config(profile, module, overrides), assets),
+        )
+    raise RuntimeError(
+        f"traded-assets history is not supported for connector '{profile.connector}'"
+    )
+
+
 def get_open_orders(
     profile_id: str | None = None,
     *,

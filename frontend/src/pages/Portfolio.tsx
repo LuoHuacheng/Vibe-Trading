@@ -25,9 +25,11 @@ import {
   type PortfolioSettings,
   type PortfolioSnapshot,
   type PortfolioSourceCatalogItem,
+  type PortfolioTradedAsset,
 } from "@/lib/api";
 import { echarts } from "@/lib/echarts";
 import { getChartTheme } from "@/lib/chart-theme";
+import { cn } from "@/lib/utils";
 import { useThemeDark } from "@/lib/theme-store";
 import i18n from "@/i18n";
 
@@ -134,6 +136,9 @@ export function Portfolio() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>("all");
+  const [assetFilter, setAssetFilter] = useState<string>("crypto");
+  const [hideUnpriced, setHideUnpriced] = useState(true);
+  const [detailTab, setDetailTab] = useState<"holdings" | "traded">("holdings");
 
   async function load() {
     setLoading(true);
@@ -152,6 +157,24 @@ export function Portfolio() {
       setError(err instanceof Error ? err.message : t("portfolio.page.errorLoad"));
     } finally {
       setLoading(false);
+    }
+  }
+
+  /**
+   * Lightweight holdings refresh: re-reads the latest stored snapshot from
+   * ``GET /api/portfolio`` without re-pulling every broker. The full
+   * ``refresh()`` below is what a manual broker refresh uses.
+   */
+  async function reloadSnapshot() {
+    setRefreshing(true);
+    setError(null);
+    try {
+      const result = await api.getPortfolio();
+      setSnapshot(result.snapshot);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("portfolio.page.errorLoad"));
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -262,10 +285,18 @@ export function Portfolio() {
     const needle = query.trim().toLowerCase();
     return [...(snapshot?.positions ?? [])]
       .filter((row) => sourceFilter === "all" || (row.source_id ?? row.broker) === sourceFilter)
+      .filter((row) => assetFilter === "all" || row.asset_type === assetFilter)
+      .filter((row) => !hideUnpriced || row.priced)
       .filter((row) => !needle || [row.broker, row.symbol, row.name, row.asset_type, row.market]
         .join(" ").toLowerCase().includes(needle))
       .sort((a, b) => (b.market_value_usd ?? 0) - (a.market_value_usd ?? 0));
-  }, [snapshot, query, sourceFilter]);
+  }, [snapshot, query, sourceFilter, assetFilter, hideUnpriced]);
+
+  // Mirrors src/portfolio/normalization.py ``normalize_position`` asset_type
+  // values, so the filter offers every type the backend can emit (stocks/ETFs
+  // from broker connectors, crypto/stablecoins from Binance/OKX), not just the
+  // types present in the current snapshot.
+  const assetTypes = ["stock", "etf", "crypto", "stablecoin"];
 
   const failedAccounts = useMemo(
     () => (snapshot?.accounts ?? []).filter((row) => row.status === "error"),
@@ -415,21 +446,53 @@ export function Portfolio() {
             </section>
 
             <section className="overflow-hidden rounded-xl border bg-card">
-              <div className="flex flex-col gap-3 border-b p-4 lg:flex-row lg:items-center lg:justify-between">
-                <div><h2 className="font-semibold">{t("portfolio.holdings.title")}</h2><p className="mt-1 text-xs text-muted-foreground">{t("portfolio.holdings.count", { count: positions.length })}</p></div>
-                <div className="relative w-full lg:w-72"><Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("portfolio.holdings.search")} aria-label={t("portfolio.holdings.search")} className="w-full rounded-md border bg-background py-2 pl-9 pr-3 text-sm" /></div>
+              <div className="flex items-center gap-1 border-b p-0.5" role="group">
+                {(["holdings", "traded"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setDetailTab(tab)}
+                    aria-pressed={detailTab === tab}
+                    className={cn(
+                      "rounded-md px-4 py-2 text-sm font-medium transition-colors",
+                      detailTab === tab
+                        ? "bg-primary/10 text-primary"
+                        : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                  >
+                    {t(tab === "holdings" ? "portfolio.holdings.title" : "portfolio.traded.title")}
+                  </button>
+                ))}
               </div>
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[1050px] text-sm">
-                  <thead className="bg-muted/40 text-left text-xs text-muted-foreground"><tr><Th>{t("portfolio.holdings.colBroker")}</Th><Th>{t("portfolio.holdings.colSymbol")}</Th><Th>{t("portfolio.holdings.colType")}</Th><Th>{t("portfolio.holdings.colQuantity")}</Th><Th>{t("portfolio.holdings.colCostPrice")}</Th><Th>{t("portfolio.holdings.colValue")}</Th><Th>{t("portfolio.holdings.colWeight")}</Th><Th>{t("portfolio.holdings.colPnl")}</Th><Th>{t("portfolio.holdings.colData")}</Th></tr></thead>
-                  <tbody className="divide-y">
-                    {positions.map((row) => {
-                      const weight = snapshot.totals.usd > 0 ? row.market_value_usd / snapshot.totals.usd : 0;
-                      return <tr key={`${row.source_id ?? row.broker}-${row.symbol}`} className="hover:bg-muted/20"><Td><div className="font-medium">{row.source_label ?? row.broker.toUpperCase()}</div><div className="mt-1 text-xs"><BrokerBadge broker={row.broker} /></div></Td><Td><div className="font-medium">{row.symbol}</div><div className="max-w-52 truncate text-xs text-muted-foreground">{row.name}</div></Td><Td><span className="capitalize text-muted-foreground">{row.asset_type}</span></Td><Td>{quantity(row.quantity)}</Td><Td><div>{price(row.cost_price)}</div><div className="text-xs text-muted-foreground">{price(row.market_price)}</div></Td><Td><div className="font-medium">{row.priced ? money(row.market_value_usd) : "—"}</div><div className="text-xs text-muted-foreground">{row.priced ? money(row.market_value_cny, "CNY") : t("portfolio.holdings.unpriced")}</div></Td><Td>{row.priced ? percentage(weight) : "—"}</Td><Td><span className={row.unrealized_pnl_usd == null ? "text-muted-foreground" : row.unrealized_pnl_usd >= 0 ? "text-positive" : "text-danger"}>{row.unrealized_pnl_usd == null ? "—" : money(row.unrealized_pnl_usd)}</span></Td><Td><DataBadge priced={row.priced} /></Td></tr>;
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              {detailTab === "holdings" ? (
+                <>
+                  <div className="flex flex-col gap-3 border-b p-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div><h2 className="font-semibold">{t("portfolio.holdings.title")}</h2><p className="mt-1 text-xs text-muted-foreground">{t("portfolio.holdings.count", { count: positions.length })}</p></div>
+                    <div className="flex w-full flex-col gap-3 lg:w-auto lg:flex-row lg:items-center">
+                      <button type="button" onClick={() => void reloadSnapshot()} disabled={refreshing || reconnectingSource !== null} aria-label={t("portfolio.holdings.refresh")} className="inline-flex items-center gap-1.5 rounded-md border bg-card px-3 py-2 text-sm transition-colors hover:bg-muted/60 disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("portfolio.holdings.refresh")}</button>
+                      <label className="flex shrink-0 cursor-pointer items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={hideUnpriced} onChange={(event) => setHideUnpriced(event.target.checked)} className="h-4 w-4 accent-primary" />{t("portfolio.holdings.hideUnpriced")}</label>
+                      <select value={assetFilter} onChange={(event) => setAssetFilter(event.target.value)} aria-label={t("portfolio.holdings.colType")} className="rounded-md border bg-background px-2 py-2 text-sm">
+                        <option value="all">{t("portfolio.holdings.allTypes")}</option>
+                        {assetTypes.map((type) => <option key={type} value={type} className="capitalize">{type}</option>)}
+                      </select>
+                      <div className="relative w-full lg:w-72"><Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("portfolio.holdings.search")} aria-label={t("portfolio.holdings.search")} className="w-full rounded-md border bg-background py-2 pl-9 pr-3 text-sm" /></div>
+                    </div>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[1050px] text-sm">
+                      <thead className="bg-muted/40 text-left text-xs text-muted-foreground"><tr><Th>{t("portfolio.holdings.colBroker")}</Th><Th>{t("portfolio.holdings.colSymbol")}</Th><Th>{t("portfolio.holdings.colType")}</Th><Th>{t("portfolio.holdings.colQuantity")}</Th><Th>{t("portfolio.holdings.colCostPrice")}</Th><Th>{t("portfolio.holdings.colValue")}</Th><Th>{t("portfolio.holdings.colWeight")}</Th><Th>{t("portfolio.holdings.colPnl")}</Th><Th>{t("portfolio.holdings.colData")}</Th></tr></thead>
+                      <tbody className="divide-y">
+                        {positions.map((row) => {
+                          const weight = snapshot.totals.usd > 0 ? row.market_value_usd / snapshot.totals.usd : 0;
+                          return <tr key={`${row.source_id ?? row.broker}-${row.symbol}`} className="hover:bg-muted/20"><Td><div className="font-medium">{row.source_label ?? row.broker.toUpperCase()}</div><div className="mt-1 text-xs"><BrokerBadge broker={row.broker} /></div></Td><Td><div className="font-medium">{row.symbol}</div><div className="max-w-52 truncate text-xs text-muted-foreground">{row.name}</div></Td><Td><span className="capitalize text-muted-foreground">{row.asset_type}</span></Td><Td>{quantity(row.quantity)}</Td><Td><div>{price(row.cost_price)}</div><div className="text-xs text-muted-foreground">{price(row.market_price)}</div></Td><Td><div className="font-medium">{row.priced ? money(row.market_value_usd) : "—"}</div><div className="text-xs text-muted-foreground">{row.priced ? money(row.market_value_cny, "CNY") : t("portfolio.holdings.unpriced")}</div></Td><Td>{row.priced ? percentage(weight) : "—"}</Td><Td><span className={row.unrealized_pnl_usd == null ? "text-muted-foreground" : row.unrealized_pnl_usd >= 0 ? "text-positive" : "text-danger"}>{row.unrealized_pnl_usd == null ? "—" : money(row.unrealized_pnl_usd)}</span></Td><Td><DataBadge priced={row.priced} /></Td></tr>;
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              ) : (
+                <TradedAssetsPanel />
+              )}
             </section>
 
             <HistoryChart history={history} />
@@ -596,6 +659,68 @@ function AllocationPie({ title, data, centerLabel, onSelect }: { title: string; 
     return () => { window.removeEventListener("resize", resize); chart.off("click", select); chart.dispose(); };
   }, [data, centerLabel, onSelect, dark, instance.language]);
   return <div className="rounded-xl border bg-card p-5"><h2 className="font-semibold">{title}</h2><div ref={ref} className="h-80 w-full" /></div>;
+}
+
+function TradedAssetsPanel() {
+  const { t } = useTranslation();
+  const [assets, setAssets] = useState<PortfolioTradedAsset[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load(mode: "initial" | "refresh") {
+    if (mode === "initial") setLoading(true);
+    else setRefreshing(true);
+    setError(null);
+    try {
+      const result = await api.getTradedAssets();
+      setAssets(result.assets ?? []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }
+
+  useEffect(() => { void load("initial"); }, []);
+
+  const rows = useMemo(() => [...assets].sort((a, b) => {
+    if (a.closed !== b.closed) return a.closed ? -1 : 1;
+    return String(b.last_trade_at ?? "").localeCompare(String(a.last_trade_at ?? ""));
+  }), [assets]);
+
+  return (
+    <>
+      <div className="flex items-center justify-end gap-3 border-b p-3">
+        <p className="mr-auto text-xs text-muted-foreground">{t("portfolio.traded.subtitle")}</p>
+        <button type="button" onClick={() => void load("refresh")} disabled={loading || refreshing} aria-label={t("portfolio.traded.refresh")} className="inline-flex items-center gap-1.5 rounded-md border bg-card px-3 py-2 text-sm transition-colors hover:bg-muted/60 disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("portfolio.traded.refresh")}</button>
+      </div>
+      {error ? <div className="px-4 py-3 text-sm text-danger">{error}</div> : null}
+      {loading ? <div className="flex h-24 items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div> : rows.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-muted-foreground">{t("portfolio.traded.empty")}</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[850px] text-sm">
+            <thead className="bg-muted/40 text-left text-xs text-muted-foreground"><tr><Th>{t("portfolio.traded.colSymbol")}</Th><Th>{t("portfolio.traded.colStatus")}</Th><Th>{t("portfolio.traded.colTrades")}</Th><Th>{t("portfolio.traded.colBuy")}</Th><Th>{t("portfolio.traded.colSell")}</Th><Th>{t("portfolio.traded.colRealized")}</Th><Th>{t("portfolio.traded.colLast")}</Th></tr></thead>
+            <tbody className="divide-y">
+              {rows.map((row) => (
+                <tr key={row.symbol} className="hover:bg-muted/20">
+                  <Td><div className="font-medium">{row.symbol}</div>{row.broker ? <div className="mt-1 text-xs"><BrokerBadge broker={row.broker} /></div> : null}</Td>
+                  <Td>{row.closed ? <span className="text-muted-foreground">{t("portfolio.traded.closed")}</span> : <span className="text-positive">{t("portfolio.traded.open")}</span>}</Td>
+                  <Td>{row.trades}<div className="text-xs text-muted-foreground">{t("portfolio.traded.fillsDetail", { buys: row.buys, sells: row.sells })}</div></Td>
+                  <Td>{money(row.buy_amount_usd)}</Td>
+                  <Td>{money(row.sell_amount_usd)}</Td>
+                  <Td><span className={row.realized_pnl_usd == null ? "text-muted-foreground" : row.realized_pnl_usd >= 0 ? "text-positive" : "text-danger"}>{row.realized_pnl_usd == null ? "—" : money(row.realized_pnl_usd)}</span></Td>
+                  <Td>{dateTime(row.last_trade_at ?? undefined)}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  );
 }
 
 function HistoryChart({ history }: { history: PortfolioHistoryPoint[] }) {
