@@ -506,3 +506,42 @@ def test_stdio_path_unchanged() -> None:
     cfg = MCPServerConfig.model_validate({"command": "uvx", "args": ["demo"]})
     transport = _build_transport(cfg)
     assert isinstance(transport, StdioTransport)
+
+
+def test_mcp_version_is_capped_below_the_strict_issuer_check() -> None:
+    """The IBKR OAuth path depends on this cap; a silent bump breaks the broker.
+
+    mcp 1.30.0 enforces RFC 8414 section 3.3 — an authorization server's
+    metadata `issuer` must equal the issuer used to build the well-known URL.
+    IBKR's official MCP server advertises the authorization server
+    ``https://api.ibkr.com/oauth2`` while its metadata (both well-known paths,
+    verified live 2026-09-08) reports ``"issuer": "https://api.ibkr.com"``, so
+    discovery raises ``OAuthFlowError`` before any token is requested and no
+    IBKR connection can be established.
+
+    ``test_ibkr_oauth_registration_uses_browser_headers`` above is the same
+    finding at the fixture level, and its fixture mirrors the live document —
+    so making it pass by editing the fixture would hide a broken broker
+    behind a green suite. This test guards the actual remedy instead.
+    """
+    import tomllib
+    from pathlib import Path
+
+    from packaging.requirements import Requirement
+
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    dependencies = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "dependencies"
+    ]
+    caps = [
+        Requirement(entry)
+        for entry in dependencies
+        if Requirement(entry).name == "mcp"
+    ]
+    assert caps, "the mcp cap is gone from pyproject dependencies"
+    assert not caps[0].specifier.contains("1.30.0"), (
+        f"mcp 1.30.0 satisfies {caps[0]}; IBKR OAuth discovery fails on it"
+    )
+    assert caps[0].specifier.contains("1.29.1"), (
+        f"{caps[0]} excludes the last working version"
+    )

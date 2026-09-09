@@ -10,7 +10,7 @@ import pytest
 from src.core import runner as runner_mod
 from src.core.runner import (
     Runner,
-    _make_rlimit_preexec,
+    _rlimit_bootstrap_argv,
     _prepare_sandbox_home,
     _resolve_sandbox_credentials,
 )
@@ -240,12 +240,107 @@ def test_prepare_sandbox_home_preseeds_mootdx_config(tmp_path: Path) -> None:
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def test_make_rlimit_preexec_returns_callable_on_posix() -> None:
-    # Structural check only — the returned closure mutates *this* process's
-    # rlimits if called directly, so it must never be invoked in-process here;
-    # test_execute_* below already exercises it end-to-end via a real fork.
-    preexec = _make_rlimit_preexec()
-    assert preexec is None or callable(preexec)
+def test_rlimit_bootstrap_argv_shape_on_posix() -> None:
+    # Structural check only; test_execute_applies_address_space_rlimit below
+    # proves the ceiling really lands, end-to-end through a real exec.
+    argv = _rlimit_bootstrap_argv()
+    if runner_mod.resource is None:
+        assert argv is None
+        return
+    assert argv[0] == "-c"
+    assert argv[1] == runner_mod._SANDBOX_RLIMIT_BOOTSTRAP
+    # The two ceilings are resolved in the parent and passed as literal argv,
+    # so the child never re-parses the env.
+    assert int(argv[2]) == runner_mod._rlimit_as_bytes()
+    assert int(argv[3]) == runner_mod._SANDBOX_RLIMIT_NOFILE
+
+
+def test_rlimit_bootstrap_is_valid_python() -> None:
+    import ast
+
+    ast.parse(runner_mod._SANDBOX_RLIMIT_BOOTSTRAP)
+
+
+def test_execute_never_passes_preexec_fn(monkeypatch, tmp_path: Path) -> None:
+    """#1355: preexec_fn runs Python bytecode in the forked child of a
+    multi-threaded parent (``vibe-trading serve``), which POSIX leaves
+    undefined and which SIGSEGVs on aarch64/glibc 2.34. The rlimit ceiling must
+    reach the child through the exec'd bootstrap instead, never through a fork
+    callback."""
+    seen: list[dict] = []
+    real_run = runner_mod.subprocess.run
+
+    def _spy_run(cmd, **kwargs):
+        seen.append({"cmd": list(cmd), "kwargs": dict(kwargs)})
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", _spy_run)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    entry = _probe_entry(tmp_path, "print('no-preexec')\n")
+
+    result = Runner(timeout=60).execute(entry, run_dir, cwd=tmp_path)
+
+    assert result.success, result.stderr
+    assert "no-preexec" in result.stdout
+    assert seen, "subprocess.run was never called"
+    assert all("preexec_fn" not in call["kwargs"] for call in seen)
+    if runner_mod.resource is not None:
+        # ...and the ceiling is genuinely still requested, so a future patch
+        # cannot satisfy this test by simply dropping the sandbox limits.
+        launch = seen[-1]["cmd"]
+        assert "-c" in launch
+        assert launch[launch.index("-c") + 1] == runner_mod._SANDBOX_RLIMIT_BOOTSTRAP
+
+
+def test_execute_bootstrap_preserves_argv_and_script_dir(tmp_path: Path) -> None:
+    # The -c wrapper must be transparent to the entry script: argv[0] is the
+    # script, argv[1:] are the caller's cli_args, __name__ is "__main__", and
+    # the script's own directory is importable exactly as with `python x.py`.
+    # The script lives in its OWN directory, NOT in cwd — otherwise the `-c`
+    # interpreter already has cwd on sys.path and the sibling import would
+    # succeed even if the bootstrap never added the script dir at all.
+    script_dir = tmp_path / "strategy"
+    script_dir.mkdir()
+    (script_dir / "sibling_mod.py").write_text(
+        "VALUE = 'imported-from-script-dir'\n", encoding="utf-8"
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    entry = _probe_entry(
+        script_dir,
+        "import sys\n"
+        "import sibling_mod\n"
+        "print('name=' + __name__)\n"
+        "print('argv0=' + sys.argv[0])\n"
+        "print('rest=' + ','.join(sys.argv[1:]))\n"
+        "print('sibling=' + sibling_mod.VALUE)\n",
+    )
+
+    result = Runner(timeout=60).execute(
+        entry, run_dir, cwd=tmp_path, cli_args=["--alpha", "7"]
+    )
+
+    assert result.success, result.stderr
+    out = result.stdout
+    assert "name=__main__" in out
+    assert f"argv0={entry}" in out
+    assert "rest=--alpha,7" in out
+    assert "sibling=imported-from-script-dir" in out
+
+
+def test_execute_bootstrap_propagates_nonzero_exit(tmp_path: Path) -> None:
+    # A failing strategy must still surface its own exit code and traceback,
+    # not be swallowed or remapped by the bootstrap.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    entry = _probe_entry(tmp_path, "import sys\nsys.exit(3)\n")
+
+    result = Runner(timeout=60).execute(entry, run_dir, cwd=tmp_path)
+
+    assert not result.success
+    assert result.exit_code == 3
 
 
 def test_rlimit_as_bytes_respects_env_override(monkeypatch) -> None:
@@ -334,7 +429,7 @@ def test_execute_retries_without_uid_drop_when_drop_fails(
 
 @pytest.mark.skipif(runner_mod.resource is None, reason="POSIX resource module required")
 def test_execute_applies_address_space_rlimit(monkeypatch, tmp_path: Path) -> None:
-    # Prove the preexec_fn actually ran in the child by reading back its
+    # Prove the exec'd bootstrap actually applied the limits by reading back
     # RLIMIT_NOFILE (RLIMIT_AS is a no-op on macOS but NOFILE is portable).
     import resource as _resource
 

@@ -30,11 +30,30 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from src.market_data import canonical_fx_pair
+
+from src.agent.resolution_context import (
+    IdentityConstraint,
+    ResolutionContext,
+    candidate_market,
+)
 
 
 GROUNDING_ARTIFACT = "grounding_evidence.json"
 
 _RESOLVER_TOOL = "search_symbol"
+
+# Tools whose successful completion can ground backtest/analysis metric claims
+# (#1336). Success alone is not authority: only results that actually carried
+# metric output (parsed from the result or its run-dir artifacts) raise
+# ``analysis_claim_unavailable``. A deduplicated ("skipped") call is never a
+# completion.
+_ANALYSIS_TOOLS = frozenset(
+    {"backtest", "factor_analysis", "run_shadow_backtest", "quantlib_call"}
+)
+# Tools whose run produces the equity/regime windows behind a categorical
+# "all N-month windows were profitable" statement.
+_ANALYSIS_WINDOW_TOOLS = frozenset({"backtest", "run_shadow_backtest"})
 _PRIVATE_COMPANY_SKILL_NAMES = {
     "private-company",
     "private-company-analysis",
@@ -155,11 +174,66 @@ _GENERIC_PRICE_FIELD_ALIASES = {
 # Project-style canonical symbols. A bare model-generated ticker is still
 # checked when it appears under a symbol argument key, but it is not accepted
 # as user-provided identity because it lacks venue information.
+#
+# A joined crypto pair (``BTCUSDT``, ``ETHUSDT`` …) is recognized alongside
+# the dashed/slashed form so a user message like ``Get BTCUSDT spot price``
+# seeds an asserted identity and the asserted-symbol conflict check at
+# ``_ingest_resolution`` runs against it. The base is restricted to alpha
+# so a numeric prefix cannot masquerade as a joined pair, and the suffix
+# list is the unambiguous stablecoin set (``USDT`` / ``USDC`` / ``BUSD`` /
+# ``TUSD``) — ``USD`` is excluded because too many non-crypto strings end
+# in those three letters and over-matching would lock the wrong identity.
+_JOINED_CRYPTO_QUOTE_SUFFIXES = ("USDT", "USDC", "BUSD", "TUSD")
+# A dashed / slashed pair is crypto when its quote leg is unambiguously a
+# crypto quote asset, or when a USD quote sits on one of these bases. Both
+# sets MUST agree with ``_CRYPTO_QUOTE_ASSETS`` / ``_CRYPTO_USD_BASES`` in
+# ``src.tools.symbol_search_tool`` — that module is the resolver, and a venue
+# inferred here that disagrees with the identity it locks is a contradictory
+# identity, which outranks every later lock and blocks all market tools. The
+# tool imports this module, so the sets are duplicated rather than imported;
+# ``test_crypto_pair_tables_match_the_resolver`` fails if they drift. ``USD``
+# is the one quote the resolver accepts that is NOT unambiguous, so it is
+# excluded here and decided by the base whitelist below instead.
+_CRYPTO_QUOTE_ASSETS = frozenset(
+    {"USDT", "USDC", "BUSD", "TUSD", "FDUSD", "BTC", "ETH", "BNB"}
+)
+_CRYPTO_USD_BASES = frozenset(
+    {
+        "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "TRX", "DOT",
+        "MATIC", "AVAX", "LINK", "LTC", "BCH", "ETC", "XLM", "ATOM",
+        "FIL", "APT", "NEAR", "ALGO", "SAND", "MANA", "AXS", "XAUT",
+        "PAXG",
+    }
+)
+# Spot precious metals quoted in USD collide with the TUSD suffix: XPTUSD is
+# XPT + USD (platinum), but stripping "TUSD" leaves the alpha base "XP" and
+# folds it to XP-TUSD — a crypto pair that does not exist, and the same class
+# of misresolution the USD exclusion above exists to prevent. XAU/XAG/XPD do
+# not collide today; they are listed together because they are the same kind
+# of symbol and a future suffix would collide with them the same way.
+_METAL_USD_PAIR_RE = re.compile(r"^(?:XAU|XAG|XPT|XPD)USD$", re.IGNORECASE)
+_JOINED_CRYPTO_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z]{2,15}(?:" + "|".join(_JOINED_CRYPTO_QUOTE_SUFFIXES) + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _CANONICAL_SYMBOL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"\d{3,6}\.(?:SH|SZ|BJ|SS|HK|KS|KQ)|"
+    # Futu writes the venue as a PREFIX (HK.00700 / SH.600519 / US.AAPL). The
+    # suffix branch above cannot see it, so a user who pasted a connector code
+    # got no identity lock at all and every market tool answered
+    # identity_required. Handled for the whole prefix set, not just HK: the
+    # connector emits all four, and one venue's fix leaves the same hole open
+    # in the next.
+    r"(?:HK|SH|SZ|BJ|SS)\.\d{3,6}|"
+    # Case-SENSITIVE (the connector writes it uppercase): a case-folded
+    # match turns any "…/us.reuters/…" host inside a source URL into the
+    # symbol REUTERS.US and fails the answer for an unsourced figure.
+    r"(?-i:US\.[A-Z][A-Z0-9&-]{0,19})|"
     r"[A-Z][A-Z0-9&.-]{0,19}\.(?:US|NS|BO|FX|TO|V)|"
     r"[A-Z0-9]{2,15}(?:-|/)(?:USDT|USDC|USD|BTC|ETH)|"
+    r"[A-Z]{2,15}(?:" + "|".join(_JOINED_CRYPTO_QUOTE_SUFFIXES) + r")|"
+    r"\^[A-Z0-9&.\-]{1,20}|"
     r"[A-Z0-9]{2,15}=[FX]"
     r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
@@ -179,17 +253,157 @@ _PRIVATE_ASSERTION_RE = re.compile(
     r"(?:是|仍是|属于)(?:一家)?(?:私人|私营|非上市)公司|未上市|没有上市)",
     re.IGNORECASE,
 )
+# The bare verbs below are present tense only, which is not how an answer
+# actually states an observed price: "closed at 412.35" and "last traded at
+# 412.35" are the ordinary spellings and neither matches \bclose\b or
+# \btrade\b. Chinese 收盘 / 现价 match, so the gate was strictly leakier in
+# English than in Chinese — a fabricated USD price in the most natural
+# phrasing walked straight through while its Chinese translation was caught.
+# The past-tense forms are required to be followed by "at" so that reporting
+# volume ("traded 1.2M shares") or a corporate event ("the deal closed at a
+# 30% premium" — a percentage, already masked) is not read as a quote.
+_PRICE_VERB_PAST_RE = r"\b(?:closed|opened|traded|quoted|priced|settled|fixed)\s+at\b"
 _PRICE_CONTEXT_RE = re.compile(
     r"(?:\b(?:opening|open|high|low|closing|close|price|quote)\b|"
+    + _PRICE_VERB_PAST_RE + r"|"
     r"\b(?:entry|buy|target|support|resistance)\s+(?:price|level)\b|"
     r"开盘价?|最高价?|最低价?|收盘价?|买入价|入场价|目标价|支撑位?|阻力位?|"
+    # Chinese had the mirror-image gap: these four are as ordinary as 收盘价
+    # and none of them matched, so a fabricated 成交价 / 股价 walked through
+    # exactly the way "closed at" did in English.
+    r"成交价|最新价|股价|收报|"
     r"现价|报价|价格|价位)",
+    re.IGNORECASE,
+)
+_ANALYSIS_METRIC_RE = re.compile(
+    r"(?:\breturn vol(?:atility)?\b|\bmax(?: |\.)?drawdown\b|\bmaxdd\b|"
+    r"\bsharpe(?: ratio)?\b|\bwin rate\b|\bhit rate\b|"
+    r"\bprob(?:ability)?\.?\s+of\b|\bvolatility\b|\bdrawdown\b|"
+    r"\bannualiz\w*\b|\bwindow(?:s)?\b|\bregime(?:s)?\b|"
+    r"\b(?:annual|cumulative|total)\s+return\b|"
+    r"夏普|回撤|波动率|胜率|命中率|概率|年化|回测|窗口|收益(?:率)?|回报(?:率)?)",
+    re.IGNORECASE,
+)
+# Phrases that indicate a figure is attributed to an external source rather
+# than model memory (paper restatement, #1338 review). Attributing a number
+# to a named source is the opposite of an unsourced claim. The subject list
+# is deliberately restricted to sources that cannot be this run's own output
+# (papers, studies, analysts, filings): "the backtest reports" / "the data
+# shows" is exactly how a model dresses up its own numbers (#1336), so
+# data/backtest/strategy/report subjects do NOT count.
+_ATTRIBUTION_RE = re.compile(
+    r"(?:"
+    r"\b(?:the\s+(?:papers?|studies?|researchers?|analysts?|surveys?"
+    r"|regulators?|authorities|literature|authors?)"
+    r"|analysts?|researchers?|literature|sec\s+filings?\b|filings?"
+    r"|annual\s+filings?|quarterly\s+filings?|rating\s+agencies?)"
+    r"\s+(?:reports?|estimates?|shows?|indicates?|suggests?|states?|claims?"
+    r"|notes?|cites?|mentions?|reveals?|discloses?|publishes?|found"
+    r"|calculated|computed|derived)\b"
+    r"|"
+    r"(?:论文|文献|分析师|研究机构|学者)"
+    r"[^。，\n]{0,6}?(?:报告|显示|表明|指出|称|估计|发现)"
+    r")",
+    re.IGNORECASE,
+)
+# Measurement-shaped numbers for analysis claims: keeps the % sign and sign
+# (unlike _numbers_without_dates_or_percent, which drops percentages on
+# purpose). A bare integer is NOT a measurement — "252 个交易日年化" is the
+# standard convention, not a claim about this run's analysis (#1032-style
+# definitional prose must stay untouched). Dates can still look like
+# measurements, so date masks run first.
+_MEASURE_NUMBER_RE = re.compile(
+    r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)\s*[%％]?"  # decimal: 1.21, -8.1%
+    r"|[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)\s*[%％]"  # integer percent: 55%, 70%
+)
+# A forward-looking frame means the figure is a forecast, not a claim that a
+# backtest/analysis measured it — the measurement gate only polices "measured
+# facts" (#1336), forecasts stay under the "analysis, not advice" prompt rule.
+_FORECAST_FRAME_RE = re.compile(
+    r"(?:\b(?:forecast|expected|projected|predicted)\b|预计|预期|预测|估计|展望)",
+    re.IGNORECASE,
+)
+
+# Metric family for a claim/evidence leaf, so a figure is only grounded by
+# evidence of its own kind: an observed price must never stand in for an
+# invented volatility (#1336).
+_ANALYSIS_KIND_ALIASES = {
+    "annualized_vol": "vol",
+    "annualized_volatility": "vol",
+    "volatility": "vol",
+    "return_vol": "vol",
+    "return_volatility": "vol",
+    "vol": "vol",
+    "max_drawdown": "drawdown",
+    "maxdd": "drawdown",
+    "drawdown": "drawdown",
+    "sharpe": "sharpe",
+    "sharpe_ratio": "sharpe",
+    "win_rate": "win_rate",
+    "hit_rate": "win_rate",
+    "hitrate": "win_rate",
+    "probability": "probability",
+    "prob": "probability",
+    "total_return": "return",
+    "annual_return": "return",
+    "cumulative_return": "return",
+    "benchmark_return": "return",
+    "excess_return": "return",
+    "annualized_return": "return",
+    "return": "return",
+    "returns": "return",
+    "ic_positive_ratio": "win_rate",
+}
+
+# Order matters: 最大回撤 is drawdown before 收益/return, and 年化波动率 is vol
+# before the generic return branch.
+_ANALYSIS_KIND_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?:回撤|drawdown|maxdd|最大亏损)", re.IGNORECASE), "drawdown"),
+    (
+        re.compile(
+            r"(?:波动率|波动性|volatility|annualized\s*vol|return\s*vol|年化波动)",
+            re.IGNORECASE,
+        ),
+        "vol",
+    ),
+    (re.compile(r"(?:夏普|sharpe)", re.IGNORECASE), "sharpe"),
+    (re.compile(r"(?:胜率|命中率|win\s*rate|hit\s*rate)", re.IGNORECASE), "win_rate"),
+    (re.compile(r"(?:概率|probability|prob)", re.IGNORECASE), "probability"),
+    # 年化/annualized alone ("| 年化 | 18.2% |") resolves to return so a
+    # generic-header table cannot dodge the gate with the fragment the prose
+    # detector (_ANALYSIS_METRIC_RE) already treats as a metric word.
+    (re.compile(r"(?:收益|回报|收益率|回报率|年化|\breturns?\b|\bannualized\b)", re.IGNORECASE), "return"),
+)
+
+# Definitional prose ("夏普比率大于 1.0 通常被认为较好") states a convention,
+# not a measurement this session produced (#1336: preserve explicitly labelled
+# definitions). The bare 通常 alone is deliberately not enough — "通常实现
+# 18.2% 年化" is a measured claim.
+_DEFINITION_FRAME_RE = re.compile(
+    r"(?:通常(?:认为|被?认为|说来|指|用于)|一般认为|定义为|是指|惯例|"
+    r"conventionally|typically\s+(?:considered|regarded|seen)|"
+    r"generally\s+(?:accepted|considered|regarded)|by\s+convention)",
+    re.IGNORECASE,
+)
+
+# A categorical "all N-month windows were profitable" claim carries only an
+# integer window length, which _MEASURE_NUMBER_RE deliberately ignores; it is a
+# measured fact about the run and needs a window-producing analysis result.
+_CATEGORICAL_WINDOW_RE = re.compile(
+    r"(?:所有|全部|每个|任何|each|every|all)[\s\S]{0,40}?"
+    r"(?:窗口|区间|windows?|periods?)[\s\S]{0,30}?"
+    r"(?:正收益|均为正|都为正|盈利|上涨|positive|profitable)",
     re.IGNORECASE,
 )
 _DERIVATION_RE = re.compile(
     r"(?:\bderived\b|\bcalculated\b|\bformula\b|\bbased on\b|计算|推导|公式|基于)",
     re.IGNORECASE,
 )
+# "从 2026-08-03 的 100.0 涨到 2026-09-02 的 112.4" / "rose from 100.0 to
+# 112.4": a return figure framed as growth between two endpoints is
+# arithmetic on sourced inputs, not an invented backtest metric (#1338
+# review). The frame alone never grounds anything — the values must also
+# match an observed endpoint pair exactly (see _return_derived_from_observed).
 _NUMBER_RE = re.compile(
     r"(?<![A-Za-z0-9_])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
     r"(?![A-Za-z0-9_])"
@@ -254,6 +468,23 @@ _RANGE_TAIL = r"(?:\s*[-–—~～至到]\s*[-+]?\d[\d,]*(?:\.\d+)?)?"
 _PERCENT_RANGE_RE = re.compile(
     r"\d[\d,]*(?:\.\d+)?\s*[-–—~至]\s*\d[\d,]*(?:\.\d+)?\s*[%％]"
 )
+# A percentage-POINT delta is not a quoted price. "~3.6pp below Penumbra"
+# describes a margin gap; left unmasked the ".6" is consumed as a decimal
+# and the number reaches the OHLC comparator, which then rejects an
+# otherwise correct fundamentals answer and demands `get_market_data` to
+# substantiate a claim that has nothing to do with price.
+# The trailing "%" spellings are already handled above; this covers the
+# percentage-point spellings, which the percent masks never matched.
+# The Chinese units take an optional measure word ("3.6 个百分点" is the
+# ordinary spelling; bare "3.6 百分点" is the rare one) and are matched
+# without a trailing \b: after a CJK character \b requires a non-word
+# character to follow, so "下降 3.6 个百分点后企稳" would not match. The
+# ASCII units keep \b, which is what stops "3.6ppm" being read as pp.
+_PERCENTAGE_POINT_RE = re.compile(
+    r"[-+~≈]?\s*\d[\d,]*(?:\.\d+)?\s*"
+    r"(?:(?:pp|ppt|ppts|bps|bp)\b|个?(?:百分点|基点))",
+    re.IGNORECASE,
+)
 # Localized calendar text carries digits that the ISO pattern above leaves
 # behind: "8 月 3 日" otherwise contributes 8 and 3 as candidate prices.
 _LOCALIZED_DATE_RE = re.compile(
@@ -309,7 +540,12 @@ _INDICATOR_VALUE_RE = re.compile(
     r"\b(?:rsi|macd|atr|adx|cci|obv|kdj|boll|dif|dea|vix|iv|"
     r"sharpe|sortino|beta)\b"
     r"(?:\s*\([^)]{0,20}\))?"
-    r"\s*(?:is|at|of|reads?|=|为|是)?\s*[:：]?\s*"
+    # #1354: "RSI below 30" / "sharpe above 1" — a directional connective is
+    # part of the indicator reading, so the reading's number stays masked.
+    # Only indicator NAMES get these connectives; a price word with
+    # "below/above" ("close above 2500") is an observed-value claim and
+    # matches none of these names, so it stays gated.
+    r"\s*(?:is|at|of|reads?|=|为|是|below|above|under|over)?\s*[:：]?\s*"
     r"[-+]?\d[\d,]*(?:\.\d+)?",
     re.IGNORECASE,
 )
@@ -324,6 +560,22 @@ _CURRENCY_TOKEN = r"(?:\$|US\$|C\$|HK\$|CAD|USD|CNY|HKD|¥|￥)?"
 # yet both went to the OHLC check and rejected a weekly update whose quotes
 # were correct. This is the same category as the target/stop levels below -- a
 # level the report proposes, not one the data source reported.
+
+# #1354: a signal value trailing an arrow or a signal word ("sinal +1",
+# "-> +1", "触发 +1", "Sinal: +1") is the formula's output, not an observed
+# price. Signal values are small integers (a +/-1 signal, a 1-10 score); a
+# multi-digit price never follows these words, so the digit bound keeps
+# "close -> 2500" (a price claim written in arrow notation) gated. The colon
+# is optional ("Sinal: +1" — ASCII '.' is not a clause separator, so this can
+# sit in the same clause as the price word), the sign may be spaced ("sinal
+# - 1"), and the lookahead stops the bound from masking the first two digits
+# of a longer number ("signal 2500" keeps the full 2500 gated).
+_SIGNAL_VALUE_RE = re.compile(
+    r"(?:\b(?:signal|sinal|trigger|triggers|triggered|dispara|信号|触发)\b[:：]?"
+    r"|->|→|=>)"
+    r"\s*[-+]?\s*\d{1,2}(?:\.\d+)?(?!\d)",
+    re.IGNORECASE,
+)
 _ORDER_LEVEL_RE = re.compile(
     r"(?:"
     # (a) "<qty> [股|shares] @ <price>" -- the whole clause, quantity included
@@ -449,10 +701,46 @@ _PROSPECTIVE_LEVEL_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-# Full-width brackets and enumeration commas delimit prose clauses. ASCII
-# parentheses are deliberately not separators: an explicit derivation such as
-# "(8.5 - 7.9) / 2" must stay in one segment for the formula check.
-_CLAUSE_SEPARATOR_RE = re.compile(r"[,，;；。、\n（）【】]")
+# #1354: the closed structural rule for prose price claims. A number that
+# follows a price-context word is an observed value only when nothing
+# formula-like binds it instead. Two closed token classes decide that:
+#
+#   * a formula marker sitting between the price word and the number — a
+#     comparison/division operator, or an indicator identifier followed by
+#     digits (SMA/EMA/…/VWAP + digits; MA for the Chinese MA20 convention) —
+#     turns the number into an operand of the formula, not a claimed value;
+#   * an observation binder after that marker ("was", "at", 报收/收于/收报/收在)
+#     re-attaches the number to the price word, so "close above SMA50 and was
+#     2500" stays a claim while "close/SMA50 > 1" claims nothing.
+#
+# This replaces the per-phrasing denylist (a signal-value mask, an indicator-
+# connective mask, …) with one syntactic distinction; the catalogue of
+# phrasings can never close, a closed marker set can.
+_FORMULA_MARKER_RE = re.compile(
+    r"(?:>=|<=|≥|≤|>|<|/)"
+    r"|\b(?:SMA|EMA|WMA|DMA|MA|RSI|MACD|ATR|ADX|CCI|OBV|KDJ|BOLL|VWAP)\d+\b",
+    re.IGNORECASE | re.ASCII,
+)
+_OBSERVATION_BINDER_RE = re.compile(
+    r"\b(?:was|were|is|are|at)\b|(?:报收|收于|收报|收在)|==|=|≈",
+    re.IGNORECASE,
+)
+# The clause splitter does not split on the ASCII period, so "close was 210.
+# In 2024 the market rallied" stays one clause and 2024 would be misread as
+# the asserted price. A period/bang/question followed by whitespace and a
+# sentence-start (capital, quote, or bracket) is a boundary here — but only
+# in this price-claim scan, never in the global clause splitter, where it
+# would tear apart "000543.SZ" and "1.5". The capital/open-bracket lookahead
+# deliberately excludes abbreviations: "close approx. 2500" keeps 2500 gated.
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?]\s+(?=[A-Z(（])")
+
+
+# Full-width enumeration commas delimit prose clauses. Paired brackets (ASCII
+# or full-width ()()[]) are deliberately not separators: an explicit
+# derivation such as "(8.5 - 7.9) / 2" must stay in one segment for the
+# formula check, and 公司名（代码）价格 must stay in one segment so the
+# unsourced-symbol gate can see the symbol with its figure (#1260).
+_CLAUSE_SEPARATOR_RE = re.compile(r"[,，;；。、\n]")
 
 
 # The ASCII comma both separates clauses and groups thousands, and the clause
@@ -556,6 +844,11 @@ def _utc_now() -> str:
 # for one listing, which no tie-break could resolve, so every Shanghai listing
 # resolved ``ambiguous`` and no market tool could run for the rest of the run.
 _EXCHANGE_PREFIXED_RE = re.compile(r"^(SH|SZ|BJ)(\d{6})$")
+# The dotted form of the same idea, as the Futu connector spells it
+# (``HK.00700`` / ``US.AAPL``). ``SS`` is Yahoo's Shanghai alias and folds
+# onto ``SH`` exactly as the suffix spelling does.
+_VENUE_PREFIXES = frozenset({"HK", "SH", "SZ", "BJ", "SS", "US"})
+_US_TICKER_RE = re.compile(r"[A-Z][A-Z0-9&-]{0,19}")
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -567,18 +860,54 @@ def _normalize_symbol(value: Any) -> str:
     Returns:
         The canonical spelling — uppercased, with Shanghai's ``.SS`` alias
         folded onto ``.SH``, an exchange prefix rewritten as a suffix, a Hong
-        Kong code zero-padded, and a crypto pair hyphenated. Text that is not a
-        symbol is returned uppercased and otherwise untouched.
+        Kong code zero-padded, and a crypto pair hyphenated. A joined crypto
+        pair with no separator (``BTCUSDT``) is rewritten as the dashed form
+        (``BTC-USDT``) so every downstream check sees one identity. Text that
+        is not a symbol is returned uppercased and otherwise untouched.
     """
-    symbol = str(value or "").strip().upper().replace("/", "-")
+    # A fiat/fiat pair is one FX instrument regardless of spelling: ``GBP/USD``
+    # and ``GBPUSD`` are both ``GBPUSD=X``. Checked BEFORE the slash is
+    # rewritten ("GBP/USD" -> "GBP-USD", the crypto-pair spelling), which
+    # disagreed with the resolver's ``GBPUSD=X`` answer — a contradictory
+    # identity that outranked every later lock and blocked all further tools.
+    raw = str(value or "").strip().upper()
+    fx = canonical_fx_pair(raw)
+    if fx is not None:
+        return fx
+    symbol = raw.replace("/", "-")
     if not symbol:
         return ""
+
     prefixed = _EXCHANGE_PREFIXED_RE.match(symbol)
     if prefixed:
         return f"{prefixed.group(2)}.{prefixed.group(1)}"
     base, dot, suffix = symbol.rpartition(".")
     if not dot:
+        # No separator at all: rewrite a joined crypto pair (``BTCUSDT``)
+        # as the dashed form so the dash/slash branch and the canonical
+        # regex both match. The base must be all-alpha so a numeric prefix
+        # cannot collide with another numeric-code branch downstream.
+        joined = _JOINED_CRYPTO_RE.fullmatch(symbol)
+        if joined and not _METAL_USD_PAIR_RE.fullmatch(symbol):
+            for quote in _JOINED_CRYPTO_QUOTE_SUFFIXES:
+                if symbol.endswith(quote) and len(symbol) > len(quote):
+                    base_part = symbol[: -len(quote)]
+                    if base_part.isalpha():
+                        return f"{base_part}-{quote}"
         return symbol
+    # Venue-prefixed listing (Futu connector format: HK.06693 / SH.600519 /
+    # SZ.000001 / US.AAPL): rewrite to the canonical suffix spelling so
+    # identity matching agrees with the market-data chain (06693.HK) that
+    # get_market_data uses. Shanghai's .SS alias is folded onto .SH here too,
+    # the same way the suffix branch below does it.
+    if base in _VENUE_PREFIXES and suffix:
+        venue = "SH" if base == "SS" else base
+        if venue == "US":
+            if _US_TICKER_RE.fullmatch(suffix):
+                return f"{suffix}.US"
+        elif suffix.isdigit():
+            digits = suffix.zfill(5) if venue == "HK" else suffix
+            return f"{digits}.{venue}"
     if suffix == "SS":
         suffix = "SH"
     if suffix == "HK" and base.isdigit():
@@ -765,6 +1094,35 @@ def _price_field_for_path(path: str) -> str | None:
     return _GENERIC_PRICE_FIELD_ALIASES.get(leaf)
 
 
+def _metric_kind_for_path(path: str) -> str | None:
+    """Map an evidence JSON path to an analysis metric kind."""
+    leaf = re.sub(r"\[\d+\]$", "", str(path or "").rsplit(".", 1)[-1])
+    leaf = leaf.strip().casefold()
+    kind = _ANALYSIS_KIND_ALIASES.get(leaf)
+    if kind is not None:
+        return kind
+    # Compound leaves name the kind as a token ("reported_annualized_return",
+    # "strategy_max_drawdown"). #1338 review: matching only the verbatim alias
+    # table makes every other spelling silently ungroundable. Scan from the
+    # right — English compounds put the head noun last, so "return_vol"
+    # resolves to vol, never to return.
+    tokens = [token for token in re.split(r"[_.]", leaf) if token]
+    for size in (2, 1):
+        for start in range(len(tokens) - size, -1, -1):
+            kind = _ANALYSIS_KIND_ALIASES.get("_".join(tokens[start : start + size]))
+            if kind is not None:
+                return kind
+    return _metric_kind_for_text(path)
+
+
+def _metric_kind_for_text(text: str) -> str | None:
+    """Return the analysis metric kind named in a claim or header."""
+    for pattern, kind in _ANALYSIS_KIND_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return None
+
+
 def _scan_symbols(text: str) -> set[str]:
     """Return the canonical symbols written anywhere in a blob of text."""
     return {
@@ -793,10 +1151,40 @@ def _infer_venue(symbol: str) -> str | None:
     for suffix, venue in suffixes.items():
         if upper.endswith(suffix):
             return venue
-    if "-" in upper or "/" in upper:
-        return "crypto_or_fx"
+    # Yahoo's continuous-front-month futures notation (GC=F, CL=F, SI=F, ...).
+    # The exchange category is the venue class. The engine and the
+    # correlation helper mirror this pattern; this is the third copy.
     if upper.endswith("=F"):
         return "futures"
+    # Yahoo's forex notation (XAUUSD=X, EURUSD=X) is FX.
+    if re.match(r"^[A-Z]{6}=X$", upper):
+        return "forex"
+    # Bare 6-character precious-metal / FX symbols. The whitelist is
+    # ISO 4217 metals + G10 currencies; it intentionally does NOT include
+    # any US-equity prefix. Mirroring the engine ``_MARKET_PATTERNS``.
+    if re.match(
+        r"^(?:XAU|XAG|XPT|XPD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|USD)[A-Z]{3}$",
+        upper,
+    ):
+        return "forex"
+    # Dashed / slashed symbols are NOT categorically crypto: a USD quote is
+    # crypto only on a whitelisted base (``_CRYPTO_USD_BASES``), so
+    # ``XAU-USD`` / ``EUR-USD`` / ``GBP-USD`` are forex. Without this guard a
+    # spot-gold pair surfaced as a crypto-or-fx hybrid in the runtime
+    # registry, contradicting the engine classifier that already routes it to
+    # ``forex`` (#1280).
+    if "-" in upper or "/" in upper:
+        base, _, quote = (
+            upper.partition("-") if "-" in upper else upper.partition("/")
+        )
+        if quote in _CRYPTO_QUOTE_ASSETS:
+            return "crypto_or_fx"
+        if quote == "USD" and base in _CRYPTO_USD_BASES:
+            return "crypto_or_fx"
+        # Any other dashed / slashed pair is forex-shaped (e.g. ``XAU-USD``,
+        # ``EUR-USD``, ``GBP-USD``); the per-pair engine classifier decides
+        # ``forex`` vs ``crypto`` vs ``futures`` downstream.
+        return "forex"
     return None
 
 
@@ -824,6 +1212,10 @@ def _infer_currency(symbol: str) -> str | None:
             quote = upper.rsplit(separator, 1)[-1]
             if 3 <= len(quote) <= 5:
                 return quote
+    if upper.endswith("=X"):
+        pair = upper[:-2]
+        if len(pair) == 6:
+            return pair[3:6]
     return None
 
 
@@ -840,13 +1232,43 @@ def _infer_instrument_type(symbol: str, candidate_type: Any = None) -> str:
         return "option"
     if "forex" in raw or raw == "currency":
         return "forex"
+    if "index" in raw:
+        return "index"
     upper = _normalize_symbol(symbol)
     if upper.endswith("=F"):
         return "future"
     if upper.endswith(".FX"):
         return "forex"
+    # Yahoo's continuous-front-month futures notation (GC=F, CL=F, ...).
+    # Mirrors the engine ``_MARKET_PATTERNS`` and the correlation helper.
+    if re.match(r"^[A-Z]{2,5}=F$", upper):
+        return "future"
+    # Yahoo's forex notation (XAUUSD=X, EURUSD=X).
+    if re.match(r"^[A-Z]{6}=X$", upper):
+        return "forex"
+    # Bare 6-character precious-metal / FX symbols (whitelist).
+    if re.match(
+        r"^(?:XAU|XAG|XPT|XPD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|USD)[A-Z]{3}$",
+        upper,
+    ):
+        return "forex"
+    # Dashed / slashed symbols: crypto only when the quote leg is a
+    # stablecoin OR the base is in the USD-whitelist. The whitelist
+    # mirrors ``_canonical_crypto_pair`` in
+    # ``src.tools.symbol_search_tool``. ``XAU-USD`` / ``EUR-USD`` /
+    # ``GBP-USD`` are NOT crypto and resolve as ``forex`` (the per-pair
+    # engine classifier decides the final market downstream).
     if "-" in upper or "/" in upper:
-        return "crypto"
+        base, _, quote = (
+            upper.partition("-") if "-" in upper else upper.partition("/")
+        )
+        if quote in _CRYPTO_QUOTE_ASSETS:
+            return "crypto"
+        if quote == "USD" and base in _CRYPTO_USD_BASES:
+            return "crypto"
+        return "forex"
+    if upper.startswith("^"):
+        return "index"
     return "listed_security"
 
 
@@ -863,6 +1285,7 @@ class IdentityRecord:
     source_tool_call_id: str | None = None
     source: list[str] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    resolution_constraints: list[dict[str, Any]] = field(default_factory=list)
     version: int = 1
     updated_at: str = field(default_factory=_utc_now)
 
@@ -932,6 +1355,7 @@ class GroundingLedger:
         run_dir: Path,
         user_message: str,
         history: Sequence[Mapping[str, Any]] | None = None,
+        contextual_identity_constraints: bool = True,
     ) -> None:
         """Create a ledger and seed only authoritative prior identities.
 
@@ -939,15 +1363,24 @@ class GroundingLedger:
             run_dir: Active run directory.
             user_message: Current user request.
             history: Optional prior message history. It remains available to
-                the model, but is deliberately not an authorization source for
-                this run: stale identities from an earlier user subject must
-                not unlock a new subject's tools.
+                the model. Only explicit constraints whose clause names the
+                current resolver subject may carry forward; stale global
+                instructions cannot authorize a new subject.
+            contextual_identity_constraints: Whether explicit market words in
+                the original conversation may narrow resolver candidates.
         """
         self.run_dir = Path(run_dir)
         self.user_message = user_message
+        self.resolution_context = ResolutionContext.from_messages(
+            user_message,
+            history,
+            enabled=contextual_identity_constraints,
+        )
         self._identities: dict[str, IdentityRecord] = {}
         self._evidence: list[EvidenceRecord] = []
         self._tool_failures: list[dict[str, Any]] = []
+        self._analysis_completed: list[dict[str, Any]] = []
+        self._analysis_metrics: list[dict[str, Any]] = []
         self._validations: list[dict[str, Any]] = []
         self._recovery_rounds = 0
         self._symbol_resolution_attempts = 0
@@ -1238,6 +1671,8 @@ class GroundingLedger:
             return
 
         self._track_session_symbols(arguments, result)
+        if tool_name in _ANALYSIS_TOOLS:
+            self._ingest_analysis_result(tool_name, arguments, payload, call_id)
         if tool_name == _RESOLVER_TOOL:
             self._ingest_resolution(arguments, payload, call_id)
         elif tool_name == "get_market_data":
@@ -1245,6 +1680,190 @@ class GroundingLedger:
         elif payload is not None:
             self._ingest_generic_numeric(tool_name, arguments, payload, call_id)
         self.persist()
+
+    def _ingest_analysis_result(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        payload: dict[str, Any] | None,
+        call_id: str,
+    ) -> None:
+        """Record metric numbers a completed analysis result actually produced.
+
+        Success of the call envelope is not enough: ``backtest`` reports ok for
+        any runner exit, and a deduplicated ("skipped") call carries no new
+        result at all (#1336). Only results that yielded at least one
+        recognisable metric figure count as completed analysis.
+        """
+        if payload is None or payload.get("skipped"):
+            return
+        if tool_name == "backtest":
+            if str(payload.get("status") or "").casefold() != "ok" and payload.get(
+                "exit_code"
+            ) not in (0, "0"):
+                return
+            recorded = self._record_backtest_metrics(arguments, payload, call_id)
+        elif tool_name == "factor_analysis":
+            if str(payload.get("status") or "").casefold() != "ok":
+                return
+            recorded = self._record_leaf_metrics(payload, call_id, tool_name, "")
+        elif tool_name == "run_shadow_backtest":
+            if str(payload.get("status") or "").casefold() != "ok":
+                return
+            combined = payload.get("combined")
+            if not isinstance(combined, dict):
+                # A combined dict containing only {"error": ...} is no analysis.
+                return
+            recorded = self._record_leaf_metrics(combined, call_id, tool_name, "combined")
+        elif tool_name == "quantlib_call":
+            if payload.get("ok") is not True or str(
+                arguments.get("action") or ""
+            ).casefold() != "call":
+                return
+            function = str(arguments.get("function") or "")
+            recorded = self._record_leaf_metrics(
+                payload.get("result"), call_id, tool_name, function
+            )
+        else:
+            return
+        if recorded:
+            self._analysis_completed.append(
+                {"call_id": call_id, "tool": tool_name, "recorded_at": _utc_now()}
+            )
+
+    def _record_leaf_metrics(
+        self,
+        value: Any,
+        call_id: str,
+        tool_name: str,
+        field_prefix: str,
+    ) -> int:
+        """Record nested numeric leaves whose key names a metric kind."""
+        recorded = 0
+
+        def visit(item: Any, path: str) -> None:
+            nonlocal recorded
+            if _is_number(item):
+                kind = _metric_kind_for_path(path)
+                if kind is None:
+                    return
+                self._analysis_metrics.append(
+                    {
+                        "metric": kind,
+                        "value": float(item),
+                        "tool": tool_name,
+                        "call_id": call_id,
+                        "field": path,
+                    }
+                )
+                recorded += 1
+                return
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    visit(child, f"{path}.{key}" if path else str(key))
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    visit(child, f"{path}[{index}]")
+
+        visit(value, field_prefix or "")
+        return recorded
+
+    def _record_backtest_metrics(
+        self,
+        arguments: Mapping[str, Any],
+        payload: dict[str, Any],
+        call_id: str,
+    ) -> int:
+        """Parse metric figures from a successful backtest's run-dir artifacts."""
+        root = self.run_dir.resolve()
+        candidates: list[Path] = []
+        raw_dir = arguments.get("run_dir") or payload.get("run_dir")
+        if raw_dir:
+            candidate = Path(str(raw_dir))
+            if not candidate.is_absolute():
+                candidate = self.run_dir / candidate
+            try:
+                resolved = candidate.resolve()
+                if resolved == root or resolved.is_relative_to(root):
+                    candidates.append(resolved)
+            except OSError:
+                pass
+        # The loop archives a detached backtest's artifacts into the active run
+        # dir right after it succeeds, so that copy is the second candidate.
+        candidates.append(root)
+        artifacts = payload.get("artifacts")
+        if isinstance(artifacts, dict):
+            for path_value in artifacts.values():
+                if not isinstance(path_value, str):
+                    continue
+                try:
+                    resolved = Path(path_value).resolve()
+                    if resolved.is_relative_to(root):
+                        candidates.append(resolved)
+                except OSError:
+                    continue
+        files: list[Path] = []
+        seen_dirs: set[Path] = set()
+        for candidate in candidates:
+            if candidate.is_file():
+                files.append(candidate)
+                continue
+            if candidate in seen_dirs:
+                continue
+            seen_dirs.add(candidate)
+            for dir_path in (candidate, candidate / "artifacts"):
+                for name in ("metrics.csv", "metrics.json"):
+                    target = dir_path / name
+                    if target.is_file():
+                        files.append(target)
+        recorded = 0
+        seen_files: set[Path] = set()
+        for file_path in files:
+            if file_path in seen_files:
+                continue
+            seen_files.add(file_path)
+            recorded += self._record_metrics_file(file_path, call_id)
+        return recorded
+
+    def _record_metrics_file(self, path: Path, call_id: str) -> int:
+        """Record metric figures from one metrics.csv/metrics.json artifact."""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return 0
+        if path.suffix == ".json":
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return 0
+            if not isinstance(data, dict):
+                return 0
+            return self._record_leaf_metrics(data, call_id, "backtest", "")
+        try:
+            rows = list(csv.reader(text.splitlines()))
+        except csv.Error:
+            return 0
+        if len(rows) < 2:
+            return 0
+        header = [cell.strip().casefold() for cell in rows[0]]
+        recorded = 0
+        for index, raw in enumerate(rows[1]):
+            if index >= len(header):
+                break
+            kind = _ANALYSIS_KIND_ALIASES.get(header[index])
+            value = _coerce_csv_number(raw)
+            if kind is not None and value is not None:
+                self._analysis_metrics.append(
+                    {
+                        "metric": kind,
+                        "value": float(value),
+                        "tool": "backtest",
+                        "call_id": call_id,
+                        "field": header[index],
+                    }
+                )
+                recorded += 1
+        return recorded
 
     def validate_final_answer(self, content: str) -> ValidationResult:
         """Validate identity assertions and numeric price claims.
@@ -1261,6 +1880,7 @@ class GroundingLedger:
         issues.extend(self._validate_identity(content))
         issues.extend(self._validate_unsourced_symbols(content))
         issues.extend(self._validate_price_claims(content))
+        issues.extend(self._validate_analysis_claims(content))
         result = ValidationResult(valid=not issues, issues=issues)
         self._validations.append(
             {
@@ -1289,7 +1909,7 @@ class GroundingLedger:
         for issue in validation.issues:
             code = issue.get("code")
             value = issue.get("value")
-            if code in {"numeric_claim_conflict", "numeric_claim_unavailable", "unsourced_symbol_figures"} and value is not None:
+            if code in {"numeric_claim_conflict", "numeric_claim_unavailable", "unsourced_symbol_figures", "analysis_claim_unavailable"} and value is not None:
                 symbol = issue.get("symbol") or ""
                 label = f"{value:g}" if isinstance(value, (int, float)) else str(value)
                 banned.append(f"{label} ({symbol})" if symbol else label)
@@ -1488,6 +2108,8 @@ class GroundingLedger:
                 "session_symbol_roots": sorted(self._session_symbol_roots),
                 "evidence": [asdict(record) for record in self._evidence],
                 "tool_failures": list(self._tool_failures),
+                "analysis_completed": list(self._analysis_completed),
+                "analysis_evidence": list(self._analysis_metrics),
                 "validations": list(self._validations),
             }
             temp.write_text(
@@ -1574,6 +2196,9 @@ class GroundingLedger:
 
         raw_candidates = data.get("candidates")
         candidates = [dict(item) for item in raw_candidates if isinstance(item, dict)] if isinstance(raw_candidates, list) else []
+        resolver_candidates = candidates
+        relevant_constraints = self.resolution_context.constraints_for(query)
+        constraint_audit = [item.audit_record() for item in relevant_constraints]
         sources = data.get("sources") if isinstance(data.get("sources"), dict) else {}
         if not candidates:
             # "This entity does not exist" may only be concluded when every
@@ -1599,9 +2224,37 @@ class GroundingLedger:
                 source_tool_call_id=call_id,
                 source=clean_sources,
                 candidates=[],
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
+
+        market_values = {
+            item.value
+            for item in relevant_constraints
+            if item.dimension == "market" and item.explicit
+        }
+        if market_values:
+            constrained = [
+                candidate
+                for candidate in candidates
+                if candidate_market(candidate) in market_values
+            ]
+            if constrained:
+                candidates = constrained
+            else:
+                # A mismatch with an explicit constraint must stay fail closed.
+                # The candidate list may be truncated, so this is ambiguity,
+                # not proof that the requested listing does not exist.
+                self._identities[key] = IdentityRecord(
+                    query=query,
+                    status="ambiguous",
+                    source_tool_call_id=call_id,
+                    candidates=resolver_candidates,
+                    resolution_constraints=constraint_audit,
+                    version=version,
+                )
+                return
 
         chosen = self._choose_candidate(query, candidates)
         if chosen is None:
@@ -1609,7 +2262,8 @@ class GroundingLedger:
                 query=query,
                 status="ambiguous",
                 source_tool_call_id=call_id,
-                candidates=candidates,
+                candidates=resolver_candidates,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1620,7 +2274,8 @@ class GroundingLedger:
                 query=query,
                 status="invalidated",
                 source_tool_call_id=call_id,
-                candidates=candidates,
+                candidates=resolver_candidates,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1640,6 +2295,7 @@ class GroundingLedger:
                 status="conflicting",
                 source_tool_call_id=call_id,
                 candidates=conflicting,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1652,6 +2308,7 @@ class GroundingLedger:
                 status="conflicting",
                 source_tool_call_id=call_id,
                 candidates=conflicting,
+                resolution_constraints=constraint_audit,
                 version=version,
             )
             return
@@ -1671,7 +2328,8 @@ class GroundingLedger:
             currency=_infer_currency(symbol),
             source_tool_call_id=call_id,
             source=source_names,
-            candidates=candidates,
+            candidates=resolver_candidates,
+            resolution_constraints=constraint_audit,
             version=version,
         )
         self._supersede_shortlists(symbol)
@@ -1946,8 +2604,9 @@ class GroundingLedger:
             )
         source = str(payload.get("source") or tool_name)
         remaining = _MAX_GENERIC_EVIDENCE
+        timestamp_fields = (*_TIMESTAMP_FIELDS, "as_of")
 
-        def visit(value: Any, path: str) -> None:
+        def visit(value: Any, path: str, timestamp: str | None = None) -> None:
             nonlocal remaining
             if remaining <= 0:
                 return
@@ -1958,7 +2617,7 @@ class GroundingLedger:
                         tool=tool_name,
                         symbol=symbol,
                         source=source,
-                        timestamp=None,
+                        timestamp=timestamp,
                         field=path or "value",
                         value=value,
                         status="observed",
@@ -1969,11 +2628,25 @@ class GroundingLedger:
                 remaining -= 1
                 return
             if isinstance(value, dict):
+                local_timestamp = next(
+                    (
+                        str(value[key])
+                        for key in timestamp_fields
+                        if value.get(key) is not None
+                    ),
+                    timestamp,
+                )
                 for key, item in value.items():
-                    visit(item, f"{path}.{key}" if path else str(key))
+                    if str(key).casefold() in timestamp_fields:
+                        continue
+                    visit(
+                        item,
+                        f"{path}.{key}" if path else str(key),
+                        local_timestamp,
+                    )
             elif isinstance(value, list):
                 for index, item in enumerate(value):
-                    visit(item, f"{path}[{index}]")
+                    visit(item, f"{path}[{index}]", timestamp)
 
         visit(payload, "")
 
@@ -2133,6 +2806,13 @@ class GroundingLedger:
                 )
                 if not unknown or not self._numbers_without_dates_or_percent(segment):
                     continue
+                # Accept figures that are attributed to an external source
+                # (e.g., "The paper reports a Sharpe ratio of 1.8.") rather
+                # than model memory. Scoped to the clause: a line-level check
+                # would let a citation in one clause launder an invented
+                # sibling metric in the next.
+                if _ATTRIBUTION_RE.search(segment):
+                    continue
                 for symbol in unknown:
                     reported.add(symbol)
                     issues.append(
@@ -2148,6 +2828,375 @@ class GroundingLedger:
                         }
                     )
         return issues
+
+    def _validate_analysis_claims(self, content: str) -> list[dict[str, Any]]:
+        """Reject backtest/analysis metrics with no kind-scoped evidence.
+
+        #1336: after failed or deduplicated market-data calls the model may
+        still present return-volatility / drawdown / probability figures as
+        measured facts. A metric figure is legitimate only when the run's
+        evidence contains the same *kind* of figure — recorded from a
+        completed analysis result (backtest artifacts, factor/shadow/quantlib
+        output) or from any successful tool's numeric output (e.g.
+        ``portfolio_risk_xray``, flattened into ``_evidence``). Kind scoping
+        is what keeps an observed price from standing in for an invented
+        volatility figure. Definitional prose ("夏普比率大于 1.0 通常被认为
+        较好"), explicitly forward-looking forecasts, and categorical
+        historical-window facts without any window-producing analysis are
+        handled separately here.
+
+        Args:
+            content: Candidate assistant answer.
+
+        Returns:
+            One issue per metric-bearing clause or table cell.
+        """
+        issues: list[dict[str, Any]] = []
+        lines = content.splitlines()
+        consumed: set[int] = set()
+        price_records = self._comparable_price_records()
+        for header, rows, row_indices in self._pipe_tables(lines):
+            consumed.update(row_indices)
+            columns = [
+                (cell, _metric_kind_for_text(cell), bool(_FORECAST_FRAME_RE.search(cell)))
+                for cell in header
+            ]
+            has_kind_header = any(kind for _, kind, _ in columns)
+            for row in rows:
+                cells = row + [""] * (len(columns) - len(row))
+                if not has_kind_header:
+                    # Generic header ("指标 | 数值", "Metric | Value"): a cell
+                    # naming a metric kind is a row LABEL and claims exactly
+                    # one adjacent value cell (right first — "label, value"
+                    # order — then left, for value-first layouts). Validating
+                    # every cell after the label would grab annotation columns
+                    # ("备注 | 较去年提升 2%") that prose never attributes to
+                    # the label; parity with the prose verdict is the bar.
+                    row_kinds = [
+                        (index, _metric_kind_for_text(cell))
+                        for index, cell in enumerate(cells)
+                        if _metric_kind_for_text(cell) is not None
+                    ]
+                    claimed: set[int] = set()
+                    for label_index, row_kind in row_kinds:
+                        # A label cell that smuggles its own measurement
+                        # ("| 年化收益率 18.2% | - |") is prose-identical to
+                        # "年化收益率为 18.2%" — validate the label's own
+                        # numbers against its kind too.
+                        self._check_table_cell(
+                            cells[label_index], row_kind, cells[label_index], issues
+                        )
+                        # A forecast frame in the LABEL ("| 预计夏普比率 | 1.2 |")
+                        # frames the claimed value clause-wide, exactly as prose
+                        # exempts the whole clause and the metric-header path
+                        # skips a forecast-framed column. Without this the generic
+                        # path is stricter than both of its siblings.
+                        label_is_forecast = bool(
+                            _FORECAST_FRAME_RE.search(cells[label_index])
+                        )
+                        for value_index in (label_index + 1, label_index - 1):
+                            if (
+                                0 <= value_index < len(cells)
+                                and value_index not in claimed
+                                and _metric_kind_for_text(cells[value_index]) is None
+                            ):
+                                claimed.add(value_index)
+                                if label_is_forecast:
+                                    continue
+                                self._check_table_cell(
+                                    cells[label_index], row_kind, cells[value_index], issues
+                                )
+                    continue
+                for (cell_text, kind, header_forecast), cell in zip(columns, cells):
+                    if kind is None or header_forecast:
+                        continue
+                    self._check_table_cell(cell_text, kind, cell, issues)
+        for index, line in enumerate(lines):
+            if index in consumed:
+                continue
+            line_symbol = self._symbol_for_claim(line, price_records)
+            for segment in _split_clauses(line):
+                if _CATEGORICAL_WINDOW_RE.search(segment) and _NUMBER_RE.search(segment):
+                    if not any(
+                        entry.get("tool") in _ANALYSIS_WINDOW_TOOLS
+                        for entry in self._analysis_completed
+                    ):
+                        match = _NUMBER_RE.search(segment)
+                        issues.append(
+                            {
+                                "code": "analysis_claim_unavailable",
+                                "claim": segment.strip()[:200],
+                                "value": match.group(0) if match else None,
+                                "message": (
+                                    "No backtest completed in this session, yet the "
+                                    "answer states a categorical historical-window "
+                                    "fact. Mark the analysis as incomplete and omit "
+                                    "this claim."
+                                ),
+                            }
+                        )
+                    continue
+                if _DEFINITION_FRAME_RE.search(segment):
+                    continue
+                # Attributed figures ("The paper reports a Sharpe of 1.8",
+                # or the marker in a neighbouring clause: "据研究显示，策略
+                # 年化收益 18.2%") are citations, not invented measurements
+                # — skip the gate.
+                if _ATTRIBUTION_RE.search(segment):
+                    continue
+                values = self._measure_numbers(segment)
+                if not values:
+                    continue
+                if not _ANALYSIS_METRIC_RE.search(segment):
+                    continue
+                if _FORECAST_FRAME_RE.search(segment):
+                    continue
+                kind = _metric_kind_for_text(segment)
+                unsupported = [
+                    value
+                    for value in values
+                    if not self._analysis_value_observed(value, kind)
+                ]
+                if not unsupported:
+                    continue
+                # A return figure may be arithmetic on sourced inputs rather
+                # than an invented backtest metric (#1338 review): an explicit
+                # formula anchored to observed values, or growth between two
+                # observed endpoints stated in the same line.
+                if kind == "return":
+                    if _DERIVATION_RE.search(line) and self._is_explicit_derivation(
+                        line, price_records, line_symbol
+                    ):
+                        continue
+                    operands = self._observed_operands_in_line(
+                        line, price_records, line_symbol
+                    )
+                    if len(operands) >= 2 and self._return_derived_from_observed(
+                        unsupported, price_records, line_symbol, operands=operands
+                    ):
+                        continue
+                issues.append(
+                    {
+                        "code": "analysis_claim_unavailable",
+                        "claim": segment.strip()[:200],
+                        "value": unsupported[0],
+                        "kind": kind,
+                        "message": (
+                            "No supporting analysis evidence (a completed "
+                            "backtest result or observed risk metric) exists for "
+                            "this figure. Mark the analysis as incomplete and omit "
+                            "these figures."
+                        ),
+                    }
+                )
+        return issues
+
+    def _check_table_cell(
+        self,
+        label: str,
+        kind: str | None,
+        cell: str,
+        issues: list[dict[str, Any]],
+    ) -> None:
+        """Reject one table cell whose numeric value is an unsupported metric.
+
+        Shared by the metric-headed and generic-header (label, value) table
+        paths. A forecast or definitional annotation exempts only that cell.
+
+        Args:
+            label: The metric label the value is attached to (header cell or
+                row's first cell), for the issue claim text.
+            kind: The resolved metric kind, already derived from ``label``.
+            cell: One value cell to validate.
+            issues: Accumulator for ``analysis_claim_unavailable`` issues.
+        """
+        if kind is None:
+            return
+        values = GroundingLedger._measure_numbers(cell)
+        if not values:
+            return
+        # A forecast annotation inside the cell ("预计 12.4%") exempts only
+        # that cell, never its neighbours.
+        if _FORECAST_FRAME_RE.search(cell) or _DEFINITION_FRAME_RE.search(cell):
+            return
+        unsupported = [
+            value
+            for value in values
+            if not self._analysis_value_observed(value, kind)
+        ]
+        if not unsupported:
+            return
+        issues.append(
+            {
+                "code": "analysis_claim_unavailable",
+                "claim": f"{label}: {cell}"[:200],
+                "value": unsupported[0],
+                "kind": kind,
+                "message": (
+                    "No supporting analysis evidence (a completed "
+                    "backtest result or observed risk metric) exists "
+                    "for this figure. Mark the analysis as incomplete "
+                    "and omit these figures."
+                ),
+            }
+        )
+
+    @staticmethod
+    def _measure_numbers(text: str) -> list[str]:
+        """Extract measurement-shaped numbers (decimal or percent) from a claim."""
+        masked = _LOCALIZED_DATE_RE.sub(" ", text)
+        masked = _DATE_RE.sub(" ", masked)
+        masked = _SHORT_DATE_RE.sub(" ", masked)
+        masked = _DASH_DATE_RE.sub(" ", masked)
+        return [
+            match.group(0).replace(" ", "").replace(",", "")
+            for match in _MEASURE_NUMBER_RE.finditer(masked)
+        ]
+
+    @staticmethod
+    def _pipe_tables(
+        lines: Sequence[str],
+    ) -> list[tuple[list[str], list[list[str]], list[int]]]:
+        """Yield (header cells, row cells, row line indices) per pipe table."""
+        tables: list[tuple[list[str], list[list[str]], list[int]]] = []
+        index = 0
+        while index < len(lines):
+            if lines[index].count("|") < 2:
+                index += 1
+                continue
+            block_start = index
+            block: list[str] = []
+            while index < len(lines) and lines[index].count("|") >= 2:
+                block.append(lines[index])
+                index += 1
+            rows: list[list[str]] = []
+            row_indices: list[int] = []
+            for offset, block_line in enumerate(block[1:], start=1):
+                cells = GroundingLedger._table_cells(block_line)
+                if not cells or all(
+                    _TABLE_SEPARATOR_RE.fullmatch(cell.strip()) for cell in cells
+                ):
+                    continue
+                rows.append(cells)
+                row_indices.append(block_start + offset)
+            tables.append((GroundingLedger._table_cells(block[0]), rows, row_indices))
+        return tables
+
+    def _analysis_value_observed(self, raw: str, kind: str | None) -> bool:
+        """Return True when a claim measurement matches kind-scoped evidence.
+
+        Tools disagree on scale: ``compute_risk_xray`` returns fractions
+        (annualized_vol 0.182, max_drawdown -0.094) while answers quote
+        percents (18.2%, -9.4%). Try both the value and its percent scaling
+        so an observed 0.182 grounds an 18.2% claim and vice versa. Drawdown
+        sign conventions disagree too (positive vs negative fraction), so
+        magnitude is compared for that kind. Only evidence of the claim's own
+        kind counts: an observed price never grounds a volatility figure.
+        """
+        try:
+            value = float(raw.replace("%", "").replace("％", "").replace(",", ""))
+        except ValueError:
+            return True
+        observed: list[float] = []
+        for record in self._analysis_metrics:
+            if record.get("metric") == kind and record.get("value") is not None:
+                observed.append(float(record["value"]))
+        for record in self._evidence:
+            if record.status != "observed" or record.value is None:
+                continue
+            if _metric_kind_for_path(record.field) != kind:
+                continue
+            observed.append(float(record.value))
+        candidates = {value, value / 100.0}
+        if kind == "drawdown":
+            candidates |= {abs(value), abs(value) / 100.0}
+
+        def close(candidate: float, item: float) -> bool:
+            return abs(candidate - item) <= max(abs(item) * 0.005, 1e-9)
+
+        return any(close(candidate, item) for candidate in candidates for item in observed)
+
+    def _observed_operands_in_line(
+        self,
+        line: str,
+        records: Sequence[EvidenceRecord],
+        symbol: str | None,
+    ) -> list[float]:
+        """Observed values that literally appear as numbers in this clause.
+
+        This is the structural half of the derivation exemption. Keying it on
+        a growth PHRASE ("从…到" / "from…to") made the gate stricter for every
+        wording the list happened to miss, which is the same per-language
+        drift that ``test_grounding_language_parity`` exists to stop: the
+        Chinese "第一日收盘 100.0 美元，第二日收盘 112.4 美元，收益率 12.4%"
+        states the identical derivation and was rejected. Requiring the
+        operands themselves to be present and sourced is language-independent
+        and strictly narrower than a phrase list, because a bare
+        "cumulative return of 12.4%" carries no operands at all.
+        """
+        candidates = [record for record in records if record.value is not None]
+        if symbol:
+            candidates = [record for record in candidates if record.symbol == symbol]
+        observed = {float(record.value) for record in candidates}
+        if not observed:
+            return []
+        present: set[float] = set()
+        for raw in self._numbers_without_dates_or_percent(line):
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            for candidate in observed:
+                if abs(value - candidate) <= max(abs(candidate) * 1e-9, 1e-9):
+                    present.add(candidate)
+        return sorted(present)
+
+    def _return_derived_from_observed(
+        self,
+        claimed: Sequence[str],
+        records: Sequence[EvidenceRecord],
+        symbol: str | None,
+        *,
+        operands: Sequence[float] | None = None,
+    ) -> bool:
+        """True when a return figure equals growth between observed endpoints.
+
+        #1338 review: "AAPL.US 从 2026-08-03 的 100.0 涨到 2026-09-02 的
+        112.4，区间收益率为 12.4%" states arithmetic on sourced inputs. Only
+        an exact (±0.5%) match against a pair of observed values grounds the
+        figure; the caller must already have verified the from/to frame, so a
+        bare unanchored return claim never reaches here.
+        """
+        if operands is not None:
+            observed = sorted(set(operands))
+        else:
+            candidates = [record for record in records if record.value is not None]
+            if symbol:
+                candidates = [
+                    record for record in candidates if record.symbol == symbol
+                ]
+            observed = sorted({float(record.value) for record in candidates})
+        if len(observed) < 2:
+            return False
+        values: list[float] = []
+        for raw in claimed:
+            try:
+                values.append(float(str(raw).rstrip("%％")))
+            except ValueError:
+                continue
+        for base in observed:
+            for target in observed:
+                if target == base:
+                    continue
+                derived = (target - base) / base
+                for value in values:
+                    if abs(value - derived) <= max(abs(derived) * 0.005, 1e-9):
+                        return True
+                    if abs(value - derived * 100.0) <= max(
+                        abs(derived * 100.0) * 0.005, 1e-9
+                    ):
+                        return True
+        return False
 
     def _validate_price_claims(self, content: str) -> list[dict[str, Any]]:
         """Check Markdown OHLC tables and price prose against observed records.
@@ -2176,7 +3225,7 @@ class GroundingLedger:
             for segment in _split_clauses(line):
                 if not _PRICE_CONTEXT_RE.search(segment):
                     continue
-                values = self._numbers_without_dates_or_percent(segment)
+                values = self._direct_price_values(segment)
                 if not values:
                     continue
                 has_price_claim = True
@@ -2187,6 +3236,13 @@ class GroundingLedger:
                 )
                 if self._is_explicit_derivation(segment, records, symbol):
                     continue
+                # NO attribution exemption here, deliberately. A paper's
+                # Sharpe is a figure this run could never have observed, so
+                # citing it is legitimate; a PRICE is exactly what this run
+                # does observe, so "analysts say TSLA.US last traded at
+                # 412.35" is the laundering shape this gate exists to catch —
+                # adding a citation subject must not buy a fabricated quote a
+                # way through. The exemption stays in the analysis gate only.
                 for value in values:
                     issue = self._compare_price_claim(
                         value=value,
@@ -2486,6 +3542,42 @@ class GroundingLedger:
         return records
 
     @staticmethod
+    def _masked_candidate_text(text: str) -> str:
+        """Mask every non-price digit run, preserving string length and offset.
+
+        Each mask match is replaced by an equal-length run of spaces, so a
+        number's offset in the returned string is its offset in ``text`` — the
+        structural price-claim scan needs that alignment.
+        """
+        masked = text
+        for pattern in (
+            _MD_LIST_ITEM_RE,
+            _RATE_FORMULA_IDENTITY_RE,
+            _CANONICAL_SYMBOL_RE,
+            _LOCALIZED_DATE_RE,
+            _DATE_RE,
+            _SHORT_DATE_RE,
+            _DASH_DATE_RE,
+            _PERCENT_RANGE_RE,
+            _PERCENTAGE_POINT_RE,
+            _ORDER_LEVEL_RE,
+            _AGGREGATE_AMOUNT_RE,
+            _LABELLED_SCORE_RE,
+            _INDICATOR_VALUE_RE,
+            _SIGNAL_VALUE_RE,
+            _PROSPECTIVE_LEVEL_RE,
+            _REFERENCE_LEVEL_RE,
+            _SINCE_REFERENCE_RE,
+            _LINE_REFERENCE_RE,
+            _NUMBERED_HEADING_RE,
+            _RATIO_RE,
+            _FX_RATE_RE,
+            _QUANTITY_WITH_UNIT_RE,
+        ):
+            masked = pattern.sub(lambda m: " " * (m.end() - m.start()), masked)
+        return masked
+
+    @staticmethod
     def _numbers_without_dates_or_percent(text: str) -> list[float]:
         """Extract the numbers in a claim that could plausibly be prices.
 
@@ -2503,35 +3595,60 @@ class GroundingLedger:
         Returns:
             Candidate price values, in order of appearance.
         """
-        masked = _MD_LIST_ITEM_RE.sub(" ", text)
-        masked = _RATE_FORMULA_IDENTITY_RE.sub(" ", masked)
-        masked = _CANONICAL_SYMBOL_RE.sub(" ", masked)
-        masked = _LOCALIZED_DATE_RE.sub(" ", masked)
-        masked = _DATE_RE.sub(" ", masked)
-        masked = _SHORT_DATE_RE.sub(" ", masked)
-        masked = _DASH_DATE_RE.sub(" ", masked)
-        masked = _PERCENT_RANGE_RE.sub(" ", masked)
-        masked = _ORDER_LEVEL_RE.sub(" ", masked)
-        masked = _AGGREGATE_AMOUNT_RE.sub(" ", masked)
-        masked = _LABELLED_SCORE_RE.sub(" ", masked)
-        masked = _INDICATOR_VALUE_RE.sub(" ", masked)
-        masked = _PROSPECTIVE_LEVEL_RE.sub(" ", masked)
-        masked = _REFERENCE_LEVEL_RE.sub(" ", masked)
-        masked = _SINCE_REFERENCE_RE.sub(" ", masked)
-        masked = _LINE_REFERENCE_RE.sub(" ", masked)
-        masked = _NUMBERED_HEADING_RE.sub(" ", masked)
-        masked = _RATIO_RE.sub(" ", masked)
-        masked = _FX_RATE_RE.sub(" ", masked)
-        without_dates = _QUANTITY_WITH_UNIT_RE.sub(" ", masked)
+        masked = GroundingLedger._masked_candidate_text(text)
         values: list[float] = []
-        for match in _NUMBER_RE.finditer(without_dates):
-            tail = without_dates[match.end() :].lstrip()
+        for match in _NUMBER_RE.finditer(masked):
+            tail = masked[match.end() :].lstrip()
             if tail.startswith(("%", "％")):
                 continue
             try:
                 values.append(float(match.group(0).replace(",", "")))
             except ValueError:
                 continue
+        return values
+
+    @staticmethod
+    def _direct_price_values(text: str) -> list[float]:
+        """Numbers in a price segment that read as asserted observed values.
+
+        ``_numbers_without_dates_or_percent`` returns every non-masked number;
+        this further drops numbers that are formula operands rather than claims
+        (#1354). For each surviving number, the span between the nearest
+        preceding price-context word and the number decides:
+
+        * a sentence boundary (``. ``/``! ``/``? ``) in the span — the number
+          belongs to a later sentence the price word cannot reach ("close was
+          210. In 2024 …" must not claim 2024);
+        * otherwise, a closed formula marker in the span turns the number into
+          an operand, unless an observation binder ("was", "at", 报收/收于/…) after
+          the last marker re-attaches it to the price word.
+
+        "close/SMA50 > 1" and "close above SMA50 and was 2500" are decided in
+        opposite directions by the binder; "close was 2500" (no marker) stays
+        a claim either way.
+        """
+        price_words = list(_PRICE_CONTEXT_RE.finditer(text))
+        masked = GroundingLedger._masked_candidate_text(text)
+        values: list[float] = []
+        for match in _NUMBER_RE.finditer(masked):
+            tail = masked[match.end() :].lstrip()
+            if tail.startswith(("%", "％")):
+                continue
+            try:
+                value = float(match.group(0).replace(",", ""))
+            except ValueError:
+                continue
+            preceding = [w for w in price_words if w.end() <= match.start()]
+            if preceding:
+                span = text[preceding[-1].end() : match.start()]
+                if _SENTENCE_BOUNDARY_RE.search(span):
+                    continue
+                markers = list(_FORMULA_MARKER_RE.finditer(span))
+                if markers and not _OBSERVATION_BINDER_RE.search(
+                    span[markers[-1].end() :]
+                ):
+                    continue
+            values.append(value)
         return values
 
     def _is_explicit_derivation(
@@ -2643,7 +3760,9 @@ class GroundingLedger:
 __all__ = [
     "GROUNDING_ARTIFACT",
     "GroundingLedger",
+    "IdentityConstraint",
     "IdentityRecord",
+    "ResolutionContext",
     "ToolAuthorization",
     "ValidationResult",
 ]

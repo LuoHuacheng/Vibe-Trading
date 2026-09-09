@@ -27,9 +27,19 @@ agent/runs/
 agent/.ui_runtime/
 agent/.tasks/
 agent/uploads/
-# Same runtime artifacts, but written to the repo root when the CLI or server
-# is started from there — sessions.db holds real session transcripts and
-# live/ holds broker audit and kill-switch state.
+# The same runtime artifacts, written to the repo root whenever the runtime
+# root resolves here — which it does for anyone whose shell exports
+# VIBE_TRADING_HOME as this checkout, and for a CLI or server started from it.
+#
+# This list is the set of children `get_runtime_root()` can create; keep it
+# closed against `agent/src/config/paths.py` and the connector `sdk.py`
+# CONFIG_FILENAME sites rather than adding entries one incident at a time.
+# It was built that way and had gaps: /swarm/runs/ was ignored while /swarm/
+# was not, and workspace/ — created by get_workspace_path() on any channel
+# adapter import — was not covered at all. Several of these carry secrets
+# (auth/ holds the Codex token, connectors/ and connections.json hold broker
+# credentials) or tamper-evident state (live/ holds the hash-chained audit
+# ledger), so a stray `git add -A` here is a credential leak, not just noise.
 /sessions.db
 /sessions.db-shm
 /sessions.db-wal
@@ -37,10 +47,27 @@ agent/uploads/
 /runs/
 /shadow_runs/
 /shadow_accounts/
-/swarm/runs/
+/swarm/
 /live/
 /uploads/
 /imports/
+/workspace/
+/auth/
+/connectors/
+/portfolio/
+/scheduled_research/
+/memory/
+/memory_index/
+/cache/
+/data/
+/reports/
+/hypotheses/
+/history/
+/pairing/
+/connections.json
+/portfolio.json
+/config.yaml
+/strategy_evidence.sqlite3
 agent/tests/*_result.json
 .ruff_cache/
 frontend/dist/

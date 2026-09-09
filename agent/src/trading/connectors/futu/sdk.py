@@ -415,7 +415,12 @@ def get_historical_bars(
     limit: int = 90,
     **_: Any,
 ) -> dict[str, Any]:
-    """Fetch historical K-line bars for ``symbol`` (e.g. ``US.AAPL``)."""
+    """Fetch historical K-line bars for ``symbol`` (e.g. ``US.AAPL``).
+
+    Bars are forward-adjusted (Futu ``AuType.QFQ``, the SDK default, passed
+    explicitly so a futu-side default change cannot silently switch the
+    caliber). The response declares the caliber in ``adjustment``.
+    """
     cfg = config or load_config()
     futu = _require_futu()
     ktype_name = _KLTYPE_MAP.get(period.strip(), "K_DAY")
@@ -423,11 +428,16 @@ def get_historical_bars(
     quote_ctx = _quote_ctx(cfg)
     try:
         code = symbol.strip().upper()
-        rows = _records(_unwrap(quote_ctx.request_history_kline(code, ktype=ktype, max_count=int(limit))))
+        autype = getattr(getattr(futu, "AuType", None), "QFQ", None)
+        request: dict[str, Any] = {"ktype": ktype, "max_count": int(limit)}
+        if autype is not None:
+            request["autype"] = autype
+        rows = _records(_unwrap(quote_ctx.request_history_kline(code, **request)))
         return {
             "status": "ok",
             "symbol": code,
             "period": period,
+            "adjustment": "qfq",
             "bars": [_bar_to_dict(row) for row in rows],
         }
     finally:

@@ -13,7 +13,10 @@ from src.agent.context import ContextBuilder
 from src.agent.grounding import (
     GroundingLedger,
     _infer_currency,
+    _infer_instrument_type,
     _infer_venue,
+    _JOINED_CRYPTO_RE,
+    _normalize_symbol,
     _scan_symbols,
     _symbol_from_csv_filename,
     _timestamp_matches_claim_date,
@@ -363,6 +366,13 @@ def test_bare_ticker_stays_blocked_when_it_names_more_than_one_identity(
         ("00700.HK", "700.HK"),
         ("00700.HK", "0700.HK"),
         ("BTC-USDT", "BTC/USDT"),
+        # Joined crypto pairs (no separator) are the same identity as the
+        # dashed/slashed spelling. Without this normalization, a ``BTCUSDT``
+        # argument against a locked ``BTC-USDT`` is rejected as
+        # ``identity_mismatch`` by ``_match_authorized_symbol``.
+        ("BTC-USDT", "BTCUSDT"),
+        ("ETH-USDT", "ETHUSDT"),
+        ("BTC-USDC", "BTCUSDC"),
     ],
 )
 def test_provider_spellings_of_one_instrument_are_one_identity(
@@ -382,6 +392,84 @@ def test_provider_spellings_of_one_instrument_are_one_identity(
 
     assert ledger.authorized_symbols == {locked}
     assert authorization.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The four unambiguous stablecoin suffixes, with several bases.
+        ("BTCUSDT", "BTC-USDT"),
+        ("ETHUSDT", "ETH-USDT"),
+        ("SOLUSDT", "SOL-USDT"),
+        ("BTCUSDC", "BTC-USDC"),
+        ("BTCBUSD", "BTC-BUSD"),
+        ("ETHTUSD", "ETH-TUSD"),
+        ("btcusdt", "BTC-USDT"),  # case-insensitive
+        # Edge: the suffix alone is too short to split (the base must have
+        # at least one character).
+        ("USDT", "USDT"),
+        ("USDC", "USDC"),
+        # Edge: a numeric prefix is not a crypto base.
+        ("123USDT", "123USDT"),
+        # Negatives: existing shapes must be untouched.
+        ("BTC-USDT", "BTC-USDT"),
+        ("BTC/USD", "BTC-USD"),
+        ("VALOUR-BTC-0-SEK.ST", "VALOUR-BTC-0-SEK.ST"),
+        ("AAPL.US", "AAPL.US"),
+        ("600519.SH", "600519.SH"),
+    ],
+)
+def test_normalize_joined_crypto_pairs(raw: str, expected: str) -> None:
+    """A joined crypto pair (no separator) normalizes to its dashed form."""
+    assert _normalize_symbol(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("BTCUSDT", {"BTC-USDT"}),
+        ("BTCUSDT spot price", {"BTC-USDT"}),
+        ("ETH/USDT latest price", {"ETH-USDT"}),
+        ("BTC-USDT close", {"BTC-USDT"}),
+        ("BTCUSDT, ETH-USDT, BTC-USD", {"BTC-USDT", "ETH-USDT", "BTC-USD"}),
+    ],
+)
+def test_scan_symbols_detects_joined_pairs(text: str, expected: set[str]) -> None:
+    """A bare joined crypto pair is scanned as the canonical symbol."""
+    assert _scan_symbols(text) == expected
+
+
+# The other arm of the same decision, pinned as two mechanisms because it is
+# two mechanisms. Nothing covered either of them: adding "USD" back to the
+# suffix list passed every other test in this file while folding spot gold to
+# XAU-USD, the exact tokenized-gold misresolution #1282 exists to stop.
+#
+# 1. Bare "USD" is kept out of the suffix list, so an FX or metal pair never
+#    matches the joined-pair regex in the first place.
+@pytest.mark.parametrize("raw", ["XAUUSD", "XAGUSD", "XPDUSD", "EURUSD", "GBPUSD"])
+def test_bare_usd_quote_never_matches_the_joined_pair_regex(raw: str) -> None:
+    assert _JOINED_CRYPTO_RE.fullmatch(raw) is None
+    assert "-USD" not in _normalize_symbol(raw)
+
+
+# 2. XPTUSD is the case the suffix list alone cannot catch: it is XPT + USD
+#    (platinum), but it also ends in "TUSD", so the regex DOES match and the
+#    alpha base "XP" passes the isalpha guard. Without the metal-pair check it
+#    normalizes to XP-TUSD — a crypto pair that does not exist. FX pairs have
+#    canonical_fx_pair as a second line of defence; XAU/XPT are metal codes,
+#    not fiat codes, so they have none.
+def test_metal_usd_pair_is_not_split_on_the_tusd_suffix() -> None:
+    assert _JOINED_CRYPTO_RE.fullmatch("XPTUSD") is not None, (
+        "precondition: the regex does match, which is why the guard is needed"
+    )
+    assert _normalize_symbol("XPTUSD") == "XPTUSD"
+
+
+# ...and the guard must not swallow genuine pairs quoted in TrueUSD.
+def test_genuine_tusd_pairs_still_fold() -> None:
+    assert _normalize_symbol("LINKTUSD") == "LINK-TUSD"
+    assert _normalize_symbol("ADABUSD") == "ADA-BUSD"
+    assert _normalize_symbol("OPUSDT") == "OP-USDT"
 
 
 def test_binance_pair_resolution_authorizes_crypto_consumers(tmp_path: Path) -> None:
@@ -543,6 +631,56 @@ def test_explicit_symbol_and_resolver_suffix_alias_are_one_identity(
     assert ledger.identity_status == "locked"
     assert ledger.authorized_symbols == {"562500.SH"}
     assert authorization.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected_venue", "expected_type"),
+    [
+        # Spot gold: bare 6-letter, dashed, slashed, Yahoo forex notation.
+        # Before this fix, the shape-based fallback in _infer_venue / _infer_instrument_type
+        # mis-classified any dashed / slashed symbol as crypto_or_fx / crypto.
+        ("XAUUSD", "forex", "forex"),
+        ("XAU-USD", "forex", "forex"),
+        ("XAU/USD", "forex", "forex"),
+        ("XAUUSD=X", "forex", "forex"),
+        # COMEX gold futures via Yahoo continuous-front-month notation.
+        ("GC=F", "futures", "future"),
+        # Tokenized gold stays crypto.
+        ("XAUT-USDT", "crypto_or_fx", "crypto"),
+        ("PAXG-USDT", "crypto_or_fx", "crypto"),
+        # Regression: existing crypto / US equity behavior unchanged.
+        ("BTC-USDT", "crypto_or_fx", "crypto"),
+        ("GLD", None, "listed_security"),
+        ("AAPL.US", "us", "listed_security"),
+    ],
+)
+def test_runtime_registry_classifies_gold_fx_futures_consistently(
+    symbol, expected_venue, expected_type
+) -> None:
+    """The runtime registry must agree with the engine classifier for gold / FX / futures.
+
+    PR #1280 added the metal/FX/futures patterns to the engine
+    ``_MARKET_PATTERNS`` and the correlation helper. This test pins the
+    third copy (the shape-based fallback in
+    ``_infer_venue`` / ``_infer_instrument_type``) to the same
+    whitelist. Without this, a bare ``XAUUSD`` query would surface in
+    the registry as ``venue=None, type=listed_security`` and a dashed
+    ``XAU-USD`` would surface as ``venue=crypto_or_fx, type=crypto``,
+    contradicting the engine's actual classification. The user observed
+    this exact runtime state in the agent before the fix.
+    """
+    assert _infer_venue(symbol) == expected_venue
+    assert _infer_instrument_type(symbol) == expected_type
+    # Quote currency is non-None only for dashed / slashed shapes.
+    if "-" in symbol or "/" in symbol:
+        # Whitelist-based ``USD`` leg: only metals/FX/forex (not crypto).
+        if symbol.endswith("-USD") and symbol not in {"XAUT-USD", "PAXG-USD"}:
+            assert _infer_currency(symbol) == "USD"
+        # Otherwise the trailing 3-5 letter leg is the quote currency.
+        elif symbol.endswith("-USDT") or symbol.endswith("-USDC") or \
+             symbol.endswith("-BUSD") or symbol.endswith("-TUSD") or \
+             symbol.endswith("-FDUSD"):
+            assert _infer_currency(symbol) in {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
 
 
 def test_resolver_answering_a_different_venue_is_still_conflicting(
@@ -1242,6 +1380,97 @@ def test_price_validation_ignores_score_indicator_and_window_digits(
     ):
         result = ledger.validate_final_answer(draft)
         assert result.valid is True, (draft, result.issues)
+
+
+def test_price_validation_ignores_formula_variable_digits(tmp_path: Path) -> None:
+    """A price word used as a formula variable is not an asserted price (#1354).
+
+    The gate uses one structural rule, not a catalogue of phrasings: a number
+    after a price word is a claimed value only when nothing formula-like sits
+    between them. A closed marker set — comparison/division operators or an
+    indicator identifier followed by digits — marks the number an operand; an
+    observation binder ("was", "at", 报收/收于/…) after that marker re-attaches it
+    to the price word, so "close above SMA50 and was 2500" stays a claim while
+    "close/SMA50 > 1" claims nothing. An ASCII sentence boundary (" . ") ends
+    the price word's reach, so a bare year two sentences later is not claimed.
+    """
+    ledger = _screened_ledger(tmp_path)
+
+    for draft in (
+        # Division + comparison: window and threshold, not a price.
+        "000543.SZ close/SMA50 > 1 时买入（source: tencent）",
+        # Signal value after a signal word / arrow / 触发.
+        "000543.SZ close acima da EMA30 dispara sinal +1（source: tencent）",
+        "000543.SZ close above EMA20 -> +1（source: tencent）",
+        "000543.SZ 收盘价上穿MA20 触发 +1 信号（source: tencent）",
+        # Plain comparison against a level, not a quote.
+        "000543.SZ close > 1 时买入（source: tencent）",
+        # Indicator reading with a directional connective.
+        "000543.SZ close/SMA50 > 1 and RSI below 30（source: tencent）",
+        # Colon after the signal word (ASCII '.' is not a clause separator,
+        # so "Sinal: +1" can share a clause with the price word).
+        "000543.SZ close acima da EMA30. Sinal: +1（source: tencent）",
+        # Indicator identifier + digits between the price word and the number,
+        # even when the operator is spelled out in prose.
+        "000543.SZ close vs SMA20 maior que 1（source: tencent）",
+        "000543.SZ close minus SMA20 fallen below 0（source: tencent）",
+    ):
+        result = ledger.validate_final_answer(draft)
+        assert result.valid is True, (draft, result.issues)
+
+    # Strict-narrowing bar: the formula language must not launder an observed
+    # value. Verified adversarially; each shape stays a claim.
+    for launder in (
+        # no operator, no indicator digits: the plain claim
+        "000543.SZ close was 2500（source: tencent）",
+        # digit-carrying connector bridging to an indicator
+        "000543.SZ close was 2500 and SMA50 2450（source: tencent）",
+        # observation verb trailing the formula in the same clause
+        "000543.SZ close above SMA50 and was 2500 yesterday（source: tencent）",
+        # at-attached level trailing the formula
+        "000543.SZ close above SMA50 at 2450（source: tencent）",
+        # equality claim, not a formula
+        "000543.SZ close = 2500（source: tencent）",
+        # second price word after a comma stays gated
+        "000543.SZ close above SMA50, and closed at 2500 yesterday（source: tencent）",
+        # Chinese observation syntax
+        "000543.SZ 收盘价报收 2500（source: tencent）",
+        # multi-digit value after a signal word is a price, not a signal
+        "000543.SZ close signal 2500（source: tencent）",
+        # "above" with a price word is a claim, not an indicator reading
+        "000543.SZ close above 2500（source: tencent）",
+    ):
+        result = ledger.validate_final_answer(launder)
+        assert result.valid is False, launder
+        assert "numeric_claim_conflict" in {issue["code"] for issue in result.issues}
+
+
+def test_direct_price_values_structural_rule() -> None:
+    """The structural rule decides operand vs. claim at the number level (#1354)."""
+    extract = GroundingLedger._direct_price_values
+    # Formula operands — a marker between the price word and the number.
+    for text in (
+        "close/SMA50 > 1.0",
+        "close acima da EMA30 dispara sinal +1",
+        "收盘价上穿MA20 触发 +1 信号",
+        "close/SMA50 > 1 and RSI below 30",
+        "close vs SMA20 maior que 1",
+        "close minus SMA20 fallen below 0",
+        # CJK-adjacent indicator (no ASCII space): the marker's \b must not
+        # treat a CJK letter as a word character, or 上穿MA20 is invisible.
+        "收盘价上穿SMA20 2500",
+    ):
+        assert extract(text) == [], text
+    # Observed values — no marker, or an observation binder after the marker.
+    assert extract("close was 2500") == [2500.0]
+    assert extract("close above 2500") == [2500.0]
+    assert extract("close = 2500") == [2500.0]
+    assert extract("close above SMA50 and was 2500 yesterday") == [2500.0]
+    assert extract("close above SMA50 at 2450") == [2450.0]
+    assert extract("收盘价报收 2500") == [2500.0]
+    # Sentence boundary: the price word cannot reach a later sentence.
+    assert extract("close was 210. In 2024 the market rallied") == [210.0]
+    assert extract("close. Sinal: 2500") == []
 
 
 def test_price_validation_ignores_short_dates_and_percent_ranges(
@@ -2064,6 +2293,134 @@ def test_an_unevidenced_price_is_still_rejected_without_any_tool_call(
     }
 
 
+@pytest.mark.parametrize(
+    ("draft", "paren_width"),
+    [
+        ("同期五粮液（000858.SZ）收 168.50 元。", "full-width"),
+        ("同期五粮液(000858.SZ)收 168.50 元。", "half-width"),
+    ],
+)
+def test_fullwidth_parentheses_do_not_split_symbol_from_figure(
+    tmp_path: Path,
+    draft: str,
+    paren_width: str,
+) -> None:
+    """#1260: 公司名（代码）价格 must stay in one clause for the gate.
+
+    Full-width （） were treated as clause separators, so the symbol landed in
+    one segment and the figure in the next and the unsourced-symbol gate
+    never saw them together — a false negative that flipped on parenthesis
+    width alone. Both widths must fire now; the half-width form is the
+    control that already passed.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="What is Kweichow Moutai (600519.SH) trading at this week?",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={
+            "codes": ["600519.SH"],
+            "start_date": "2026-08-24",
+            "end_date": "2026-08-28",
+            "source": "baostock",
+        },
+        result=json.dumps(
+            {
+                "600519.SH": [
+                    {
+                        "trade_date": "2026-08-28T00:00:00",
+                        "open": 1289.0,
+                        "high": 1297.89,
+                        "low": 1288.0,
+                        "close": 1297.4,
+                        "volume": 16126.11,
+                    }
+                ],
+                "_provenance": {
+                    "600519.SH": {
+                        "source": "baostock",
+                        "fallback_used": False,
+                        "currency_conversion": "none",
+                        "volume_unit": "lots",
+                    }
+                },
+            }
+        ),
+        call_id="c1",
+        success=True,
+    )
+
+    issues = [
+        issue
+        for issue in ledger.validate_final_answer(draft).issues
+        if issue.get("code") == "unsourced_symbol_figures"
+    ]
+
+    assert issues, f"{paren_width} parentheses must fire unsourced_symbol_figures"
+    # Pin the offending symbol, not just "some issue fired": the gate must
+    # blame the unsourced 000858.SZ, not the sourced 600519.SH.
+    assert [issue["symbol"] for issue in issues] == ["000858.SZ"]
+
+
+def test_unsourced_symbol_without_a_figure_stays_silent(tmp_path: Path) -> None:
+    """#1260 guard arm: figure co-presence is what the gate checks.
+
+    The regression test above pins that the gate fires when symbol and figure
+    share a clause. This arm pins the inverse: an unsourced symbol with NO
+    nearby figure must not fire unsourced_symbol_figures, so the gate's
+    figure-presence guard (_numbers_without_dates_or_percent) cannot be
+    dropped without this test failing.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="What is Kweichow Moutai (600519.SH) trading at this week?",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={
+            "codes": ["600519.SH"],
+            "start_date": "2026-08-24",
+            "end_date": "2026-08-28",
+            "source": "baostock",
+        },
+        result=json.dumps(
+            {
+                "600519.SH": [
+                    {
+                        "trade_date": "2026-08-28T00:00:00",
+                        "open": 1289.0,
+                        "high": 1297.89,
+                        "low": 1288.0,
+                        "close": 1297.4,
+                        "volume": 16126.11,
+                    }
+                ],
+                "_provenance": {
+                    "600519.SH": {
+                        "source": "baostock",
+                        "fallback_used": False,
+                        "currency_conversion": "none",
+                        "volume_unit": "lots",
+                    }
+                },
+            }
+        ),
+        call_id="c1",
+        success=True,
+    )
+
+    issues = [
+        issue
+        for issue in ledger.validate_final_answer(
+            "同期五粮液（000858.SZ）是知名白酒企业。"
+        ).issues
+        if issue.get("code") == "unsourced_symbol_figures"
+    ]
+
+    assert issues == []
+
+
 def test_a_shortlist_answers_the_user_but_still_cannot_fetch_a_quote(
     tmp_path: Path,
 ) -> None:
@@ -2471,3 +2828,922 @@ def test_a_us_csv_stem_resolves_to_its_venue_suffix() -> None:
     assert _symbol_from_csv_filename("GC_F") == "GC=F"
     # A bare name has no venue suffix and must stay unresolvable.
     assert _symbol_from_csv_filename("AAPL") is None
+
+
+class TestFiatPairAndIndexNormalization:
+    """Search, fetch and grounding agree on one FX spelling; ^ is a symbol."""
+
+    def test_fiat_pair_spellings_normalize_to_yahoo_form(self) -> None:
+        from src.agent.grounding import _normalize_symbol
+
+        assert _normalize_symbol("GBP/USD") == "GBPUSD=X"
+        assert _normalize_symbol("GBPUSD") == "GBPUSD=X"
+        assert _normalize_symbol("GBPUSD=X") == "GBPUSD=X"
+        # Crypto/metals keep their pair form — not fiat/fiat FX.
+        assert _normalize_symbol("ETH/USD") == "ETH-USD"
+        assert _normalize_symbol("XAU/USD") == "XAU-USD"
+
+    def test_scanned_slashed_pair_matches_resolver_answer(self) -> None:
+        """The query-as-asserted scan must agree with the chosen candidate."""
+        from src.agent.grounding import _scan_symbols
+
+        assert _scan_symbols("use GBP/USD spot") == {"GBPUSD=X"}
+
+    def test_index_symbols_are_scanned_and_typed(self) -> None:
+        from src.agent.grounding import (
+            _infer_currency,
+            _infer_instrument_type,
+            _scan_symbols,
+        )
+
+        assert _scan_symbols("quote ^SPX") == {"^SPX"}
+        assert _infer_instrument_type("^SPX", "INDEX") == "index"
+        assert _infer_instrument_type("^SPX") == "index"
+        assert _infer_currency("GBPUSD=X") == "USD"
+
+    def test_ingest_search_symbol_does_not_create_conflicting_identity(self) -> None:
+        """The flagship regression: ingest('GBP/USD') must lock, never conflict."""
+        from src.agent.grounding import _normalize_symbol
+
+        # Chosen (from search_symbol) and asserted (the query text) must be
+        # the same canonical identity — the comparison in _ingest_resolution.
+        chosen = _normalize_symbol("GBPUSD=X")
+        asserted = _scan_symbols("GBP/USD")
+        assert chosen in asserted
+
+
+def test_fx_pair_resolution_authorizes_market_data_consumer(tmp_path: Path) -> None:
+    """Issue: search_symbol('GBP/USD') must lock, and get_market_data('GBPUSD=X')
+    must be authorized — the slashed query used to normalize to the crypto
+    spelling (GBP-USD), disagreeing with the chosen GBPUSD=X candidate and
+    creating a conflicting identity that outranked every later lock.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="Get me the GBP/USD spot rate.",
+    )
+    before_resolution = ledger.authorized_symbols
+    resolver = ledger.authorize_tool_call(
+        "search_symbol",
+        {"query": "GBP/USD"},
+        batch_authorized_symbols=before_resolution,
+        call_id="resolve-fx",
+    )
+    assert resolver.allowed is True
+
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "GBP/USD"},
+        result=json.dumps(
+            {
+                "ok": True,
+                "source": "symbol_search",
+                "data": {
+                    "query": "GBP/USD",
+                    "count": 1,
+                    "sources": {"yahoo": "ok", "fx_normalizer": "ok"},
+                    "candidates": [
+                        {
+                            "symbol": "GBPUSD=X",
+                            "name": "GBP/USD",
+                            "market": "fx",
+                            "type": "currency",
+                            "exchange": "CCY",
+                            "source": "fx_normalizer",
+                        },
+                    ],
+                },
+            }
+        ),
+        call_id="resolve-fx",
+        success=True,
+    )
+
+    authorization = ledger.authorize_tool_call(
+        "get_market_data",
+        {"codes": ["GBPUSD=X"]},
+        batch_authorized_symbols=ledger.authorized_symbols,
+        batch_identity_status=ledger.identity_status,
+        call_id="fx-prices",
+    )
+
+    assert ledger.identity_status == "locked"
+    assert ledger.authorized_symbols == {"GBPUSD=X"}
+    assert authorization.allowed is True
+
+
+def test_backtest_metrics_rejected_when_analysis_tool_failed(
+    tmp_path: Path,
+) -> None:
+    """#1336: failed analysis tools cannot ground backtest-style metrics."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="比较几支标的并回测不同市场状态",
+    )
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": "runs/compare"},
+        result=(
+            '{"status": "error", "error": "market data unavailable after dedup"}'
+        ),
+        call_id="bt-failed",
+        success=False,
+    )
+
+    bad = ledger.validate_final_answer(
+        "| 策略 | Return vol | MaxDD | Prob. of hitting target |\n"
+        "|---|---:|---:|---:|\n"
+        "| M1 | 12.4% | -8.1% | 55% |"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_backtest_metrics_rejected_when_no_analysis_result(
+    tmp_path: Path,
+) -> None:
+    """#1336: without any completed analysis, metric prose is unsupported."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="比较几个标的的历史行情",
+    )
+
+    bad = ledger.validate_final_answer(
+        "历史回测显示策略年化波动率约 18.2%，最大回撤 -9.4%，"
+        "夏普比率 1.21，命中目标概率 58%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_backtest_metrics_accepted_after_successful_backtest(
+    tmp_path: Path,
+) -> None:
+    """#1336: a genuinely completed backtest grounds metrics its artifact holds."""
+    run_dir = tmp_path / "runs" / "compare"
+    (run_dir / "artifacts").mkdir(parents=True)
+    (run_dir / "artifacts" / "metrics.csv").write_text(
+        "total_return,sharpe,max_drawdown\n0.124,1.21,-0.081\n",
+        encoding="utf-8",
+    )
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="比较几支标的并回测不同市场状态",
+    )
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(run_dir)},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "exit_code": 0,
+                "run_dir": str(run_dir),
+                "artifacts": {
+                    "metrics.csv": str(run_dir / "artifacts" / "metrics.csv")
+                },
+            }
+        ),
+        call_id="bt-ok",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "| 策略 | 年化收益 | 夏普比率 | MaxDD |\n"
+        "|---|---:|---:|---:|\n"
+        "| M1 | 12.4% | 1.21 | -8.1% |"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_analysis_mention_without_figures_is_allowed(tmp_path: Path) -> None:
+    """#1336: refusal prose naming the gap is not a quantitative claim."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="回测这几个标的",
+    )
+
+    good = ledger.validate_final_answer(
+        "回测未能完成（行情数据不可用），因此无法给出波动率或回撤数据。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_metrics_from_successful_numeric_tool_are_allowed(
+    tmp_path: Path,
+) -> None:
+    """A successful generic analysis result grounds its returned metrics.
+
+    The real tool returns fractions (annualized_vol 0.182, max_drawdown
+    -0.094) while answers quote percents — the unit scaling must match.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="分析组合风险",
+    )
+    ledger.ingest_tool_result(
+        tool_name="portfolio_risk_xray",
+        arguments={"symbols": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "data": {
+                    "volatility": {"annualized_vol": 0.182},
+                    "drawdown": {"max_drawdown": -0.094},
+                    "sharpe": 1.21,
+                },
+            }
+        ),
+        call_id="risk-ok",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "组合年化波动率 18.2%，最大回撤 -9.4%，夏普比率 1.21。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_partially_unsupported_analysis_metrics_are_rejected(
+    tmp_path: Path,
+) -> None:
+    """One observed metric cannot launder another invented metric."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="分析组合风险",
+    )
+    ledger.ingest_tool_result(
+        tool_name="portfolio_risk_xray",
+        arguments={"symbols": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "data": {"volatility": {"annualized_vol": 0.182}},
+            }
+        ),
+        call_id="risk-partial",
+        success=True,
+    )
+
+    bad = ledger.validate_final_answer(
+        "组合年化波动率 18.2%，最大回撤 -9.4%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_forecast_probability_is_not_a_measured_claim(tmp_path: Path) -> None:
+    """#1336 gates measured facts, not forward-looking forecasts."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="明天市场会怎么样",
+    )
+
+    good = ledger.validate_final_answer(
+        "预计明日上涨概率 70%，波动率可能放大。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_valid_price_does_not_launder_unsupported_analysis_metric(
+    tmp_path: Path,
+) -> None:
+    """A valid quote must not make an invented backtest metric acceptable."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 现价多少",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {"AAPL.US": [{"trade_date": "2026-09-02", "close": 18.2}]}
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    result = ledger.validate_final_answer(
+        "AAPL.US 收盘价 18.2 USD。历史回测年化波动率 18.2%。"
+    )
+
+    assert result.valid is False, result.issues
+    assert any(issue["code"] == "analysis_claim_unavailable" for issue in result.issues)
+
+
+def test_successful_backtest_only_supports_metrics_in_its_artifact(
+    tmp_path: Path,
+) -> None:
+    """One successful result must not authorize unrelated invented metrics."""
+    metrics = tmp_path / "artifacts" / "metrics.csv"
+    metrics.parent.mkdir()
+    metrics.write_text("annual_return,sharpe\n0.182,1.21\n", encoding="utf-8")
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="回测策略",
+    )
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(tmp_path)},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "run_dir": str(tmp_path),
+                "artifacts": {"metrics": str(metrics)},
+            }
+        ),
+        call_id="backtest",
+        success=True,
+    )
+
+    result = ledger.validate_final_answer(
+        "策略年化收益 18.2%，夏普比率 1.21，最大回撤 -9.4%。"
+    )
+
+    assert result.valid is False, result.issues
+    assert any(issue.get("value") == "-9.4%" for issue in result.issues)
+
+
+def test_skipped_analysis_result_does_not_authorize_metrics(tmp_path: Path) -> None:
+    """A skipped/deduplicated call is not a completed analysis."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(tmp_path)},
+        result=json.dumps({"skipped": True, "reason": "already completed"}),
+        call_id="backtest-skipped",
+        success=True,
+    )
+
+    result = ledger.validate_final_answer("回测年化收益 18.2%，最大回撤 -9.4%。")
+
+    assert result.valid is False, result.issues
+
+
+def test_integer_historical_window_claim_is_rejected(tmp_path: Path) -> None:
+    """Categorical claims about all historical windows need evidence too."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="分析策略")
+
+    result = ledger.validate_final_answer("所有历史 12 个月窗口均实现正收益。")
+
+    assert result.valid is False, result.issues
+    assert any(issue["code"] == "analysis_claim_unavailable" for issue in result.issues)
+
+
+def test_analysis_definition_is_not_rejected(tmp_path: Path) -> None:
+    """A threshold definition is not a measured result from this session."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="什么是夏普比率？")
+
+    result = ledger.validate_final_answer("夏普比率大于 1.0 通常被认为较好。")
+
+    assert result.valid is True, result.issues
+
+
+def test_forecast_table_cell_does_not_exempt_measured_cell(
+    tmp_path: Path,
+) -> None:
+    """A forecast column must not hide an unsupported historical metric cell."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="比较两种策略")
+
+    result = ledger.validate_final_answer(
+        "| 策略 | 预计收益 | 历史最大回撤 |\n"
+        "|---|---:|---:|\n"
+        "| M1 | 预计 12.4% | -8.1% |"
+    )
+
+    assert result.valid is False, result.issues
+    assert any(issue["code"] == "analysis_claim_unavailable" for issue in result.issues)
+
+
+def test_analysis_completion_is_persisted_with_metric_provenance(
+    tmp_path: Path,
+) -> None:
+    """The grounding artifact records why an analysis figure was accepted."""
+    metrics = tmp_path / "artifacts" / "metrics.csv"
+    metrics.parent.mkdir()
+    metrics.write_text("annual_return\n0.182\n", encoding="utf-8")
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+    ledger.ingest_tool_result(
+        tool_name="backtest",
+        arguments={"run_dir": str(tmp_path)},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "run_dir": str(tmp_path),
+                "artifacts": {"metrics": str(metrics)},
+            }
+        ),
+        call_id="backtest",
+        success=True,
+    )
+
+    artifact = json.loads(
+        (tmp_path / "artifacts" / "grounding_evidence.json").read_text(encoding="utf-8")
+    )
+
+    assert artifact["analysis_evidence"]
+    assert artifact["analysis_evidence"][0]["metric"] == "return"
+
+
+def test_derived_interval_return_from_observed_endpoints_is_allowed(
+    tmp_path: Path,
+) -> None:
+    """#1338 review: a return figure derived from observed endpoints stays legal.
+
+    Both endpoints are observed evidence and the answer states the growth
+    inline — arithmetic on sourced inputs, not an invented backtest metric.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 最近一个月走势如何",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "AAPL.US 从 2026-08-03 的 100.0 涨到 2026-09-02 的 112.4，"
+        "区间收益率为 12.4%。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_derived_cumulative_return_english_is_allowed(tmp_path: Path) -> None:
+    """#1338 review: same derivation exemption for the English shape."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US price history",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "AAPL.US rose from 100.0 to 112.4, a cumulative return of 12.4% "
+        "over the window."
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_unanchored_return_claim_is_still_rejected(tmp_path: Path) -> None:
+    """Without the from/to frame, a return figure stays gated."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 价格",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    bad = ledger.validate_final_answer(
+        "AAPL.US 区间收益率为 12.4%，历史回测年化收益 18.2%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue["code"] == "analysis_claim_unavailable" for issue in bad.issues
+    )
+
+
+def test_wrong_derived_return_arithmetic_is_rejected(tmp_path: Path) -> None:
+    """A from/to frame with arithmetic that no observed pair supports fails."""
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="AAPL.US 价格",
+    )
+    ledger.ingest_tool_result(
+        tool_name="get_market_data",
+        arguments={"codes": ["AAPL.US"]},
+        result=json.dumps(
+            {
+                "AAPL.US": [
+                    {"trade_date": "2026-08-03", "close": 100.0},
+                    {"trade_date": "2026-09-02", "close": 112.4},
+                ]
+            }
+        ),
+        call_id="quote",
+        success=True,
+    )
+
+    bad = ledger.validate_final_answer(
+        "AAPL.US 从 2026-08-03 的 100.0 涨到 2026-09-02 的 112.4，"
+        "区间收益率为 30.5%。"
+    )
+
+    assert bad.valid is False, bad.issues
+    assert any(
+        issue.get("value") == "30.5%" for issue in bad.issues
+    )
+
+
+def test_research_paper_reported_metrics_are_grounded(tmp_path: Path) -> None:
+    """#1338 review: attributed paper figures must not be suppressed.
+
+    research_papers reports `reported_annualized_return` / `reported_max_drawdown`
+    — compound leaves whose kind must resolve by token, not verbatim alias.
+    """
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="查一下动量策略论文的回测表现",
+    )
+    ledger.ingest_tool_result(
+        tool_name="research_papers",
+        arguments={"query": "momentum"},
+        result=json.dumps(
+            {
+                "status": "ok",
+                "data": {
+                    "results": [
+                        {
+                            "title": "Momentum crashes",
+                            "reported_annualized_return": 0.182,
+                            "reported_max_drawdown": -0.094,
+                        }
+                    ]
+                },
+            }
+        ),
+        call_id="rp-ok",
+        success=True,
+    )
+
+    good = ledger.validate_final_answer(
+        "该论文报告其策略年化收益 18.2%，最大回撤 -9.4%（论文自述，非本次回测）。"
+    )
+
+    assert good.valid is True, good.issues
+
+
+def test_compound_metric_leaf_kind_resolution() -> None:
+    """Token-split kind resolution covers the compound-leaf family."""
+    from src.agent.grounding import _metric_kind_for_path
+
+    assert _metric_kind_for_path("results[0].reported_annualized_return") == "return"
+    assert _metric_kind_for_path("strategy_max_drawdown") == "drawdown"
+    assert _metric_kind_for_path("data.benchmark_return_vol") == "vol"
+    assert _metric_kind_for_path("data.hit_rate_daily") == "win_rate"
+    assert _metric_kind_for_path("data.risk_free_rate") is None
+    assert _metric_kind_for_path("data.trade_count") is None
+
+
+def test_analysis_gates_accept_attributed_paper_restatement(tmp_path: Path) -> None:
+    """An attributed figure is a citation, not an invented measurement (#1338
+    review): 'The paper reports a Sharpe ratio of 1.8' must pass with zero tool
+    results, in both languages, while unattributed phrasing stays blocked."""
+    for answer in (
+        "The paper reports a Sharpe ratio of 1.8 for the momentum factor.",
+        "该论文报告其策略夏普比率为 1.8。",
+        "研究机构指出该策略年化收益 18.2%。",
+        "文献指出因子年化收益 18.2%。",
+        "Analysts estimate an annualized volatility of 22%.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Research the factor.")
+        issues = ledger.validate_final_answer(answer).issues
+        assert not [i for i in issues if i.get("code") == "analysis_claim_unavailable"], (
+            answer,
+            issues,
+        )
+
+
+def test_analysis_gate_still_rejects_unattributed_and_unsourced(
+    tmp_path: Path,
+) -> None:
+    """The attribution exemption must not launder model-memory figures: the
+    review's pinned reject pair and an invented metric with an ordinary prose
+    subject keep failing."""
+    for answer in (
+        "TSLA.US last traded at 412.35 USD.",
+        "特斯拉现价 412.35 美元。",
+        "The strategy reports a Sharpe ratio of 1.8.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Analyze something.")
+        ledger.ingest_tool_result(
+            tool_name="get_market_data",
+            arguments={"codes": ["AAPL.US"]},
+            result=json.dumps(
+                {
+                    "AAPL.US": [
+                        {
+                            "trade_date": "2026-09-02T00:00:00",
+                            "close": 112.4,
+                        }
+                    ]
+                }
+            ),
+            call_id="md-1",
+            success=True,
+        )
+        issues = ledger.validate_final_answer(answer).issues
+        assert issues, answer
+        assert not any(
+            issue.get("code") == "analysis_claim_unavailable" and "1.8" not in str(issue)
+            for issue in issues
+        ), answer
+
+
+def test_attribution_exemption_cannot_launders_self_claims(tmp_path: Path) -> None:
+    """The #1336 attack shape must not escape via attribution vocabulary:
+    "the backtest/data shows" is a self-claim, and a citation in one clause
+    must not exempt an invented sibling metric in the next."""
+    for answer in (
+        "The backtest data shows an annualized return of 25%.",
+        "回测数据显示策略年化收益 25%。",
+        "数据显示策略夏普比率为 3.5。",
+        "根据本次回测，年化波动率 18.2%。",
+        "The strategy reports a Sharpe ratio of 1.8.",
+        "研究显示策略年化收益 25%。",
+        "研究报告显示策略年化收益 25%。",
+        "回测研究显示策略年化收益 25%。",
+        "投资者普遍认为其年化收益 25%。",
+        # citation in clause 1, invented sibling in clause 2
+        "The paper reports a Sharpe ratio of 1.8, and our strategy achieved "
+        "an annualized return of 47.3%.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Research the factor.")
+        issues = ledger.validate_final_answer(answer).issues
+        assert [i for i in issues if i.get("code") == "analysis_claim_unavailable"], (
+            answer,
+            issues,
+        )
+
+
+def test_attribution_never_exempts_a_price_claim(tmp_path: Path) -> None:
+    """A citation subject must not launder a fabricated quote.
+
+    The attribution exemption is legitimate in the ANALYSIS gate — a paper's
+    Sharpe is a figure this run could never have observed. A price is the
+    opposite: it is exactly what this run observes, so attributing it to a
+    source is the laundering shape the price gate exists to catch. With the
+    exemption applied to `_validate_price_claims`, every line below passed
+    with zero tool evidence.
+    """
+    for answer in (
+        "Analysts say TSLA.US last traded at 412.35 USD.",
+        "分析师指出特斯拉现价 412.35 美元。",
+        "The paper reports that AAPL.US closed at 189.20.",
+        "据研究机构报告，AAPL.US 收盘价为 189.20。",
+        "The filing reports the stock closed at 412.35.",
+    ):
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="Quote the price.")
+        issues = ledger.validate_final_answer(answer).issues
+        assert issues, f"attributed price accepted with zero evidence: {answer}"
+
+
+def test_derived_return_exemption_is_structural_not_phrasal(tmp_path: Path) -> None:
+    """The same derivation must get the same verdict in both languages.
+
+    Keying the exemption on a growth PHRASE ("从…到" / "from…to") made the
+    gate stricter for every wording the list missed. The pairs below state the
+    identical arithmetic on the identical observed endpoints; asserting the
+    two verdicts are EQUAL is what stops the next patch moving the breakage to
+    the other language, exactly as test_grounding_language_parity does.
+    """
+
+    def verdict(answer: str) -> bool:
+        ledger = GroundingLedger(run_dir=tmp_path, user_message="AAPL.US 走势")
+        ledger.ingest_tool_result(
+            tool_name="get_market_data",
+            arguments={"codes": ["AAPL.US"]},
+            result=json.dumps(
+                {
+                    "AAPL.US": [
+                        {"trade_date": "2026-08-03", "close": 100.0},
+                        {"trade_date": "2026-09-02", "close": 112.4},
+                    ]
+                }
+            ),
+            call_id="quote",
+            success=True,
+        )
+        return bool(ledger.validate_final_answer(answer).issues)
+
+    # Accepted in both: operands present in the clause and sourced.
+    for english, chinese in (
+        (
+            "AAPL.US rose from 100.0 to 112.4, a cumulative return of 12.4%.",
+            "AAPL.US 第一日收盘 100.0 美元，第二日收盘 112.4 美元，收益率 12.4%。",
+        ),
+    ):
+        en, zh = verdict(english), verdict(chinese)
+        assert en == zh, f"verdicts disagree by language: EN={en} ZH={zh}"
+        assert en is False, f"sourced derivation rejected: {english}"
+
+    # Still rejected in both: no operands in the clause, or wrong arithmetic.
+    for answer in (
+        "AAPL.US delivered a cumulative return of 12.4% over the window.",
+        "AAPL.US 区间收益率为 12.4%。",
+        "AAPL.US rose from 100.0 to 112.4, a cumulative return of 15.0%.",
+        "AAPL.US 从 100.0 涨到 112.4，区间收益率为 15.0%。",
+    ):
+        assert verdict(answer) is True, f"unanchored/wrong return accepted: {answer}"
+def test_generic_header_table_metric_rows_are_gated(tmp_path: Path) -> None:
+    """#1336 must not be dodgeable by formatting the claim as a generic-header
+    table (| 指标 | 数值 | / | Metric | Value |) with the metric kind in the
+    row instead of prose or a metric-headed table."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+
+    result = ledger.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---:|\n| 年化收益 | 18.2% |\n| 最大回撤 | -9.4% |"
+    )
+
+    assert result.valid is False, result.issues
+    assert [
+        i for i in result.issues if i.get("code") == "analysis_claim_unavailable"
+    ]
+
+    # a comparison marker must not launder an unsupported figure through a
+    # metric-headed table either: prose rejects "夏普比率 > 1.5。" without
+    # evidence, so the table form must be rejected too
+    result = ledger.validate_final_answer("| 夏普比率 |\n|---|---|\n| > 1.5 |")
+    assert result.valid is False, result.issues
+
+    # value-first layout (kind in a later cell) is gated too
+    result = ledger.validate_final_answer(
+        "| 数值 | 指标 |\n|---|---|\n| 18.2% | 年化收益率 |"
+    )
+    assert result.valid is False, result.issues
+    # the bare fragment the prose detector treats as a metric word is gated
+    result = ledger.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---|\n| 年化 | 18.2% |"
+    )
+    assert result.valid is False, result.issues
+    # multiple (label, value) pairs in one row are each gated with their own kind
+    result = ledger.validate_final_answer(
+        "| 指标 | 数值 | 指标 | 数值 |\n|---|---|---|---|\n| 年化波动率 | 18.2% | 最大回撤 | -9.4% |"
+    )
+    assert result.valid is False, result.issues
+    assert len([i for i in result.issues if i.get("code") == "analysis_claim_unavailable"]) == 2
+
+
+def test_generic_header_table_matches_prose_verdicts(tmp_path: Path) -> None:
+    """The generic-header fallback must produce the SAME verdict as prose for
+    the same claim — never looser (formatting dodge) and never stricter.
+
+    Prose without evidence rejects comparison phrasing ("最大回撤小于 -5%
+    触发风控。"), rejects the definitional frame split across the number
+    ("夏普比率通常大于1.0认为较好。"), and rejects a bare claim; with
+    kind-matched evidence all of them pass. Tables must do exactly that.
+    """
+    bare = GroundingLedger(run_dir=tmp_path / "bare", user_message="回测策略")
+    # comparison phrasing rejected without evidence, like prose
+    assert bare.validate_final_answer(
+        "| 指标 | 标准 |\n|---|---|\n| 最大回撤 | 小于 -5% 触发风控 |"
+    ).valid is False
+    # definitional frame split by the number: prose rejects it, tables must not
+    # be looser than prose or the split becomes the new formatting dodge
+    assert bare.validate_final_answer(
+        "| 指标 | 备注 |\n|---|---|\n| 夏普比率 | 通常大于1.0认为较好 |"
+    ).valid is False
+    # a label cell smuggling its own measurement is prose-identical to
+    # "年化收益率为 18.2%" — rejected
+    assert bare.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---|\n| 年化收益率 18.2% | - |"
+    ).valid is False
+
+    backed = GroundingLedger(run_dir=tmp_path / "backed", user_message="回测策略")
+    backed.ingest_tool_result(
+        tool_name="portfolio_risk_xray",
+        arguments={"symbols": ["AAPL"]},
+        result=json.dumps({"annualized_vol": 0.182, "max_drawdown": -0.05}),
+        call_id="x",
+        success=True,
+    )
+    # value-backed row accepted
+    assert backed.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---:|\n| 年化波动率 | 18.2% |"
+    ).valid is True
+    # the same comparison phrasing passes once the figure is kind-backed
+    assert backed.validate_final_answer(
+        "| 指标 | 标准 |\n|---|---|\n| 最大回撤 | 小于 -5% 触发风控 |"
+    ).valid is True
+    # contiguous definitional frame ("通常认为…") is exempt in prose, so in
+    # tables too — the frame regex is the boundary, not the formatting
+    assert backed.validate_final_answer(
+        "| 指标 | 备注 |\n|---|---|\n| 夏普比率 | 通常认为大于 1.0 较好 |"
+    ).valid is True
+    # an annotation column past the value cell is not attributed to the label:
+    # the prose verdict for "年化波动率 18.2%，较去年提升 2%。" with this evidence
+    # is valid, so the table form must not be stricter (parity).
+    assert backed.validate_final_answer(
+        "| 指标 | 数值 | 备注 |\n|---|---|---|\n| 年化波动率 | 18.2% | 较去年提升 2% |"
+    ).valid is True
+    # a FORECAST frame in the label frames the claimed value clause-wide:
+    # prose "预计夏普比率为 1.2。" and the metric-header path (header_forecast
+    # column skip) both accept; the generic path must not be stricter.
+    assert bare.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---|\n| 预计夏普比率 | 1.2 |"
+    ).valid is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Futu writes the venue as a prefix; every one of them must land on
+        # the same identity the market-data chain uses.
+        ("HK.06693", "06693.HK"),
+        ("HK.00700", "00700.HK"),
+        ("HK.700", "00700.HK"),  # zero-padded like the suffix spelling
+        ("US.AAPL", "AAPL.US"),
+        ("US.BRK-B", "BRK-B.US"),
+        ("SH.600519", "600519.SH"),
+        ("SS.600519", "600519.SH"),  # Yahoo's Shanghai alias folds onto .SH
+        ("SZ.000001", "000001.SZ"),
+        ("BJ.430047", "430047.BJ"),
+        # Negatives: a non-numeric venue code is not a listing (HK.HSI is an
+        # index feed), and the suffix spellings stay untouched.
+        ("HK.HSI", "HK.HSI"),
+        ("06693.HK", "06693.HK"),
+        ("AAPL.US", "AAPL.US"),
+        ("600519.SH", "600519.SH"),
+    ],
+)
+def test_normalize_venue_prefixed_symbols(raw: str, expected: str) -> None:
+    """A Futu-style venue prefix normalizes onto the canonical suffix form."""
+    assert _normalize_symbol(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("分析港股 HK.06693 的走势", {"06693.HK"}),
+        ("持仓 US.AAPL 与 HK.00700", {"AAPL.US", "00700.HK"}),
+        ("对比 SH.600519 和 SZ.000001", {"600519.SH", "000001.SZ"}),
+        # Negatives: prose and URLs must not become symbols. The US branch is
+        # case-sensitive precisely so a "…/us.reuters/…" host cannot.
+        ("Revenue grew in the US. Apple led the pack.", set()),
+        ("Listed in the U.S. AAPL is the largest.", set()),
+        ("see https://example.com/us.quotes for details", set()),
+    ],
+)
+def test_scan_symbols_detects_venue_prefixed_symbols(
+    text: str, expected: set[str]
+) -> None:
+    """A pasted connector code is locked as an identity, prose is not."""
+    assert _scan_symbols(text) == expected
+
+
+def test_crypto_pair_tables_match_the_resolver() -> None:
+    """The grounding copies of the crypto pair tables must not drift.
+
+    ``src.tools.symbol_search_tool`` is the resolver; it imports this module,
+    so the tables are duplicated rather than shared. A venue inferred here
+    that disagrees with the identity the resolver locks is a contradictory
+    identity, which outranks every later lock and blocks all market tools —
+    so the duplication needs a guard, not a comment.
+    """
+    from src.agent import grounding as g
+    from src.tools import symbol_search_tool as ss
+
+    assert set(g._CRYPTO_USD_BASES) == set(ss._CRYPTO_USD_BASES)
+    # ``USD`` is the one quote the resolver accepts that is ambiguous (spot
+    # gold and forex are quoted in it too); grounding decides it by the base
+    # whitelist instead, so it is the only permitted difference.
+    assert set(g._CRYPTO_QUOTE_ASSETS) | {"USD"} == set(ss._CRYPTO_QUOTE_ASSETS)

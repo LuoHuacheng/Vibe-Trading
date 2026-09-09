@@ -128,7 +128,7 @@ class TestEnvConfigDefaults:
         for market in (
             "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
             "ca_equity", "vietnam_equity", "crypto", "futures", "fund",
-            "macro", "forex",
+            "macro", "forex", "index",
         ):
             assert getattr(c.data, f"market_data_order_{market}") == ""
 
@@ -169,6 +169,7 @@ class TestEnvConfigDefaults:
         assert c.agent_tuning.content_filter_warning_threshold == 0.05
         assert c.agent_tuning.vibe_trading_enable_advisory is False
         assert c.agent_tuning.vibe_trading_enable_scheduler is False
+        assert c.agent_tuning.vibe_contextual_identity_constraints is True
         assert c.agent_tuning.vibe_trading_scheduler_max_consecutive_failures == 3
         assert c.agent_tuning.vibe_trading_scheduler_retry_base_delay_ms == 60_000
         assert c.agent_tuning.vibe_trading_scheduler_retry_max_delay_ms == 3_600_000
@@ -241,6 +242,13 @@ class TestEnvConfigTypeCoercion:
         assert tuning.vibe_trading_scheduler_max_consecutive_failures == 5
         assert tuning.vibe_trading_scheduler_retry_base_delay_ms == 2500
         assert tuning.vibe_trading_scheduler_retry_max_delay_ms == 10000
+
+    def test_contextual_identity_constraints_can_be_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VIBE_CONTEXTUAL_IDENTITY_CONSTRAINTS", "false")
+
+        assert EnvConfig().agent_tuning.vibe_contextual_identity_constraints is False
 
 
 # ===================================================================

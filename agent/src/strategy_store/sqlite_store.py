@@ -475,7 +475,7 @@ class SqliteStrategyStore:
             where = "WHERE " + " AND ".join(clauses)
 
         rows = self._conn.execute(
-            f"SELECT * FROM artifacts {where} ORDER BY created_at DESC LIMIT ?",
+            f"SELECT * FROM artifacts {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
             [*params, limit],
         ).fetchall()
         return [self._row_to_artifact(row) for row in rows]
@@ -645,7 +645,7 @@ class SqliteStrategyStore:
             """
             SELECT * FROM bench_history
             WHERE artifact_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (artifact_id, limit),
@@ -693,7 +693,7 @@ class SqliteStrategyStore:
             """
             SELECT * FROM decay_snapshots
             WHERE artifact_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (artifact_id, limit),

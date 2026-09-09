@@ -21,7 +21,7 @@ def compute_hv(close: pd.Series, window: int = 20, annualize: int = 252) -> pd.S
     Returns:
         年化历史波动率序列。
     """
-    returns = close.pct_change()
+    returns = close.pct_change(fill_method=None)
     return returns.rolling(window).std() * np.sqrt(annualize)
 
 

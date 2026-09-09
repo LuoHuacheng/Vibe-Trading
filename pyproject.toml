@@ -1,6 +1,6 @@
 [project]
 name = "vibe-trading-ai"
-version = "0.1.14"
+version = "0.1.15"
 description = "Natural-language finance research AI agent with backtesting"
 requires-python = ">=3.11"
 license = "MIT"
@@ -55,7 +55,19 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-multipart>=0.0.18",
     "sse-starlette>=1.6.0",
-    "fastmcp>=2.14.0",
+    # 4.0.0 changed MCPError's constructor (message is now separate) and the
+    # session snapshot shape; tests construct it the 2.x way. Cap until the
+    # adaptation lands.
+    "fastmcp>=2.14.0,<4.0.0",
+    # mcp 1.30.0 enforces RFC 8414 section 3.3 strictly: the `issuer` in an
+    # authorization server's metadata must equal the issuer used to build the
+    # well-known URL. IBKR's official MCP server advertises the authorization
+    # server https://api.ibkr.com/oauth2 while its metadata (verified live on
+    # 2026-09-08 at both well-known paths) says `"issuer": "https://api.ibkr.com"`,
+    # so discovery raises OAuthFlowError and the IBKR OAuth connection cannot be
+    # established at all. The cap is on the real broker path, not on the test
+    # that caught it — pulled in transitively through fastmcp.
+    "mcp<1.30",
     "ddgs>=6.0.0",
     "jinja2>=3.1.0",
     "matplotlib>=3.7.0",
@@ -79,7 +91,7 @@ py-modules = ["api_server", "mcp_server"]
 
 [tool.setuptools.packages.find]
 where = ["agent"]
-include = ["src*", "backtest*", "cli*"]
+include = ["src*", "backtest*", "cli*", "evals*"]
 
 [tool.setuptools.package-data]
 "src" = [
@@ -94,6 +106,7 @@ include = ["src*", "backtest*", "cli*"]
     "shadow_account/templates/*.html",
     "shadow_account/templates/*.css",
 ]
+"evals.harness" = ["README.md", "cases/**/*.json"]
 "backtest" = ["*.py"]
 "src.factors" = ["zoo/**/*.yaml", "zoo/**/*.md", "zoo/**/NOTICE"]
 
@@ -109,6 +122,12 @@ mt5 = [
     # (broker connector + mt5 data loader). Lazy-imported; on other platforms
     # the marker makes this a no-op and everything degrades gracefully.
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
+]
+zerodha = [
+    # Zerodha Kite Connect (India NSE/BSE) broker connector + india_broker
+    # loader backend. Lazy-imported with a named error; zerodha_available()
+    # stays False (loader falls through to Shoonya/Dhan) until installed.
+    "kiteconnect>=4.0.0",
 ]
 deepseek = [
     "langchain-deepseek>=1.0.0,<2",

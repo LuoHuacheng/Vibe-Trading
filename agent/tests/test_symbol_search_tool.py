@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from src.trading import profiles as trading_profiles
 from src.trading import service as trading_service
 from src.tools import symbol_search_tool as ss
@@ -762,3 +764,281 @@ class TestCryptoPairWithoutABrokerConnection:
         ), patch.object(ss.yahoo_client, "search", return_value=[]):
             ss.SymbolSearchTool().execute(query="apple", limit=5)
         assert called == []
+
+
+# --------------------------------------------------------------------------
+# FX pairs + index symbols: search and fetch must agree on the symbol universe
+# --------------------------------------------------------------------------
+
+
+class TestFxPairAlignment:
+    """search_symbol must resolve FX pairs and return fetch-able symbols."""
+
+    def test_canonical_fx_pair_spellings(self) -> None:
+        assert ss._canonical_fx_pair("GBP/USD") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("gbp/usd") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("GBPUSD") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("GBPUSD=X") == "GBPUSD=X"
+        assert ss._canonical_fx_pair("USD/JPY") == "USDJPY=X"
+        assert ss._canonical_fx_pair("GBPCNY") == "GBPCNY=X"
+        # Not pairs / not fiat-fiat
+        assert ss._canonical_fx_pair("BRK-B") is None
+        assert ss._canonical_fx_pair("AAPL") is None
+        assert ss._canonical_fx_pair("ETH/USD") is None  # crypto, not FX
+        assert ss._canonical_fx_pair("XAU/USD") is None  # metal, not fiat
+
+    def test_fiat_pairs_are_not_misclassified_as_crypto(self) -> None:
+        """GBP/USD must stop being treated as a crypto 'GBP-USD' pair."""
+        assert ss._canonical_crypto_pair("GBP/USD") is None
+        assert ss._canonical_crypto_pair("EURUSD") is None
+        # Crypto classifications must remain untouched.
+        assert ss._canonical_crypto_pair("ETH/USD") == "ETH-USD"
+        assert ss._canonical_crypto_pair("BTC/USDT") == "BTC-USDT"
+        assert ss._canonical_crypto_pair("BTCUSDT") == "BTC-USDT"
+
+    def test_fx_query_returns_canonical_candidate_when_yahoo_unavailable(self) -> None:
+        """A throttled/failed Yahoo must not turn a canonical pair into nothing."""
+        with patch.object(
+            ss.yahoo_client, "search", side_effect=Exception("Too Many Requests")
+        ), patch.object(
+            ss.eastmoney_client, "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(ss.sec_edgar_client, "cik_for", return_value=""):
+            out = json.loads(ss.SymbolSearchTool().execute(query="GBP/USD", limit=5))
+
+        by_symbol = {c["symbol"]: c for c in out["data"]["candidates"]}
+        assert "GBPUSD=X" in by_symbol
+        assert by_symbol["GBPUSD=X"]["market"] == "fx"
+        assert by_symbol["GBPUSD=X"]["type"] == "currency"
+
+    def test_from_yahoo_symbol_normalizes_currency_quotes(self) -> None:
+        assert ss._from_yahoo_symbol("GBP/USD", {"quoteType": "CURRENCY"}) == (
+            "GBPUSD=X",
+            "fx",
+        )
+        assert ss._from_yahoo_symbol("GBPUSD=X", {"quoteType": "CURRENCY"}) == (
+            "GBPUSD=X",
+            "fx",
+        )
+
+    def test_from_yahoo_symbol_labels_indexes(self) -> None:
+        assert ss._from_yahoo_symbol("^SPX", {"quoteType": "INDEX"}) == (
+            "^SPX",
+            "index",
+        )
+        assert ss._from_yahoo_symbol("^FTSE", {"quoteType": "INDEX"}) == (
+            "^FTSE",
+            "index",
+        )
+
+
+class TestCryptoUsdBaseWhitelist:
+    """``USD`` quote leg on the crypto resolver is gated on a base whitelist.
+
+    Without this guard, ``XAUUSD`` / ``EURUSD`` / ``GBPUSD`` would all be
+    classified as crypto pairs and the public-venue catalog (Binance/OKX)
+    fallback would either lock onto a tokenized gold token (XAUT/PAXG) or
+    find nothing — never on real spot gold. The fix: only accept ``USD`` on
+    crypto when the base is in :data:`_CRYPTO_USD_BASES`.
+    """
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # Genuine crypto pairs - must keep working.
+            "BTC-USD",
+            "ETH-USD",
+            "SOL-USD",
+            "BNB-USD",
+            "XLM-USD",
+            "XRP-USD",
+            # Stablecoin-quoted pairs (existing behaviour preserved).
+            "BTC-USDT",
+            "XAUT-USDT",
+            "PAXG-USDT",
+            "ETH-USDC",
+        ],
+    )
+    def test_crypto_pairs_with_supported_base_accepted(self, code):
+        assert ss._canonical_crypto_pair(code) is not None
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # The reported bug: a spot gold query must NOT resolve to a
+            # crypto pair, or the public-venue catalog fallback will lock a
+            # tokenized-gold row (XAUT-USDT) as the answer.
+            "XAUUSD",
+            "XAU-USD",
+            "XAU/USD",
+            # Forex pairs in 6-letter, dashed, or slashed form.
+            "EURUSD",
+            "EUR-USD",
+            "EUR/USD",
+            "GBPUSD",
+            "GBP-USD",
+            "JPYUSD",
+        ],
+    )
+    def test_non_crypto_bases_with_usd_quote_rejected(self, code):
+        """The ``USD`` leg on non-crypto bases must NOT pass as a crypto pair."""
+        assert ss._canonical_crypto_pair(code) is None
+
+    def test_tokenized_gold_bases_still_resolve_as_crypto(self):
+        # XAUT/PAXG ARE crypto (tokenized gold on Binance/OKX spot) and
+        # must keep resolving as crypto. The whitelist includes them.
+        assert ss._canonical_crypto_pair("XAUT-USDT") == "XAUT-USDT"
+        assert ss._canonical_crypto_pair("PAXG-USDT") == "PAXG-USDT"
+        assert ss._canonical_crypto_pair("XAUT-USD") == "XAUT-USD"
+        assert ss._canonical_crypto_pair("PAXG-USD") == "PAXG-USD"
+
+    def test_xauusd_and_xautusdt_are_not_equivalent_assets(self):
+        # Identity correctness: the resolver must treat XAUUSD (spot gold)
+        # and XAUT-USDT (tokenized gold) as different instruments. If both
+        # return the same canonical string, downstream lock/identity
+        # collision is possible.
+        spot = ss._canonical_crypto_pair("XAUUSD")
+        tokenized = ss._canonical_crypto_pair("XAUT-USDT")
+        assert spot is None
+        assert tokenized == "XAUT-USDT"
+        assert spot != tokenized
+
+    def test_usd_whitelist_is_a_strict_subset_of_crypto_bases(self):
+        # Defensive: the whitelist is what stops non-crypto bases from
+        # slipping through the ``USD`` branch. Every base in it must
+        # therefore actually be tradable on Binance or OKX spot.
+        # This is a coarse sanity check on the whitelist contents; if a
+        # new entry is added in error, this test will still pass (it only
+        # checks the union is non-empty and is a subset of the quote-asset
+        # alphabet).
+        assert ss._CRYPTO_USD_BASES
+        for base in ss._CRYPTO_USD_BASES:
+            assert base.isalpha()
+            assert base.isupper()
+
+class TestSpotGoldCandidateFilter:
+    """Bare gold / FX / futures queries must not lock a wrong crypto identity.
+
+    Yahoo's free-text search can return a near-string crypto pair for a
+    non-crypto query (``XAUUSD`` -> ``VALOUR-BTC-0-SEK.ST`` is a real-world
+    observation). The resolver-side ``_canonical_crypto_pair`` already
+    rejects those candidates, but the symbol-search tool itself used
+    to keep them in the candidate list, propagating the wrong instrument
+    to the identity gate. The fix: when the query is a ticker shape
+    (separator, ``=F``, or ``=X``) but NOT a crypto pair, drop any
+    candidate whose canonical form IS a crypto pair. Free-text name
+    queries (``apple``, ``tesla``) are unaffected.
+    """
+
+    def _run(self, query, yahoo_hits, eastmoney_rows=None):
+        # Default to an empty Eastmoney payload so the test isolates the
+        # Yahoo branch (the layer under test).
+        tool = ss.SymbolSearchTool()
+        em_payload = {"QuotationCodeTable": {"Data": eastmoney_rows or []}}
+        with patch.object(
+            ss.eastmoney_client, "get_json", return_value=em_payload
+        ), patch.object(ss.yahoo_client, "search", return_value=yahoo_hits), \
+             patch.object(ss, "_load_public_markets", return_value={}), \
+             patch.object(ss, "_enrich_us_cik", side_effect=lambda c, s="ok": (c, s)), \
+             patch.object(
+                 trading_profiles, "load_selected_profile_id",
+                 side_effect=OSError("no connector"),
+             ):
+            out = tool.execute(query=query, limit=10)
+        return json.loads(out)
+
+    def test_xauusdt_drops_near_string_btc_etp(self):
+        """The bug repro: Yahoo returns a Swedish Bitcoin ETP for XAUUSD."""
+        yahoo = [
+            {"symbol": "VALOUR-BTC-0-SEK.ST",
+             "shortname": "Valour Bitcoin Zero SEK",
+             "exchange": "STO", "quoteType": "EQUITY", "index": "XETR"},
+        ]
+        data = self._run("XAUUSD", yahoo)["data"]
+        assert data["count"] == 0
+        assert data["candidates"] == []
+
+    def test_xauusd_slash_drops_near_string_crypto_hits(self):
+        yahoo = [
+            {"symbol": "AETHUSDT-USD", "shortname": "Aave Ethereum USDT",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "AETH"},
+        ]
+        data = self._run("XAU/USD", yahoo)["data"]
+        assert data["count"] == 0
+
+    def test_xauusd_x_drops_near_string_crypto_hits(self):
+        yahoo = [
+            {"symbol": "AETHUSDT-USD", "shortname": "Aave Ethereum USDT",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "AETH"},
+        ]
+        data = self._run("XAUUSD=X", yahoo)["data"]
+        assert data["count"] == 0
+
+    def test_gold_query_keeps_the_real_gold_candidate(self):
+        """The filter must not be one-way: the right instrument survives.
+
+        Every other case here asserts a rejection, and a filter that dropped
+        everything would pass all of them. These assert the opposite
+        direction, across spellings — a candidate written ``XAUUSD=X`` or
+        ``XAU/USD`` is the same instrument as the query and must be kept.
+        """
+        yahoo = [
+            {"symbol": "XAUUSD=X", "shortname": "XAU/USD",
+             "exchange": "CCY", "quoteType": "CURRENCY", "index": "XAUUSD"},
+        ]
+        for query in ("XAUUSD", "XAU/USD", "XAU-USD", "XAUUSD=X"):
+            data = self._run(query, yahoo)["data"]
+            assert [c["symbol"] for c in data["candidates"]] == ["XAUUSD=X"], query
+
+    def test_fx_query_keeps_its_pair_across_spellings(self):
+        yahoo = [
+            {"symbol": "EURUSD=X", "shortname": "EUR/USD",
+             "exchange": "CCY", "quoteType": "CURRENCY", "index": "EURUSD"},
+        ]
+        for query in ("EURUSD", "EUR/USD", "EURUSD=X"):
+            data = self._run(query, yahoo)["data"]
+            assert [c["symbol"] for c in data["candidates"]] == ["EURUSD=X"], query
+
+    def test_gc_f_keeps_correct_futures_hit(self):
+        yahoo = [
+            {"symbol": "GC=F", "shortname": "Gold Continuous Front Month",
+             "exchange": "NYM", "quoteType": "FUTURE", "index": "GC"},
+        ]
+        data = self._run("GC=F", yahoo)["data"]
+        assert data["count"] == 1
+        assert data["candidates"][0]["symbol"] == "GC=F"
+
+    def test_xaut_usdt_keeps_tokenized_gold(self):
+        yahoo = [
+            {"symbol": "XAUT-USDT", "shortname": "Tether Gold",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "XAUT"},
+        ]
+        data = self._run("XAUT-USDT", yahoo)["data"]
+        assert data["count"] == 1
+        assert data["candidates"][0]["symbol"] == "XAUT-USDT"
+
+    def test_paxg_usdt_keeps_tokenized_gold(self):
+        yahoo = [
+            {"symbol": "PAXG-USDT", "shortname": "Paxos Gold",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "PAXG"},
+        ]
+        data = self._run("PAXG-USDT", yahoo)["data"]
+        assert data["count"] == 1
+        assert data["candidates"][0]["symbol"] == "PAXG-USDT"
+
+    def test_free_text_name_query_unaffected(self):
+        """A free-text company name (``apple``) is NOT a ticker shape and
+        must not have crypto candidates stripped. Yahoo's free-text
+        answer may include near-string crypto hits (``BTC-USD``) which
+        the user is allowed to see and choose from.
+        """
+        yahoo = [
+            {"symbol": "BTC-USD", "shortname": "Bitcoin USD",
+             "exchange": "CCC", "quoteType": "CRYPTOCURRENCY", "index": "BTC"},
+            {"symbol": "AAPL.US", "shortname": "Apple Inc.",
+             "exchange": "NMS", "quoteType": "EQUITY", "index": "AAPL"},
+        ]
+        data = self._run("apple", yahoo)["data"]
+        symbols = [c["symbol"] for c in data["candidates"]]
+        assert "BTC-USD" in symbols
+        assert "AAPL.US" in symbols

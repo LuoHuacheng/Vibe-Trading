@@ -53,12 +53,15 @@ def _is_supported(code: str) -> bool:
     """Return whether *code* is a symbol this loader handles.
 
     Covers US/HK/India/Korea/Canada/Vietnam/UK equities plus Yahoo's own
-    futures (``GC=F``) and forex (``EURUSD=X``) suffix conventions, which the
-    public chart endpoint serves verbatim (the code is used as-is in the
-    request URL, no conversion) (#718). Supported UK ``.L`` lines must declare
-    GBP or GBp; GBp is normalized to GBP at fetch time (#1206).
+    futures (``GC=F``), forex (``EURUSD=X``) and index (``^SPX``) symbol
+    conventions, which the public chart endpoint serves verbatim (the code is
+    used as-is in the request URL, no conversion) (#718). Supported UK ``.L``
+    lines must declare GBP or GBp; GBp is normalized to GBP at fetch time
+    (#1206).
     """
     upper = code.strip().upper()
+    if upper.startswith("^"):
+        return True
     return upper.endswith(
         (
             ".US", ".HK", ".NS", ".BO", ".KS", ".KQ", ".TO", ".V", ".VN",

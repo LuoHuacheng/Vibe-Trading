@@ -298,6 +298,31 @@ def test_limit_place_order_sets_trigger_rate(monkeypatch) -> None:
     assert captured["json"]["TriggerRate"] == 10000.0
 
 
+def test_limit_without_limit_price_errors_before_sending(monkeypatch) -> None:
+    # A limit order with no limit_price would go out as an MIT with no
+    # TriggerRate and rest untriggered while looking accepted.
+    cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
+    sent: list[str] = []
+
+    def _transport(method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        sent.append(url)
+        return _FakeResponse(200, {"orderID": 7})
+
+    monkeypatch.setattr("src.trading.connectors.etoro.trading.resolve_instrument_id", lambda symbol, c: 100000)
+    set_client_factory(lambda c: EtoroClient(cfg, transport=_transport))
+
+    result = etoro_sdk.place_order(
+        cfg,
+        symbol="BTC",
+        side="buy",
+        notional=50.0,
+        order_type="limit",
+    )
+    assert result["status"] == "error"
+    assert "limit_price" in result["error"]
+    assert sent == []
+
+
 def test_cancel_order_uses_demo_delete_path(monkeypatch) -> None:
     cfg = EtoroConfig(profile="paper", api_key="k", user_key="u")
     captured: dict[str, Any] = {}

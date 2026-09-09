@@ -1003,6 +1003,17 @@ def _make_temperature_safe_anthropic(base_cls: type) -> type:
         payload = base_cls._get_request_payload(self, *args, **kwargs)
         if isinstance(payload, dict) and self.model in _ANTHROPIC_TEMPERATURE_UNSUPPORTED:
             payload.pop("temperature", None)
+            # langchain-anthropic relocates sampling params the installed
+            # anthropic SDK (>=1) no longer accepts as named arguments into
+            # `extra_body`, which the SDK merges into the request JSON as-is.
+            # The API rejects `temperature` from either location.
+            extra_body = payload.get("extra_body")
+            if isinstance(extra_body, dict) and "temperature" in extra_body:
+                extra_body = {k: v for k, v in extra_body.items() if k != "temperature"}
+                if extra_body:
+                    payload["extra_body"] = extra_body
+                else:
+                    payload.pop("extra_body", None)
         return payload
 
     def _remember_and_should_retry(self: Any, exc: BaseException) -> bool:
@@ -1190,7 +1201,12 @@ def _build_anthropic(
 
 
 def _load_env_file(path: Path) -> None:
-    """Load a single .env file into os.environ (setdefault, no override)."""
+    """Load a single .env file into os.environ without clobbering real vars.
+
+    Exported environment variables are explicit operator intent and outrank
+    the file; ``.env`` only fills the gaps (pinned by
+    ``test_dispatch_connector_never_overrides_a_real_environment_variable``).
+    """
     if load_dotenv is not None:
         load_dotenv(dotenv_path=path, override=False)
     else:
@@ -1200,8 +1216,8 @@ def _load_env_file(path: Path) -> None:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            if key:
-                os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+            if key and key not in os.environ:
+                os.environ[key] = value.strip().strip('"').strip("'")
 
 
 def _ensure_dotenv() -> None:

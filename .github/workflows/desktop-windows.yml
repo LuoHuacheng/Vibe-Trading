@@ -21,6 +21,24 @@ on:
 permissions:
   contents: read
 
+# `npm ci` runs a security audit after installing and blocks on the response.
+# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
+# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
+# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
+# machine, one lock file, one warm cache:
+#
+#   npm ci                                    61s
+#   npm ci --no-audit --no-fund                4s
+#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
+#
+# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
+# the endpoint returns no advisories at all right now, and Dependabot already
+# watches this same tree — it is what reported the 7 open npm alerts. This is CI
+# only; a developer's `npm ci` still audits when the endpoint recovers.
+env:
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+
 jobs:
   package:
     # GTK is extracted as a checksum-pinned archive rather than executed as a

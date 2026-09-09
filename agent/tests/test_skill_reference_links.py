@@ -1,13 +1,18 @@
 """Regression tests: every ``references/`` link in data-source SKILL.md files
-resolves through the ``read_file`` tool.
+resolves for **both** readers — a browser on GitHub and the ``read_file`` tool.
 
 Background:
-    ``read_file`` roots reads at the bundled ``skills/`` directory. The
-    skill-name prefix (e.g. ``tushare/references/...``) is what these files are
-    written with, and these tests lock that convention in. A bare
-    ``references/...`` is now resolved against the skill that owns it as well,
-    so the form a human follows on GitHub reaches the same file — see
-    ``test_read_file_skill_relative.py`` for that resolution path.
+    A SKILL.md link is followed by two consumers. GitHub resolves it relative
+    to the containing directory; ``read_file`` roots reads at the bundled
+    ``skills/`` directory. Those two only agree on the document-relative form
+    (``references/...``), so that is what these files are written with and what
+    these tests lock in. The skill-name-prefixed form these tables used to
+    carry resolved for the agent but 404'd for every human who clicked it.
+    ``read_file`` reaches the document-relative form by resolving it against
+    the skill that owns it — see ``test_read_file_skill_relative.py`` for that
+    path, and note that it reports an ambiguous path rather than guessing, so
+    ``test_reference_links_resolve_through_read_file`` below fails loudly if
+    two skills ever ship the same reference path.
 
 No live API is touched: ``read_file`` performs local filesystem reads of the
 bundled skill docs only.
@@ -22,13 +27,15 @@ from typing import List, Tuple
 
 import pytest
 
-from src.tools.read_file_tool import ReadFileTool
+from src.tools.read_file_tool import _SKILL_RELATIVE_PREFIXES, ReadFileTool
 
 # Bundled skills root (mirrors ReadFileTool's own allowed-root computation).
 _SKILLS_DIR = Path(__file__).resolve().parents[1] / "src" / "skills"
 
 # Markdown link whose target is a references/*.md or scripts/*.py path, e.g.
-# "[label](tushare/references/foo/bar.md)" or "[ex](sec-edgar/scripts/x.py)".
+# "[label](references/foo/bar.md)" or "[ex](scripts/x.py)". Written wide enough
+# to still catch a skill-name-prefixed target, so a link that regresses to that
+# form is caught by the assertions rather than skipped by the scanner.
 # The target itself may contain parentheses (some tushare filenames do, e.g.
 # "社融增量(月度).md"), so anchor on the trailing ".md)"/".py)" rather than the
 # first ")". It must not contain "]" or a newline, though: excluding only "("
@@ -44,8 +51,8 @@ def _skills_with_reference_links() -> Tuple[str, ...]:
 
     Discovered, never listed. A hand-written tuple named five skills and let the
     others drift out of coverage: ``chanlun`` and ``ashare-pre-st-filter``
-    shipped 8 links with no prefix — unreachable to the agent — precisely
-    because nothing was looking at them.
+    shipped 8 links nothing was looking at, precisely because nothing was
+    looking at them.
     """
     return tuple(
         sorted(
@@ -104,7 +111,7 @@ def test_every_skill_with_reference_links_is_covered() -> None:
     """Discovery must find every such skill, not a subset someone typed out.
 
     The parametrised tests below are only as wide as this set. While it was a
-    literal tuple, a skill could add prefix-less links and stay green forever —
+    literal tuple, a skill could add links of any shape and stay green forever —
     which is exactly what two of them did.
     """
     linking = {
@@ -119,34 +126,66 @@ def test_every_skill_with_reference_links_is_covered() -> None:
 
 
 @pytest.mark.parametrize("skill,link", _all_links())
-def test_reference_links_carry_skill_prefix(skill: str, link: str) -> None:
-    """Every references/ or scripts/ link is written with its skill-name prefix.
+def test_reference_links_are_document_relative(skill: str, link: str) -> None:
+    """Every references/ or scripts/ link is written relative to its SKILL.md.
 
-    The prefixed form names one file outright. The bare form now resolves too,
-    but by searching the skills tree, which a future same-named reference in a
-    second skill would make ambiguous — so this is still the form to write.
+    The allowed prefixes are imported from the tool rather than restated, so
+    the form these documents are written in and the form ``read_file`` knows
+    how to resolve cannot drift apart.
+
+    The skill-name-prefixed form (``tushare/references/...``) reads correctly
+    but is not what GitHub follows: a browser resolves it against the file's
+    own directory and lands on ``tushare/tushare/references/...``, which does
+    not exist. The document-relative form is the only one both readers agree
+    on.
     """
-    assert link.startswith(f"{skill}/"), (
-        f"{skill}/SKILL.md link must carry the '{skill}/' prefix, got: {link}"
+    assert link.startswith(_SKILL_RELATIVE_PREFIXES), (
+        f"{skill}/SKILL.md link must be written relative to the document "
+        f"(one of {_SKILL_RELATIVE_PREFIXES}), got: {link}"
     )
 
 
 @pytest.mark.parametrize("skill,link", _all_links())
 def test_reference_links_resolve_through_read_file(skill: str, link: str) -> None:
-    """Every references/ link resolves to an existing file via read_file."""
+    """Every references/ link resolves to an existing file via read_file.
+
+    Also the ambiguity guard: ``read_file`` refuses rather than guesses when
+    two skills carry the same reference path, so this goes red the day one is
+    introduced instead of silently handing the agent the wrong skill's doc.
+    """
     body = _read(link)
     assert body["status"] == "ok", f"{link} did not resolve: {body}"
     assert body["content"], f"{link} resolved to empty content"
 
 
-def test_bare_reference_link_resolves_to_the_same_file() -> None:
-    """A bare references/ path (no prefix) reaches the same document.
+@pytest.mark.parametrize("skill,link", _all_links())
+def test_reference_links_resolve_the_way_github_resolves_them(
+    skill: str, link: str
+) -> None:
+    """Every link exists relative to its SKILL.md, and is the file read_file reads.
 
-    This is the form GitHub resolves for a human reading the SKILL.md, so both
-    consumers of the link have to land on one file.
+    Resolving against the containing directory is what a browser does, and it
+    is the reader the prefixed tables never served: every one of those links
+    404'd on GitHub. Nothing asserted it, so nothing caught it.
+    """
+    target = (_SKILLS_DIR / skill / link).resolve()
+    assert target.is_file(), (
+        f"{skill}/SKILL.md link does not exist relative to the document: "
+        f"{link} -> {target}"
+    )
+    assert Path(_read(link)["path"]).resolve() == target, (
+        f"{link} sends the two readers to different files"
+    )
+
+
+def test_skill_prefixed_link_still_resolves_through_read_file() -> None:
+    """The old prefixed form is still readable, so nothing that wrote it breaks.
+
+    ``read_file`` roots at ``skills/``, so ``<skill>/references/...`` continues
+    to resolve directly. Links copied from an older revision of these tables —
+    or reproduced from a model's memory of them — keep working.
     """
     skill, link = _all_links()[0]
-    bare = link[len(f"{skill}/"):]  # strip the skill-name prefix
-    body = _read(bare)
-    assert body["status"] == "ok", f"{bare} did not resolve: {body}"
+    body = _read(f"{skill}/{link}")
+    assert body["status"] == "ok", f"{skill}/{link} did not resolve: {body}"
     assert body["path"] == _read(link)["path"]

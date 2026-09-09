@@ -116,6 +116,45 @@ def _stub_a_share_response() -> pd.DataFrame:
     })
 
 
+def _stub_futures_dated_response() -> pd.DataFrame:
+    """Shape of ``futures_zh_daily_sina`` as the live endpoint returns it.
+
+    English column names, plus ``hold``/``settle`` which the OHLCV schema
+    drops, and — the part that matters — the contract's *whole life*: this
+    endpoint takes no date range, so four days are returned here and the
+    loader is responsible for cutting them to the requested window.
+    """
+    return pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+        "open": [3340.0, 3364.0, 3401.0, 3410.0],
+        "high": [3376.0, 3407.0, 3415.0, 3430.0],
+        "low": [3322.0, 3362.0, 3396.0, 3405.0],
+        "close": [3369.0, 3407.0, 3413.0, 3425.0],
+        "volume": [546, 391, 850, 900],
+        "hold": [361, 641, 784, 810],
+        "settle": [3348.0, 3388.0, 3406.0, 3420.0],
+    })
+
+
+def _stub_futures_main_response() -> pd.DataFrame:
+    """Shape of ``futures_main_sina``: Chinese names carrying a ``价`` suffix.
+
+    ``开盘价`` is NOT the ``开盘`` spelling ``_normalize`` learned from the
+    equity endpoints, so a loader that forwards this frame unmapped selects an
+    empty column set.
+    """
+    return pd.DataFrame({
+        "日期": ["2024-01-02", "2024-01-03"],
+        "开盘价": [3135, 3103],
+        "最高价": [3135, 3119],
+        "最低价": [3097, 3085],
+        "收盘价": [3104, 3111],
+        "成交量": [697016, 841618],
+        "持仓量": [1548351, 1562948],
+        "动态结算价": [3113, 3098],
+    })
+
+
 @pytest.fixture
 def fake_akshare(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Install a stub `akshare` module with mocked endpoints."""
@@ -125,6 +164,8 @@ def fake_akshare(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         stock_zh_a_hist=MagicMock(return_value=_stub_a_share_response()),
         stock_us_hist=MagicMock(return_value=pd.DataFrame()),
         stock_hk_hist=MagicMock(return_value=pd.DataFrame()),
+        futures_zh_daily_sina=MagicMock(return_value=_stub_futures_dated_response()),
+        futures_main_sina=MagicMock(return_value=_stub_futures_main_response()),
     )
     monkeypatch.setitem(sys.modules, "akshare", fake)
     return fake
@@ -174,3 +215,122 @@ class TestRouting:
         fake_akshare.stock_zh_a_hist.assert_called_once()
         fake_akshare.fund_etf_hist_sina.assert_not_called()
         fake_akshare.forex_hist_em.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Futures routing (HKUDS/Vibe-Trading#1395)
+# ---------------------------------------------------------------------------
+
+
+class TestFuturesRouting:
+    """The third instance of this file's founding bug.
+
+    ETFs (#50) and forex (#54) were each masked as broken A-shares by the
+    ``# Default: try A-share`` fallthrough. Futures were the same: the chain
+    named akshare as a futures source, ``markets`` advertised it, and every
+    contract reached ``stock_zh_a_hist``.
+    """
+
+    def test_dated_contract_routes_to_sina_daily(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        loader = DataLoader()
+        df = loader._fetch_one("RB2601", "2024-01-01", "2024-12-31", "1D")
+
+        fake_akshare.futures_zh_daily_sina.assert_called_once_with(symbol="RB2601")
+        fake_akshare.stock_zh_a_hist.assert_not_called()
+        assert df is not None
+        assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+        # hold/settle are not OHLCV and must not survive into the frame.
+        assert "hold" not in df.columns and "settle" not in df.columns
+
+    def test_exchange_suffix_is_stripped_before_the_call(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        """Sina raises on a suffixed code rather than returning empty.
+
+        ``futures_zh_daily_sina("RB2601.SHFE")`` fails inside akshare with
+        ``ValueError: Length mismatch``, so a loader that forwards the suffix
+        turns every exchange-qualified contract into a fetch failure.
+        """
+        loader = DataLoader()
+        loader._fetch_one("rb2601.SHFE", "2024-01-01", "2024-12-31", "1D")
+
+        fake_akshare.futures_zh_daily_sina.assert_called_once_with(symbol="RB2601")
+
+    def test_requested_window_is_applied_to_the_whole_life_frame(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        """The dated endpoint has no date parameters — the slice is ours.
+
+        The stub spans 2024-01-02..2024-01-05; asking for the middle two days
+        must return exactly those. Without the slice a one-month request came
+        back with the contract's entire history.
+        """
+        loader = DataLoader()
+        df = loader._fetch_one("RB2601", "2024-01-03", "2024-01-04", "1D")
+
+        assert df is not None
+        assert [str(d.date()) for d in df.index] == ["2024-01-03", "2024-01-04"]
+
+    def test_main_contract_routes_to_futures_main_sina(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        loader = DataLoader()
+        df = loader._fetch_one("RB0", "2024-01-01", "2024-12-31", "1D")
+
+        fake_akshare.futures_main_sina.assert_called_once_with(
+            symbol="RB0", start_date="20240101", end_date="20241231",
+        )
+        fake_akshare.futures_zh_daily_sina.assert_not_called()
+        fake_akshare.stock_zh_a_hist.assert_not_called()
+        assert df is not None
+        # The 价-suffixed names really were mapped, not silently dropped.
+        assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+        assert df.iloc[0]["close"] == pytest.approx(3104)
+        assert df.iloc[0]["open"] == pytest.approx(3135)
+
+    def test_global_contract_returns_none_instead_of_a_share(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        """The #1395 regression, asserted on the call path.
+
+        Sina carries Chinese exchanges only. A global contract must leave the
+        loader empty-handed so the chain continues to ``local`` — asserting
+        only ``df is None`` would still pass if the A-share endpoint had been
+        called and happened to return nothing.
+        """
+        loader = DataLoader()
+        for code in ("CL2412.NYMEX", "ESZ4", "GCM2025.COMEX"):
+            fake_akshare.stock_zh_a_hist.reset_mock()
+            assert loader._fetch_one(code, "2024-01-01", "2024-12-31", "1D") is None
+            fake_akshare.stock_zh_a_hist.assert_not_called()
+            fake_akshare.futures_zh_daily_sina.assert_not_called()
+
+    def test_unlisted_contract_is_reported_not_raised(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        """akshare raises for a code Sina does not list (e.g. ``MA605``)."""
+        fake_akshare.futures_zh_daily_sina.side_effect = ValueError(
+            "Length mismatch: Expected axis has 0 elements"
+        )
+        loader = DataLoader()
+        assert loader._fetch_one("MA605", "2024-01-01", "2024-12-31", "1D") is None
+
+    def test_futures_reject_non_daily_intervals(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        loader = DataLoader()
+        with pytest.raises(ValueError, match="daily"):
+            loader._fetch_one("RB2601", "2024-01-01", "2024-12-31", "60m")
+
+    def test_a_share_is_untouched_by_the_futures_branch(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        """The other side of the gate: equities must still reach their endpoint."""
+        loader = DataLoader()
+        loader._fetch_one("600519.SH", "2024-01-01", "2024-12-31", "1D")
+
+        fake_akshare.stock_zh_a_hist.assert_called_once()
+        fake_akshare.futures_zh_daily_sina.assert_not_called()
+        fake_akshare.futures_main_sina.assert_not_called()

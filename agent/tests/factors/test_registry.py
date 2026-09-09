@@ -254,3 +254,48 @@ def test_export_manifest_shape(mini_zoo: Path) -> None:
     assert "generated_at" in m
     assert m["zoos"][0]["zoo_id"] == "fakezoo"
     assert len(m["zoos"][0]["alphas"]) == 4
+
+
+def test_registry_masks_nan_on_declared_dependencies(mini_zoo: Path) -> None:
+    reg = Registry(zoo_root=mini_zoo)
+    panel = _panel()
+    # NaN in a required column should propagate to output
+    panel["close"].iloc[2, 0] = np.nan
+    out = reg.compute("fakezoo_001", panel)
+    assert np.isnan(out.iloc[2, 0])
+    # Also test with NaN in another required column
+    panel = _panel()
+    panel["open"].iloc[1, 1] = np.nan
+    out = reg.compute("fakezoo_001", panel)
+    assert np.isnan(out.iloc[1, 1])
+
+
+def test_registry_masks_nan_without_close_declared(mini_zoo: Path) -> None:
+    """The NaN mask must run even when the alpha does not declare ``close``.
+
+    The mask's shape reference was hardcoded to ``panel["close"]``, so an alpha
+    declaring only ``["open"]`` got no NaN enforcement on a panel without a
+    close column — a fabricated value (np.where on a NaN comparison) survived.
+    The reference is now the first declared dependency.
+    """
+    reg = Registry(zoo_root=mini_zoo)
+    meta = GOOD_META.replace('"close", "open"', '"open"')
+    body = textwrap.dedent(
+        """\
+        import numpy as np
+        import pandas as pd
+
+        def compute(panel):
+            o = panel["open"]
+            # NaN < 0 is False: a missing bar falls through to 0.0 (fabricated).
+            return pd.DataFrame(np.where(o < 0, 1.0, 0.0), index=o.index, columns=o.columns)
+        """
+    )
+    _write_alpha(mini_zoo / "fakezoo", "alpha_005", "fakezoo", meta=meta, body=body)
+    reg = Registry(zoo_root=mini_zoo)
+    panel = _panel()
+    del panel["close"]  # no close column at all
+    panel["open"].iloc[2, 0] = np.nan
+    out = reg.compute("fakezoo_005", panel)
+    assert np.isnan(out.iloc[2, 0])  # masked, not the fabricated 0.0
+    assert out.notna().sum().sum() > 0  # mask did not wipe the whole panel

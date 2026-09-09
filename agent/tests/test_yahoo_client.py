@@ -57,6 +57,12 @@ class TestMapSymbol:
         assert yahoo_client.map_symbol("AAPL.US") == "AAPL"
         assert yahoo_client.map_symbol("aapl.us") == "aapl"
 
+        # US class shares: dot form is unserved by Yahoo (live-verified
+        # empty chart); the hyphen form is what the chart API needs (#1351).
+        assert yahoo_client.map_symbol("BRK.B.US") == "BRK-B"
+        assert yahoo_client.map_symbol("BRK.A.US") == "BRK-A"
+        assert yahoo_client.map_symbol("BF.B.US") == "BF-B"
+
     def test_hk_normalized_to_four_digits(self):
         assert yahoo_client.map_symbol("00700.HK") == "0700.HK"
         assert yahoo_client.map_symbol("09988.HK") == "9988.HK"

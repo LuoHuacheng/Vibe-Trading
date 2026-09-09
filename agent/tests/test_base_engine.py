@@ -309,25 +309,116 @@ def test_existing_rebalance_does_not_churn_inside_slippage_band(direction):
     _assert_unchanged(engine, {"A": before})
 
 
-def test_rebalance_insufficient_capital_is_atomic():
+def test_rebalance_overcommitted_single_basket_scales_instead_of_aborting():
+    """#1274: 100% target plus commission scales the basket, not abort."""
     engine = _AdjustmentEngine(fee_rate=0.10)
-    with pytest.raises(ValueError, match="insufficient capital"):
-        _run_adjustments(engine, {"A": [1.0]})
-    _assert_unchanged(engine)
+    _run_adjustments(engine, {"A": [1.0]})
+
+    position = engine.bar_positions[0]["A"]
+    assert position.size == pytest.approx(10.0 * 1000.0 / 1100.0, rel=1e-3)
+    assert engine.bar_capitals[0] >= 0.0
 
 
-def test_existing_multi_symbol_rebalance_failure_is_atomic():
+def test_rebalance_basket_with_commission_scales_to_fit():
+    """#1274: a 100% target basket plus fees fills proportionally scaled."""
+    engine = _AdjustmentEngine(fee_rate=0.001)
+    _run_adjustments(engine, {"A": [0.60], "B": [0.40]})
+
+    sizes = _sizes(engine.bar_positions[0])
+    # One common scale factor: each sleeve keeps its share of the portfolio.
+    assert sizes["A"] == pytest.approx(6.0 * 1000.0 / 1001.0, rel=1e-3)
+    assert sizes["A"] / sizes["B"] == pytest.approx(0.60 / 0.40, rel=1e-4)
+    assert 0.0 <= engine.bar_capitals[0] < 0.01
+
+
+def test_rebalance_scaled_basket_is_independent_of_input_code_order():
+    """#1274: scaling preserves the fairness contract of the open path."""
+
+    class _FeeAdjustmentEngine(_AdjustmentEngine):
+        def __init__(self):
+            super().__init__(fee_rate=0.001)
+
+    first, second = _run_both_code_orders(_FeeAdjustmentEngine, {"A": [0.60], "B": [0.40]})
+    assert first.bar_positions == second.bar_positions
+    assert first.bar_capitals == second.bar_capitals
+
+
+def test_rebalance_scaled_sizes_keep_weights_with_differing_fees():
+    """#1274: one common size factor — per-symbol fees must not re-weight.
+
+    A cost-weighted per-order scale would keep the 60/40 *spend* split while
+    distorting sizes. Sizes must stay near the 1.5 ratio, and each symbol
+    must be rounded and commissioned under its own rules while scaling —
+    a stale active symbol would charge B's 2% fee on A's fill.
+    """
+
+    class _SymbolFeeAdjustmentEngine(_AdjustmentEngine):
+        def round_size(self, raw_size, price):
+            lot = {"A": 0.05, "B": 0.05}[self._active_symbol]
+            return round(max(raw_size, 0.0) / lot) * lot
+
+        def calc_commission(self, size, price, direction, is_open):
+            rate = {"A": 0.01, "B": 0.02}[self._active_symbol]
+            return size * price * rate
+
+    engine = _SymbolFeeAdjustmentEngine(fee_rate=0.0)
+    _run_adjustments(
+        engine,
+        {"A": [0.60], "B": [0.40]},
+        execution_prices={"A": [100.0], "B": [80.0]},
+    )
+
+    positions = engine.bar_positions[0]
+    sizes = _sizes(positions)
+    # Proportions live in NOTIONAL space (A@100 vs B@80 → share ratio 1.2);
+    # fine lots (0.5% of each fill) keep the assertion meaningful.
+    assert sizes["A"] / sizes["B"] == pytest.approx(1.2, rel=2e-2)
+    notionals = (sizes["A"] * 100.0, sizes["B"] * 80.0)
+    assert notionals[0] / sum(notionals) == pytest.approx(0.60, rel=2e-2)
+    # Each fill commissioned under its OWN symbol's schedule.
+    assert positions["A"].entry_commission == pytest.approx(
+        sizes["A"] * 100.0 * 0.01
+    )
+    assert positions["B"].entry_commission == pytest.approx(
+        sizes["B"] * 80.0 * 0.02
+    )
+    assert engine.bar_capitals[0] >= 0.0
+
+
+def test_rebalance_reduction_commits_and_increase_scales_to_fit():
+    """#1274: reductions commit as planned; the open sleeve scales to fit."""
     engine = _AdjustmentEngine(fee_rate=0.01)
+    _run_adjustments(engine, {"A": [0.25, 0.10], "B": [0.25, 0.90]})
 
+    first, second = engine.bar_positions
+    assert _sizes(first) == {"A": 2.5, "B": 2.5}
+    assert engine.bar_capitals[0] == 495.0
+    assert _sizes(second)["A"] == pytest.approx(0.995)  # 10% of bar-2 equity 995
+    # B's increase is scaled by the one common factor to fit capital.
+    assert 2.5 < _sizes(second)["B"] < 9.0
+    assert engine.bar_capitals[1] >= 0.0
+
+
+def test_rebalance_irrecoverably_infeasible_basket_fails_atomically():
+    """#1274: when no scale fits — not even an empty open sleeve — abort."""
+    engine = _AdjustmentEngine()
     with pytest.raises(ValueError, match="insufficient capital"):
-        _run_adjustments(engine, {"A": [0.25, 0.10], "B": [0.25, 0.90]})
-
-    assert engine.capital == engine.bar_capitals[0] == 495.0
-    assert engine.positions == engine.bar_positions[0]
+        _run_adjustments(
+            engine,
+            {"A": [-0.50, 0.0]},
+            execution_prices={"A": [100.0, 1000.0]},
+        )
+    # Bar 1's short is intact; the unrecoverable close released negative
+    # capital no scaling of opens (there are none) could repair. The abort
+    # committed nothing: exactly bar 1's fill exists, no bar-2 artifacts.
+    assert engine.capital == 500.0
+    position = engine.positions["A"]
+    assert (position.direction, position.size) == (-1, 5.0)
+    # Opens don't append trade records or adjustment events; the abort
+    # committed no close.
     assert engine.trades == []
     assert engine.adjustment_events == []
     assert len(engine.bar_positions) == 1
-
 
 @pytest.mark.parametrize(
     ("target_weight", "expected_position", "bar_capital", "trade_fees"),
@@ -591,7 +682,7 @@ class TestAlign:
         frame = pd.DataFrame({"open": [100.0] * 3, "close": [100.0] * 3}, index=dates)
         signals = pd.Series([0.0, 1.0, 0.0], index=dates)
 
-        out_dates, close_df, pos_df, _ = _align(
+        out_dates, close_df, _, pos_df, _ = _align(
             {"BTC-USDT-PERP": frame}, {"BTC-USDT-PERP": signals}, ["BTC-USDT-PERP"]
         )
 
@@ -601,7 +692,7 @@ class TestAlign:
 
     def test_output_shapes(self) -> None:
         data_map, signal_map, dates = _simple_data_and_signals()
-        out_dates, close_df, pos_df, ret_df = _align(data_map, signal_map, ["A", "B"])
+        out_dates, close_df, _, pos_df, ret_df = _align(data_map, signal_map, ["A", "B"])
         assert len(out_dates) == len(dates)
         assert close_df.shape == (len(dates), 2)
         assert pos_df.shape == (len(dates), 2)
@@ -610,7 +701,7 @@ class TestAlign:
     def test_signal_shifted_by_one(self) -> None:
         """Signal at bar i should produce position at bar i+1 (next-bar-open)."""
         data_map, signal_map, dates = _simple_data_and_signals()
-        _, _, pos_df, _ = _align(data_map, signal_map, ["A", "B"])
+        _, _, _, pos_df, _ = _align(data_map, signal_map, ["A", "B"])
         # Signal A goes to 1.0 at index 3 → position should be 0 at index 3, non-zero at index 4
         assert pos_df.at[dates[3], "A"] == 0.0
         assert pos_df.at[dates[4], "A"] > 0.0
@@ -618,7 +709,7 @@ class TestAlign:
     def test_positions_normalized(self) -> None:
         """Sum of abs(weights) should be <= 1.0 per row."""
         data_map, signal_map, dates = _simple_data_and_signals()
-        _, _, pos_df, _ = _align(data_map, signal_map, ["A", "B"])
+        _, _, _, pos_df, _ = _align(data_map, signal_map, ["A", "B"])
         row_sums = pos_df.abs().sum(axis=1)
         assert (row_sums <= 1.0 + 1e-10).all()
 
@@ -629,7 +720,7 @@ class TestAlign:
         sig = pd.Series([0, 0, 2.0, -3.0, 0.5], index=dates)
         data_map = {"X": df}
         signal_map = {"X": sig}
-        _, _, pos_df, _ = _align(data_map, signal_map, ["X"])
+        _, _, _, pos_df, _ = _align(data_map, signal_map, ["X"])
         # After shift, clipped values show up at indices 3 and 4
         assert pos_df["X"].abs().max() <= 1.0 + 1e-10
 
@@ -639,7 +730,7 @@ class TestAlign:
         sig = pd.Series([np.nan, 1.0, np.nan, 0.5, np.nan], index=dates)
         data_map = {"X": df}
         signal_map = {"X": sig}
-        _, _, pos_df, _ = _align(data_map, signal_map, ["X"])
+        _, _, _, pos_df, _ = _align(data_map, signal_map, ["X"])
         assert not pos_df.isna().any().any()
 
     def test_close_ffill_bfill(self) -> None:
@@ -650,7 +741,7 @@ class TestAlign:
             index=dates,
         )
         sig = pd.Series([0, 1, 1, 1, 0], index=dates)
-        _, close_df, _, _ = _align({"X": df}, {"X": sig}, ["X"])
+        _, close_df, _, _, _ = _align({"X": df}, {"X": sig}, ["X"])
         assert not close_df.isna().any().any()
 
     def test_with_optimizer(self) -> None:
@@ -660,9 +751,9 @@ class TestAlign:
         def dummy_optimizer(ret, pos, dates_arg):
             return pos * 0.5  # halve everything
 
-        _, _, pos_df, _ = _align(data_map, signal_map, ["A", "B"], optimizer=dummy_optimizer)
+        _, _, _, pos_df, _ = _align(data_map, signal_map, ["A", "B"], optimizer=dummy_optimizer)
         # Positions should be smaller due to optimizer
-        _, _, pos_no_opt, _ = _align(data_map, signal_map, ["A", "B"])
+        _, _, _, pos_no_opt, _ = _align(data_map, signal_map, ["A", "B"])
         assert pos_df.abs().sum().sum() <= pos_no_opt.abs().sum().sum() + 1e-10
 
 
@@ -787,3 +878,51 @@ class TestSafePrice:
         dates = pd.DatetimeIndex([pd.Timestamp("2025-01-02")])
         close_df = pd.DataFrame({"X": [np.nan]}, index=dates)
         assert BaseEngine._safe_price(close_df, dates[0], "X", 10.0) == 10.0
+
+
+def test_halted_position_marks_at_last_close_past_ffill_limit():
+    # #1318: a position held through a halt longer than the ffill limit used to
+    # be re-marked at entry price, producing a phantom drawdown mid-halt.
+    run_dates = pd.date_range("2026-01-02", periods=30, freq="B")
+    halt_dates = run_dates[:10]
+    halt_close = [100.0 + 5.0 * i for i in range(10)]
+    data_map = {
+        "HALT": pd.DataFrame({"open": halt_close, "close": halt_close}, index=halt_dates),
+        "RUN": pd.DataFrame({"open": 50.0, "close": 50.0}, index=run_dates),
+    }
+    signal_map = {
+        "HALT": pd.Series(0.5, index=halt_dates),
+        "RUN": pd.Series(0.0, index=run_dates),
+    }
+    dates, close_df, close_val_df, target_pos, _ = _align(data_map, signal_map, ["HALT", "RUN"])
+
+    engine = _AdjustmentEngine()
+    engine._execute_bars(
+        dates, data_map, close_df, target_pos, ["HALT", "RUN"],
+        close_val_df=close_val_df,
+    )
+
+    snaps = {s.timestamp: s.equity for s in engine.equity_snapshots}
+    marked_at_last_close = snaps[run_dates[9]]
+    # Deep into the halt the equity must not fall back to the entry-cost mark.
+    for bar in (14, 15, 20, 29):
+        assert snaps[run_dates[bar]] == pytest.approx(marked_at_last_close, rel=1e-9)
+    # The terminal forced liquidation also marks at the last traded close, so
+    # the halt's unrealized PnL survives into the final equity.
+    assert engine.equity_snapshots[-1].equity == pytest.approx(marked_at_last_close, rel=1e-6)
+
+
+def test_rebalance_scaled_away_sleeve_is_recorded_as_plan_rejection():
+    """#1274: a sleeve rounded to zero by scaling leaves an audit record.
+
+    A fills 9 of its 10 target shares; B's one-lot fill scales below one lot
+    and vanishes — run-card diagnostics must see it as a zero_size rejection,
+    not silence.
+    """
+    engine = _SymbolRulesAdjustmentEngine()
+    _run_adjustments(engine, {"A": [1.0], "B": [0.003]})
+
+    sizes = _sizes(engine.bar_positions[0])
+    assert sizes == {"A": 9.0}  # scaled to fit; B's leg dropped entirely
+    assert engine.plan_rejections[("B", "zero_size")] == 1
+    assert engine.bar_capitals[0] >= 0.0

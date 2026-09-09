@@ -8,6 +8,7 @@ import pytest
 
 from backtest.loaders.base import DataLoaderProtocol, NoAvailableSourceError
 from backtest.loaders.registry import (
+    _ensure_registered,
     FALLBACK_CHAINS,
     LOADER_REGISTRY,
     VALID_SOURCES,
@@ -135,7 +136,7 @@ class TestFallbackChains:
         expected = {
             "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
             "ca_equity", "uk_equity", "vietnam_equity", "crypto", "futures",
-            "fund", "macro", "forex",
+            "fund", "macro", "forex", "index",
         }
         assert expected == set(FALLBACK_CHAINS.keys())
 
@@ -185,14 +186,39 @@ class TestFallbackChains:
         assert "baostock" in FALLBACK_CHAINS["a_share"]
 
     def test_unchanged_chains_preserved(self) -> None:
-        """crypto/futures/fund/macro/forex chains must be left untouched."""
+        """crypto/fund/macro/forex chains must be left untouched."""
         assert FALLBACK_CHAINS["crypto"] == ["okx", "binance", "ccxt", "yfinance", "local"]
-        assert FALLBACK_CHAINS["futures"] == ["tushare", "akshare", "local"]
         assert FALLBACK_CHAINS["fund"] == ["tushare", "akshare", "local"]
         assert FALLBACK_CHAINS["macro"] == ["akshare", "tushare", "local"]
         # mt5 heads the forex chain (terminal feed when attached), degrading to
         # the previous chain unchanged.
         assert FALLBACK_CHAINS["forex"] == ["mt5", "akshare", "yfinance", "local"]
+
+    def test_futures_chain_leads_with_a_source_that_implements_futures(self) -> None:
+        """#1395 — tushare led this chain while implementing no futures path.
+
+        ``resolve_loader`` walks FALLBACK_CHAINS and never consults a loader's
+        ``markets`` set, so a loader listed here is asked for the market
+        whether or not it declares it. tushare would have been constructed,
+        found available on any TUSHARE_TOKEN, and returned an empty frame from
+        the A-share ``daily()`` endpoint before akshare was ever reached.
+        """
+        assert FALLBACK_CHAINS["futures"] == ["akshare", "local"]
+        assert "tushare" not in FALLBACK_CHAINS["futures"]
+
+    def test_every_futures_chain_member_declares_the_market(self) -> None:
+        """The invariant #1395 broke, stated directly.
+
+        Written as a closure over the chain rather than a literal, so adding a
+        source that does not serve futures fails here instead of at runtime.
+        """
+        _ensure_registered()
+        for name in FALLBACK_CHAINS["futures"]:
+            loader_cls = LOADER_REGISTRY.get(name)
+            assert loader_cls is not None, f"{name} is in the chain but not registered"
+            assert "futures" in loader_cls.markets, (
+                f"{name} leads the futures chain without declaring the market"
+            )
 
     def test_tickerall_is_explicit_only_never_a_fallback(self) -> None:
         """TickerAll is a valid explicit source but must NEVER join an automatic

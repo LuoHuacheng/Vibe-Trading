@@ -183,7 +183,9 @@ def test_already_up_to_date_no_pip(monkeypatch, capsys: pytest.CaptureFixture[st
     """Latest PyPI version <= installed version: exit 0, no pip call at all."""
     calls, fake_run = _fake_subprocess()
     monkeypatch.setattr(update_mod.subprocess, "run", fake_run)
-    # "0.0.1" is below the repo's dev version (0.1.14), and also below any real release.
+    # "0.0.1" is below the repo's dev version, and also below any real release.
+    # Deliberately not naming the current one: a version in a comment has no
+    # guard and goes stale at the next bump.
     _monkeypatch_upgrade_env(monkeypatch, latest="0.0.1")
 
     assert update_mod.cmd_update() == update_mod.EXIT_OK

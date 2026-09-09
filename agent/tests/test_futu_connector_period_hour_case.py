@@ -65,3 +65,55 @@ def test_history_4H_uses_240m_not_60m(monkeypatch) -> None:
     cfg = futu_sdk.FutuConfig(host="127.0.0.1", port=11111, profile="paper")
     futu_sdk.get_historical_bars("US.AAPL", config=cfg, period="4H", limit=24)
     assert calls[-1] == "K_240M"
+
+
+def test_history_declares_qfq_caliber_and_passes_autype(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class _KLType:
+        K_DAY = "K_DAY"
+
+    class _AuType:
+        QFQ = "QFQ"
+
+    class _Futu:
+        KLType = _KLType
+        AuType = _AuType
+
+    class _QuoteCtx:
+        def request_history_kline(self, code, **kwargs):
+            seen.update(kwargs)
+            return 0, None
+
+    monkeypatch.setattr(futu_sdk, "_require_futu", lambda: _Futu)
+    monkeypatch.setattr(futu_sdk, "_quote_ctx", lambda cfg: _QuoteCtx())
+    monkeypatch.setattr(futu_sdk, "_close", lambda ctx: None)
+    monkeypatch.setattr(futu_sdk, "_unwrap", lambda result: result)
+    monkeypatch.setattr(futu_sdk, "_records", lambda data: [])
+    cfg = futu_sdk.FutuConfig(host="127.0.0.1", port=11111, profile="paper")
+    result = futu_sdk.get_historical_bars("US.AAPL", config=cfg, period="1D", limit=24)
+    assert seen["autype"] == "QFQ"
+    assert result["adjustment"] == "qfq"
+
+
+def test_history_without_autype_stub_keeps_implicit_default(monkeypatch) -> None:
+    # SDK stubs without AuType fall back to the SDK's own default rather
+    # than blowing up; the declared caliber is still qfq.
+    class _KLType:
+        K_DAY = "K_DAY"
+
+    class _Futu:
+        KLType = _KLType
+
+    class _QuoteCtx:
+        def request_history_kline(self, code, ktype=None, max_count=None):
+            return 0, None
+
+    monkeypatch.setattr(futu_sdk, "_require_futu", lambda: _Futu)
+    monkeypatch.setattr(futu_sdk, "_quote_ctx", lambda cfg: _QuoteCtx())
+    monkeypatch.setattr(futu_sdk, "_close", lambda ctx: None)
+    monkeypatch.setattr(futu_sdk, "_unwrap", lambda result: result)
+    monkeypatch.setattr(futu_sdk, "_records", lambda data: [])
+    cfg = futu_sdk.FutuConfig(host="127.0.0.1", port=11111, profile="paper")
+    result = futu_sdk.get_historical_bars("US.AAPL", config=cfg, period="1D", limit=24)
+    assert result["adjustment"] == "qfq"

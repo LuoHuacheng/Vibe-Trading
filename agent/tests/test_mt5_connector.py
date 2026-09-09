@@ -644,6 +644,35 @@ class TestPlaceOrder:
         assert result["status"] == "error"
         assert fake_mt5.order_send_requests == []
 
+    def test_symbol_max_volume_errors_instead_of_clamping(self, fake_mt5: FakeMT5) -> None:
+        from src.trading.connectors.mt5 import sdk
+
+        # Connector guards sit above the symbol cap, so the symbol's own
+        # volume_max is the binding constraint: 150 lots asked, 100 allowed.
+        cfg = _paper_config(max_order_volume=500.0, max_order_notional_usd=100_000_000.0)
+        result = sdk.place_order(
+            cfg,
+            symbol="EURUSD", side="buy", quantity=150.0, notional=None,
+            order_type="market", limit_price=None, time_in_force="day",
+        )
+        assert result["status"] == "error"
+        assert "symbol maximum" in result["error"]
+        assert fake_mt5.order_send_requests == []
+
+    def test_notional_over_symbol_max_volume_errors(self, fake_mt5: FakeMT5) -> None:
+        from src.trading.connectors.mt5 import sdk
+
+        # 20M USD / (100k * 1.08 per lot) ~= 185 lots, over the symbol's 100.
+        cfg = _paper_config(max_order_volume=500.0, max_order_notional_usd=100_000_000.0)
+        result = sdk.place_order(
+            cfg,
+            symbol="EURUSD", side="buy", quantity=None, notional=20_000_000.0,
+            order_type="market", limit_price=None, time_in_force="day",
+        )
+        assert result["status"] == "error"
+        assert "symbol maximum" in result["error"]
+        assert fake_mt5.order_send_requests == []
+
     def test_exactly_one_size_required(self, fake_mt5: FakeMT5) -> None:
         assert self._place(fake_mt5, quantity=None, notional=None)["status"] == "error"
         assert self._place(fake_mt5, quantity=0.05, notional=1000.0)["status"] == "error"

@@ -208,3 +208,48 @@ def test_explicit_user_preset_accepted_by_swarm_tool(user_presets_dir) -> None:
     assert _normalize_preset_name("no_such_preset_anywhere") is None
     # A user preset must never be reachable via keyword auto-routing.
     assert _match_preset("please analyze my custom desk topic") != "my_custom_desk"
+
+
+_INVESTMENT_COMMITTEE_FUNDAMENTAL_TOOLS = (
+    "get_financial_statements",
+    "get_fund_flow",
+    "get_margin_trading",
+    "get_research_reports",
+    "get_stock_news",
+)
+
+
+def test_investment_committee_research_workers_have_fundamental_tools() -> None:
+    """#1343: bull/bear/risk workers mandate fundamental analysis but their
+    whitelist lacked every fundamental data tool, so each run reported "no
+    fundamental data tool executable" and degraded to price-only claims."""
+    preset = load_preset("investment_committee")
+    researchers = {
+        agent["id"]: set(agent.get("tools") or [])
+        for agent in preset["agents"]
+        if agent["id"] in ("bull_advocate", "bear_advocate", "risk_officer")
+    }
+    assert researchers, "expected the three research workers"
+    for agent_id, tools in researchers.items():
+        missing = [
+            tool for tool in _INVESTMENT_COMMITTEE_FUNDAMENTAL_TOOLS if tool not in tools
+        ]
+        assert not missing, f"{agent_id} lacks fundamental data tools: {missing}"
+
+
+def test_every_preset_tool_exists_in_local_registry() -> None:
+    """A whitelist name the registry does not provide is silently dropped
+    (_filter_registry logs and skips), leaving the worker without a tool its
+    prompt may depend on. Every bundled preset tool must resolve."""
+    from src.tools import build_registry
+
+    registry = build_registry(include_shell_tools=True)
+    for entry in list_presets():
+        preset = load_preset(entry["name"])
+        for agent in preset["agents"]:
+            for tool_name in agent.get("tools") or []:
+                assert registry.get(tool_name), (
+                    f"{entry['name']}/{agent['id']} requests tool {tool_name!r} "
+                    "that the local registry does not provide; the worker "
+                    "whitelist would silently drop it (#1343)."
+                )

@@ -24,6 +24,7 @@ _SDK_CONNECTOR_MODULES = {
     "futu": "src.trading.connectors.futu.sdk",
     "dhan": "src.trading.connectors.dhan.sdk",
     "shoonya": "src.trading.connectors.shoonya.sdk",
+    "zerodha": "src.trading.connectors.zerodha.sdk",
     "trading212": "src.trading.connectors.trading212.sdk",
     "mt5": "src.trading.connectors.mt5.sdk",
     "etoro": "src.trading.connectors.etoro.sdk",
@@ -153,10 +154,17 @@ def _local_plugin_call(
     from src.trading.connections import ConnectionStore, credential_fields
     from src.trading.local_plugins import load_adapter, plugin_by_profile_id
 
+    store = ConnectionStore()
     connection_id = str(overrides.get("connection_id") or "").strip().lower()
     if not connection_id:
+        # CLI/agent flows do not carry a connection id; when the operator has
+        # installed exactly one connection for this profile, use it. Explicit
+        # ids (Web UI) always win.
+        candidates = [row for row in store.list() if row.profile_id == profile.id]
+        if len(candidates) == 1:
+            connection_id = candidates[0].id
+    if not connection_id:
         raise ValueError("local connector plugins require a connection_id")
-    store = ConnectionStore()
     connection = store.get(connection_id)
     if connection.profile_id != profile.id:
         raise ValueError("local connection profile does not match the requested plugin")
@@ -733,6 +741,7 @@ def place_order(
         quantity=float(quantity) if quantity is not None else None,
         instrument_type=instrument_type,
         asset_class=asset_class,
+        limit_price=float(limit_price) if limit_price is not None else None,
     )
     result = execute_live_order(
         broker=profile.connector,

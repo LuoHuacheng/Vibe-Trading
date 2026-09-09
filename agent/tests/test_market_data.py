@@ -60,12 +60,85 @@ from src.market_data import (
         ("GC=F", "yahoo"),  # gold future
         ("CL=F", "yahoo"),  # crude future
         ("EURUSD=X", "yahoo"),  # forex pair
-        ("JPY=X", "yahoo"),
+        ("JPY=X", "yahoo"),  # abbreviated forex pair
+        ("^SPX", "yahoo"),  # index (S&P 500)
+        ("^FTSE", "yahoo"),  # index (FTSE 100)
+        ("^VIX", "yahoo"),
         ("something_weird", "tushare"),  # documented fallback
     ],
 )
 def test_detect_source(code: str, expected: str) -> None:
     assert detect_source(code) == expected
+
+
+def test_yahoo_loader_accepts_futures_and_forex_suffixes() -> None:
+    """The yahoo direct loader must accept =F/=X, not just equity suffixes (#718)."""
+    from backtest.loaders.yahoo_loader import _is_supported
+
+    assert _is_supported("GC=F") is True
+    assert _is_supported("EURUSD=X") is True
+    assert _is_supported("AAPL.US") is True  # unchanged
+    assert _is_supported("TD.TO") is True
+    assert _is_supported("PNG.V") is True
+    assert _is_supported("600519.SH") is False  # A-share still not yahoo
+
+
+def test_yahoo_loader_accepts_index_symbols() -> None:
+    """^SPX-style index symbols must be served verbatim like =F/=X."""
+    from backtest.loaders.yahoo_loader import _is_supported
+
+    assert _is_supported("^SPX") is True
+    assert _is_supported("^GSPC") is True
+    assert _is_supported("^VIX") is True
+    assert _is_supported("^FTSE") is True
+
+
+def test_index_market_detection() -> None:
+    """^ symbols classify as index everywhere, not the a_share default."""
+    from backtest.engines._market_hooks import _detect_market, code_currency
+
+    assert _detect_market("^SPX") == "index"
+    assert _detect_market("^N225") == "index"
+    assert code_currency("^SPX").startswith("UNKNOWN")  # honest: index has no cash currency
+
+
+def test_forex_pair_x_classifies_as_forex_not_a_share() -> None:
+    """=X pairs must stop falling through to the a_share default (latent misroute)."""
+    from backtest.engines._market_hooks import _detect_market, code_currency
+
+    assert _detect_market("GBPUSD=X") == "forex"
+    assert code_currency("GBPUSD=X") == "USD"
+
+
+def test_abbreviated_fx_pair_x_classes_as_forex() -> None:
+    """JPY=X (USD/JPY abbreviation) must not fall to the a_share default."""
+    from backtest.engines._market_hooks import _detect_market, code_currency
+
+    assert _detect_market("JPY=X") == "forex"
+    assert _detect_market("EUR=X") == "forex"
+    # The hidden base (JPY=X is USD/JPY) is not derivable — honest UNKNOWN,
+    # not a wrong CNY.
+    assert code_currency("JPY=X") == "UNKNOWN:forex"
+
+
+def test_index_backtest_routes_to_global_equity_not_china_or_crypto() -> None:
+    """^SPX must never reach ChinaAEngine/CryptoEngine through the runner."""
+    from backtest.engines.global_equity import GlobalEquityEngine
+    from backtest.runner import _MARKET_TO_SOURCE, _create_market_engine, _detect_source
+
+    assert _detect_source("^SPX") == "yahoo"
+    engine = _create_market_engine("yahoo", {}, ["^SPX"])
+    assert isinstance(engine, GlobalEquityEngine)
+
+
+def test_composite_builds_index_rule_engine() -> None:
+    """A mixed book containing an index gets an index sub-engine, not a drop."""
+    from backtest.engines.global_equity import GlobalEquityEngine
+    from backtest.engines.composite import _build_rule_engines
+
+    engines = _build_rule_engines({}, ["^SPX"])
+    assert "index" in engines
+    assert isinstance(engines["index"], GlobalEquityEngine)
 
 
 def test_yahoo_loader_accepts_futures_and_forex_suffixes() -> None:

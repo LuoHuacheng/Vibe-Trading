@@ -77,7 +77,7 @@ class SignalEngine:
         """
         close = df["close"]
         volume = df["volume"]
-        returns = close.pct_change()
+        returns = close.pct_change(fill_method=None)
 
         factors = pd.DataFrame(index=df.index)
         # 动量：过去 N 日累计收益（正向）
@@ -128,6 +128,7 @@ class SignalEngine:
 
             # 调仓日：截面排名
             composite_scores: Dict[str, float] = {}
+            observed_factors = {code: 0 for code in codes}
             for factor_name in factor_names:
                 raw_vals = {}
                 for code in codes:
@@ -135,13 +136,23 @@ class SignalEngine:
                         raw_vals[code] = factor_map[code].at[dt, factor_name]
                     else:
                         raw_vals[code] = np.nan
+                    if not np.isnan(raw_vals[code]):
+                        observed_factors[code] += 1
                 z_vals = zscore_cross_section(raw_vals)
                 for code in codes:
                     composite_scores[code] = composite_scores.get(code, 0.0) + z_vals.get(code, 0.0)
 
             # 排名取 TopN
-            ranked = sorted(composite_scores.items(), key=lambda x: x[1], reverse=True)
-            effective_n = min(self.top_n, len([s for _, s in ranked if not np.isnan(s)]))
+            ranked = sorted(
+                (
+                    (code, score)
+                    for code, score in composite_scores.items()
+                    if observed_factors[code] > 0
+                ),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            effective_n = min(self.top_n, len(ranked))
             selected = [code for code, _ in ranked[:effective_n]]
             last_selected = selected
 

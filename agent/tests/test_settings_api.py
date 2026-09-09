@@ -666,7 +666,7 @@ def test_get_data_source_settings_lists_default_source_orders(
     assert set(orders) == {
         "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
         "ca_equity", "vietnam_equity", "uk_equity", "crypto", "futures",
-        "fund", "macro", "forex",
+        "fund", "macro", "forex", "index",
     }
     a_share = orders["a_share"]
     assert a_share["env_var"] == "MARKET_DATA_ORDER_A_SHARE"

@@ -62,7 +62,9 @@ def _to_yfinance_symbol(code: str) -> str:
     """
     upper = code.strip().upper()
     if upper.endswith(".US"):
-        return upper[:-3]
+        # US class shares are hyphenated on Yahoo/yfinance (BRK-B): the dot
+        # form returns empty data (live-verified), so map BRK.B.US -> BRK-B.
+        return upper[:-3].replace(".", "-")
     if upper.endswith(".HK"):
         digits = upper[:-3]
         width = max(4, len(digits))

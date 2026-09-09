@@ -1395,3 +1395,103 @@ class TestSchemaMigration:
         fetched = store2.get_artifact(aid)
         assert fetched is not None
         assert fetched.name == "reopen_factor"
+
+
+class TestOrderingWithTiedTimestamps:
+    """Ordering must hold when created_at collides.
+
+    _now_iso() carries only the clock's resolution, so a batch registered
+    inside one tick shares a timestamp. On Linux that is rare enough to pass by
+    luck; on Windows the ~15.6ms granularity makes it the normal case. Pinning
+    the timestamp reproduces it on every platform.
+    """
+
+    PINNED = "2026-03-02T10:00:00+00:00"
+
+    def _pin(self, monkeypatch, module):
+        monkeypatch.setattr(module, "_now_iso", lambda: self.PINNED)
+
+    def test_in_memory_artifacts_newest_first_on_tie(self, monkeypatch):
+        from src.strategy_store import store as store_module
+
+        self._pin(monkeypatch, store_module)
+        s = store_module.InMemoryStrategyStore()
+        for i in range(3):
+            s.register_artifact(_make_artifact(name=f"tied_{i}"))
+
+        names = [a.name for a in s.list_artifacts()]
+        assert {a.created_at for a in s.list_artifacts()} == {self.PINNED}
+        assert names == ["tied_2", "tied_1", "tied_0"]
+
+    def test_in_memory_bench_history_newest_first_on_tie(self, monkeypatch):
+        from src.strategy_store import store as store_module
+
+        self._pin(monkeypatch, store_module)
+        s = store_module.InMemoryStrategyStore()
+        aid = s.register_artifact(_make_artifact(name="tied_bench"))
+        for i in range(3):
+            s.record_bench(BenchResult(artifact_id=aid, sharpe=float(i)))
+
+        assert [r.sharpe for r in s.get_bench_history(aid)] == [2.0, 1.0, 0.0]
+
+    def test_sqlite_artifacts_newest_first_on_tie(self, monkeypatch, tmp_path):
+        from src.strategy_store import sqlite_store as sqlite_module
+
+        self._pin(monkeypatch, sqlite_module)
+        s = sqlite_module.SqliteStrategyStore(db_path=tmp_path / "tied.db")
+        for i in range(3):
+            s.register_artifact(_make_artifact(name=f"tied_{i}"))
+
+        assert [a.name for a in s.list_artifacts()] == ["tied_2", "tied_1", "tied_0"]
+
+    # The three paths below were changed by the same patch but had no test.
+    #
+    # They are not equally load-bearing, and the difference is worth recording.
+    # `artifacts` has no index on created_at (only status and type), so its
+    # order comes entirely from the explicit ORDER BY — remove the tiebreaker
+    # and the in-memory and sqlite artifact tests both fail. `bench_history`
+    # and `decay_snapshots` DO have (artifact_id, created_at) indexes, and
+    # SQLite walking one of those in DESC order already yields a total order,
+    # so `, id DESC` there is redundant on any build that uses the index:
+    # reverting it changes nothing observable.
+    #
+    # The two sqlite history tests below are kept anyway, because they pin the
+    # documented BEHAVIOUR rather than the mechanism. If that index is ever
+    # dropped or changed, the ordering silently inverts and these are what
+    # catch it. What they cannot do is fail on the tiebreaker alone — do not
+    # read them as coverage of that clause.
+
+    def test_in_memory_decay_history_newest_first_on_tie(self, monkeypatch):
+        from src.strategy_store import store as store_module
+
+        self._pin(monkeypatch, store_module)
+        s = store_module.InMemoryStrategyStore()
+        aid = s.register_artifact(_make_artifact(name="tied_decay_mem"))
+        for i in range(3):
+            s.record_decay_snapshot(DecaySnapshot(artifact_id=aid, consecutive_warnings=i))
+
+        history = s.get_decay_history(aid)
+        assert {snap.created_at for snap in history} == {self.PINNED}
+        assert [snap.consecutive_warnings for snap in history] == [2, 1, 0]
+
+    def test_sqlite_bench_history_newest_first_on_tie(self, monkeypatch, tmp_path):
+        from src.strategy_store import sqlite_store as sqlite_module
+
+        self._pin(monkeypatch, sqlite_module)
+        s = sqlite_module.SqliteStrategyStore(db_path=tmp_path / "tied_bench.db")
+        aid = s.register_artifact(_make_artifact(name="tied_bench_sql"))
+        for i in range(3):
+            s.record_bench(BenchResult(artifact_id=aid, sharpe=float(i)))
+
+        assert [r.sharpe for r in s.get_bench_history(aid)] == [2.0, 1.0, 0.0]
+
+    def test_sqlite_decay_history_newest_first_on_tie(self, monkeypatch, tmp_path):
+        from src.strategy_store import sqlite_store as sqlite_module
+
+        self._pin(monkeypatch, sqlite_module)
+        s = sqlite_module.SqliteStrategyStore(db_path=tmp_path / "tied_decay.db")
+        aid = s.register_artifact(_make_artifact(name="tied_decay_sql"))
+        for i in range(3):
+            s.record_decay_snapshot(DecaySnapshot(artifact_id=aid, consecutive_warnings=i))
+
+        assert [snap.consecutive_warnings for snap in s.get_decay_history(aid)] == [2, 1, 0]

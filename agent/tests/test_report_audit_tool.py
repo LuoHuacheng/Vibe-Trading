@@ -231,7 +231,70 @@ def test_verdict_skips_points_without_fetched_value() -> None:
     assert out["verdict"] == "PASS"
 
 
-# ── tool contract ─────────────────────────────────────────────────────────
+def test_verdict_zero_verified_points_fails_closed() -> None:
+    """A verdict where NOTHING was verified must not certify the report."""
+    out = render_verdict([
+        {"id": 1, "label": "a", "reported_value": 100, "fetched_value": None},
+        {"id": 2, "label": "b", "reported_value": 200, "fetched_value": None},
+    ])
+    assert out["verdict"] == "FAIL"
+    assert out["total"] == 0
+    assert out["fail_count"] == 1
+    assert "no data points were verified" in out["fail_items"][0]["reason"]
+
+
+def test_verdict_garbage_fetched_value_fails_point() -> None:
+    """A supplied-but-unusable fetched value fails the point, not a crash.
+
+    Junk is NOT the same as an absent fetch: skipping it would let an agent
+    drop a hard-to-verify number by padding it with a garbage fetch.
+    """
+    out = render_verdict([
+        {"id": 1, "label": "a", "reported_value": 100,
+         "fetched_value": "about 100", "fetched_source": "s"},
+    ])
+    assert out["verdict"] == "FAIL"
+    assert out["total"] == 1
+    assert out["fail_count"] == 1
+    assert "fetched value is not a finite number" in out["fail_items"][0]["reason"]
+
+
+def test_verdict_garbage_fetch_cannot_pad_a_clean_report() -> None:
+    """One good point does not launder a garbage-fetch sibling."""
+    out = render_verdict([
+        {"id": 1, "label": "good", "reported_value": 100,
+         "fetched_value": 100, "fetched_source": "m"},
+        {"id": 2, "label": "hard", "reported_value": 500,
+         "fetched_value": "see above", "fetched_source": "s"},
+    ])
+    assert out["verdict"] == "FAIL"
+    assert out["total"] == 2
+    assert out["fail_count"] == 1
+
+
+def test_verdict_absent_fetched_with_good_point_still_passes() -> None:
+    """Absent fetch is legitimately 'not verified' and stays skippable."""
+    out = render_verdict([
+        {"id": 1, "label": "a", "reported_value": 100, "fetched_value": None},
+        {"id": 2, "label": "b", "reported_value": 100,
+         "fetched_value": 100, "fetched_source": "m"},
+    ])
+    assert out["verdict"] == "PASS"
+    assert out["total"] == 1
+
+
+def test_verdict_garbage_second_source_falls_back_to_single() -> None:
+    """A non-finite second source degrades to single-source, not a crash."""
+    out = render_verdict([
+        {"id": 1, "label": "a", "reported_value": 100,
+         "fetched_value": 100, "fetched_source": "m",
+         "fetched_value2": "n/a", "fetched_source2": "x"},
+    ])
+    assert out["verdict"] == "PASS"
+    assert out["total"] == 1
+
+
+# ── tool contract ─────────────────────────────────────────────────────
 
 
 def test_tool_metadata() -> None:

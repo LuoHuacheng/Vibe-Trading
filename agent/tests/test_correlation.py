@@ -65,6 +65,61 @@ class TestInferMarket:
         assert infer_market("TD.TO") == "ca_equity"
         assert infer_market("PNG.V") == "ca_equity"
 
+    def test_precious_metals_classify_as_forex(self):
+        # Bare 6-letter precious-metal symbols are spot / OTC markets. The
+        # underlying asset is XAU / XAG / XPT / XPD (ISO 4217 metals); the
+        # quote is USD. Engines (ForexEngine._METAL_SPECS) already handle the
+        # correct pip / lot conventions; the classifier just has to land on
+        # ``forex`` so the forex fallback chain (mt5, tickerall, qveris,
+        # yfinance) is engaged instead of the a_share chain.
+        assert infer_market("XAUUSD") == "forex"
+        assert infer_market("XAGUSD") == "forex"
+        assert infer_market("XPTUSD") == "forex"
+        assert infer_market("XPDUSD") == "forex"
+
+    def test_g10_fx_pairs_classify_as_forex(self):
+        # G10 currency pairs in their bare 6-letter form. Same routing as
+        # metals above: bare code, no separator, must reach the forex chain.
+        assert infer_market("EURUSD") == "forex"
+        assert infer_market("GBPUSD") == "forex"
+        assert infer_market("USDJPY") == "forex"
+        assert infer_market("USDCHF") == "forex"
+        assert infer_market("AUDUSD") == "forex"
+        assert infer_market("NZDUSD") == "forex"
+        assert infer_market("USDCAD") == "forex"
+
+    def test_yahoo_equals_notation_routes_to_underlying_market(self):
+        # Yahoo's continuous-front-month futures form ``=F`` and forex form
+        # ``=X`` must reach the underlying market's chain instead of falling
+        # through to the a_share default.
+        assert infer_market("GC=F") == "futures"   # COMEX Gold
+        assert infer_market("CL=F") == "futures"   # NYMEX Crude
+        assert infer_market("SI=F") == "futures"   # COMEX Silver
+        assert infer_market("HG=F") == "futures"   # COMEX Copper
+        assert infer_market("MGC=F") == "futures"  # Micro Gold
+        assert infer_market("XAUUSD=X") == "forex"
+        assert infer_market("EURUSD=X") == "forex"
+
+    def test_6char_metals_whitelist_does_not_over_match_us_equities(self):
+        # A bare 6-letter US ticker that happens to start with a 3-letter
+        # word NOT in the metals/G10 whitelist must not be re-routed. The
+        # whitelist's whole point is to be conservative; length-only patterns
+        # were rejected for this reason.
+        assert infer_market("NFLXLI") != "forex"  # not a real ticker, but illustrative
+        assert infer_market("AMZNLY") != "forex"
+        # GLD (3 letters) is gold ETF, not a metal pair; stays us_equity.
+        assert infer_market("GLD") == "us_equity"
+        # Tokenized gold is crypto, not metal forex.
+        assert infer_market("XAUT-USDT") == "crypto"
+        assert infer_market("PAXG-USDT") == "crypto"
+
+    def test_btcusdt_style_joined_pairs_stay_crypto(self):
+        # A bare joined crypto pair must still classify as crypto. This
+        # guards the new whitelist against over-aggressive skipping.
+        assert infer_market("BTCUSDT") == "crypto"
+        assert infer_market("ETHUSDT") == "crypto"
+        assert infer_market("SOLUSDT") == "crypto"
+
 
 class TestNormalizeSymbol:
     def test_bare_us_equity_gets_us_suffix(self):

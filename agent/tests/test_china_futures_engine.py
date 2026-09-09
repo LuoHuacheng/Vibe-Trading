@@ -251,6 +251,102 @@ class TestMarginRate:
 
 
 # ---------------------------------------------------------------------------
+# Product-key casing: every table lookup keys off _extract_product, so the
+# fold lives there and these tests guard the invariant that makes it safe
+# ---------------------------------------------------------------------------
+
+
+class TestProductKeyCasing:
+    def test_extract_folds_to_the_table_spelling(self) -> None:
+        """A symbol reaches the tables in their own spelling, either casing in."""
+        assert _extract_product("AU2412.SHFE") == "au"
+        assert _extract_product("au2412.SHFE") == "au"
+        assert _extract_product("if2406.CFFEX") == "IF"
+        assert _extract_product("IF2406.CFFEX") == "IF"
+
+    def test_unlisted_product_keeps_its_own_letters(self) -> None:
+        """An unknown product still falls through to the generic defaults."""
+        assert _extract_product("XX9999.SHFE") == "XX"
+
+    def test_no_product_collides_when_case_folded(self) -> None:
+        """Folding is only safe while no two keys in a table share an
+        upper-cased spelling; a future 'ao' beside an existing 'AO' would
+        silently merge two different products into one."""
+        for table in (_MULTIPLIER, _MARGIN_RATE, _PRICE_LIMIT, _COMMISSION):
+            folded: dict[str, str] = {}
+            for key in table:
+                first = folded.setdefault(key.upper(), key)
+                assert first == key, f"{first!r} and {key!r} fold together"
+
+    def test_tables_agree_on_how_a_product_is_spelled(self) -> None:
+        """One product, one spelling across all four tables — otherwise the
+        canonical map would send a lookup to the wrong casing."""
+        spelling: dict[str, str] = {}
+        for table in (_MULTIPLIER, _MARGIN_RATE, _PRICE_LIMIT, _COMMISSION):
+            for key in table:
+                first = spelling.setdefault(key.upper(), key)
+                assert first == key, f"product spelled {first!r} and {key!r}"
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive product lookup (this project's documented symbol
+# convention, and Tushare's real ts_code values, use uppercase product
+# codes across every exchange, including SHFE/DCE/INE/GFEX)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseInsensitiveLookup:
+    def test_uppercase_shfe_multiplier(self) -> None:
+        engine = _make_engine()
+        assert engine.get_contract_multiplier("AU2412.SHFE") == 1000
+
+    def test_uppercase_shfe_margin_rate(self) -> None:
+        engine = _make_engine()
+        assert engine.get_margin_rate("AU2412.SHFE") == 0.08
+
+    def test_uppercase_dce_multiplier(self) -> None:
+        # pg's real multiplier (20) differs from the generic default
+        # (10), so a missed case-sensitive lookup can't coincidentally
+        # pass by falling back to the same number.
+        engine = _make_engine()
+        assert engine.get_contract_multiplier("PG2501.DCE") == 20
+
+    def test_uppercase_ine_multiplier(self) -> None:
+        engine = _make_engine()
+        assert engine.get_contract_multiplier("SC2503.INE") == 1000
+
+    def test_uppercase_shfe_fixed_commission(self) -> None:
+        engine = _make_engine()
+        comm = engine.calc_commission_for_symbol("AU2412.SHFE", 3, 500.0, is_open=True)
+        assert comm == pytest.approx(3 * 10.0)
+
+    def test_lowercase_cffex_multiplier(self) -> None:
+        """The opposite direction: CFFEX/ZCE keys are uppercase-only."""
+        engine = _make_engine()
+        assert engine.get_contract_multiplier("if2406.cffex") == 300
+
+    def test_lowercase_zce_multiplier(self) -> None:
+        engine = _make_engine()
+        assert engine.get_contract_multiplier("cf501.zce") == 5
+
+    def test_uppercase_shfe_leverage_from_margin(self) -> None:
+        """__init__ derives leverage from the first code's margin rate."""
+        engine = ChinaFuturesEngine(
+            {"initial_cash": 1_000_000, "codes": ["AU2412.SHFE"]}
+        )
+        assert engine.default_leverage == pytest.approx(1.0 / 0.08)
+
+    def test_lowercase_cffex_price_limit_still_specific(self) -> None:
+        """IF's own 10% limit must still apply lowercase, not the 5%
+        generic default a missed lookup would silently substitute."""
+        engine = _make_engine()
+        # +6%: inside IF's real 10% band, but outside the 5% default a
+        # missed case-sensitive lookup would wrongly fall back to.
+        bar = _make_bar(close=5300.0, pre_close=5000.0)
+        assert engine.can_execute("if2406.cffex", 1, bar) is True
+
+
+# ---------------------------------------------------------------------------
 # Slippage
 # ---------------------------------------------------------------------------
 

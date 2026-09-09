@@ -235,8 +235,9 @@ def read_trade_dates(path: Path) -> list[date] | None:
 
 def read_equity_series(
     path: Path,
-) -> tuple[list[date], list[float], list[float | None], list[float]] | None:
-    """(dates, equity, benchmark-or-None-per-bar, exposures) from ``equity.csv``.
+) -> tuple[list[date], list[float], list[float | None], list[float | None]] | None:
+    """(dates, equity, benchmark-or-None-per-bar, exposure-or-None-per-bar) from
+    ``equity.csv``.
 
     Column aliases: the date column is ``timestamp`` in engine artifacts
     (legacy ``date`` still parses); the benchmark column is
@@ -245,6 +246,11 @@ def read_equity_series(
     value are skipped. Returns ``None`` when the file lacks a usable
     date/equity column pair, contains no usable rows, or is unreadable
     (decode / OS / CSV errors degrade instead of raising).
+
+    Exposure is aligned to bar position like benchmark, ``None`` where the
+    column is absent or the value isn't a finite positive number, so a
+    caller can slice it by the same ``bar_indices`` used for every other
+    per-bar series instead of a compacted, position-losing subsequence.
     """
     try:
         with path.open(newline="", encoding="utf-8-sig") as handle:
@@ -296,7 +302,8 @@ def read_equity_series(
     equities = [values[0] for _, values in ordered]
     benchmarks = [values[1] for _, values in ordered]
     exposures = [
-        values[2] for _, values in ordered if values[2] is not None and values[2] > 0
+        values[2] if values[2] is not None and values[2] > 0 else None
+        for _, values in ordered
     ]
     return dates, equities, benchmarks, exposures
 

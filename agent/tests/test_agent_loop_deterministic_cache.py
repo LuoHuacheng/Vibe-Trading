@@ -167,16 +167,23 @@ def test_non_deterministic_tool_is_never_cached(agent_factory) -> None:
 
 
 def test_failed_deterministic_call_is_not_cached(agent_factory) -> None:
-    """A failure must be retryable, not frozen in for the rest of the run."""
+    """Failures are skipped by the retry guard, never served as cached success."""
     tool = _CountingTool(deterministic=True, status="error")
     agent, run_dir, _ = agent_factory(tool)
 
     messages, records = _drive(
-        agent, tool.name, run_dir, [{"a": 1}, {"a": 1}],
+        agent,
+        tool.name,
+        run_dir,
+        [{"a": 1}, {"a": 1}, {"a": 1}, {"a": 2}],
     )
 
-    assert len(tool.calls) == 2
-    assert len(messages) == 2
+    # One honest retry runs (a transient failure says nothing about the
+    # arguments); the THIRD identical attempt is refused, and changed
+    # arguments still execute.
+    assert len(tool.calls) == 3
+    assert len(messages) == 4
+    assert json.loads(messages[2]["content"])["skipped"] is True
     assert not any(r["type"] == "tool_result_cached" for r in records)
 
 

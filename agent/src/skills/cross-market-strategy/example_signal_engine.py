@@ -64,7 +64,7 @@ class SignalEngine:
     def _vol_adjust(self, signals: dict, data_map: dict) -> dict:
         vols = {}
         for code, df in data_map.items():
-            ret = df["close"].pct_change().dropna()
+            ret = df["close"].pct_change(fill_method=None).dropna()
             vols[code] = (
                 ret.rolling(20).std().iloc[-1]
                 if len(ret) > 20

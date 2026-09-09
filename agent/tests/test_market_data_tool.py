@@ -94,6 +94,7 @@ def test_market_data_json_can_include_actual_source_provenance():
         "fallback_used": True,
         "currency_conversion": "none",
         "volume_unit": None,
+        "adjustment": "split_dividend",
     }
 
 

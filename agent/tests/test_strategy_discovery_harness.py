@@ -124,6 +124,60 @@ def _engine_equity_frame() -> pd.DataFrame:
     return eq_df
 
 
+def _engine_equity_frame_with_regime_exposure(
+    bear_exposure: float, bull_exposure: float, other_exposure: float = 1.0
+) -> pd.DataFrame:
+    """Same frame as _engine_equity_frame, plus an exposure column that
+    differs between the bear-labeled bars (index 8..17) and the
+    bull-labeled bars (index 18..27).
+
+    These are the harness's own trailing-window regime labels for
+    benchmark_window=5/bear_threshold=-0.05/bull_threshold=0.05 (the
+    fixed windows _compute_with_fixture_windows always uses), not the
+    raw curve's decline/rally span from _benchmark_series — the 5-bar
+    trailing anchor keeps the bear label through two bars of the actual
+    rally before the rolling return clears the threshold, confirmed via
+    the harness's own regime labeler."""
+    eq_df = _engine_equity_frame()
+    exposure = [other_exposure] * DAYS
+    for i in range(8, 18):
+        exposure[i] = bear_exposure
+    for i in range(18, 28):
+        exposure[i] = bull_exposure
+    eq_df["exposure"] = exposure
+    return eq_df
+
+
+def _engine_equity_frame_with_benchmark_gap(gap_index: int) -> pd.DataFrame:
+    """Same frame as _engine_equity_frame, with ONE blank benchmark cell.
+
+    ``gap_index`` is the bar immediately BEFORE a regime's first bar, so
+    every bar the regime owns still has a benchmark while the return
+    anchor for its first bar does not — the exact shape a per-regime
+    availability check cannot see.
+    """
+    eq_df = _engine_equity_frame()
+    eq_df.iloc[gap_index, eq_df.columns.get_loc("benchmark_equity")] = float("nan")
+    return eq_df
+
+
+def _write_run_fixture_with_benchmark_gap(base_dir: Path, gap_index: int) -> Path:
+    """_write_run_fixture with a single unparseable benchmark cell."""
+    run_dir = base_dir / "benchmark_gap_run"
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    _engine_equity_frame_with_benchmark_gap(gap_index).to_csv(artifacts / "equity.csv")
+
+    round_trips = [
+        (trade_date, "TEST.SH", 50.0, "signal" if i < 8 else "end")
+        for i, trade_date in enumerate(ALL_TRADE_DAYS)
+    ]
+    _write_trades_csv(artifacts, _engine_trade_rows(round_trips))
+    _write_run_state(run_dir, trade_count=len(ALL_TRADE_DAYS))
+    return run_dir
+
+
 def _entry_row(trade_date: date, code: str) -> dict:
     return {
         "timestamp": trade_date.strftime("%Y-%m-%d"),
@@ -238,6 +292,33 @@ def _write_run_fixture(
         ]
         _write_trades_csv(artifacts, _engine_trade_rows(round_trips))
 
+    _write_run_state(run_dir, trade_count=len(ALL_TRADE_DAYS))
+    return run_dir
+
+
+def _write_run_fixture_with_regime_exposure(
+    base_dir: Path, *, bear_exposure: float, bull_exposure: float
+) -> Path:
+    """Same as _write_run_fixture but equity.csv carries a per-regime
+    exposure column instead of none at all."""
+    run_dir = base_dir / "run_fixture"
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    _engine_equity_frame_with_regime_exposure(bear_exposure, bull_exposure).to_csv(
+        artifacts / "equity.csv"
+    )
+
+    round_trips = [
+        (
+            trade_date,
+            "TEST.SH",
+            50.0,
+            "signal" if i < 8 else "end",
+        )
+        for i, trade_date in enumerate(ALL_TRADE_DAYS)
+    ]
+    _write_trades_csv(artifacts, _engine_trade_rows(round_trips))
     _write_run_state(run_dir, trade_count=len(ALL_TRADE_DAYS))
     return run_dir
 
@@ -479,6 +560,47 @@ class TestComputeEvidence:
                 f"{regime}: position_size=0.5 must double breakeven "
                 f"(full={full}, half={half})"
             )
+
+    def test_position_size_is_resolved_per_regime_not_blended_across_run(
+        self, tmp_path
+    ) -> None:
+        # Exposure-derived sizing (no explicit position_size) must use each
+        # regime's own bars, not a single whole-run average that leaks the
+        # bear window's exposure into the bull window's breakeven math.
+        run_dir = _write_run_fixture_with_regime_exposure(
+            tmp_path, bear_exposure=0.25, bull_exposure=0.75
+        )
+        rows = _compute_with_fixture_windows(run_dir)
+        by_regime = {row.regime: row for row in rows}
+        assert by_regime["bear_market"].position_size == pytest.approx(0.25)
+        assert by_regime["bull_market"].position_size == pytest.approx(0.75)
+
+    def test_benchmark_gap_on_the_anchor_bar_does_not_sink_the_run(
+        self, tmp_path
+    ) -> None:
+        # The bear regime's own bars (8..17) all carry a benchmark, but the
+        # return anchor for its first bar (7) does not. Checking only the
+        # regime's own bars therefore admits a None anchor into _bar_returns,
+        # where `previous <= 0` used to raise TypeError -- swallowed by
+        # rebuild_evidence's except, so the WHOLE run produced no evidence.
+        run_dir = _write_run_fixture_with_benchmark_gap(tmp_path, gap_index=7)
+        rows = _compute_with_fixture_windows(run_dir)
+        by_regime = {row.regime: row for row in rows}
+        assert "bear_market" in by_regime, (
+            "a single missing benchmark cell must not erase the run's evidence"
+        )
+        # The regime still gets a benchmark: the gap costs bar 8 its return,
+        # bars 9..17 are unaffected.
+        assert by_regime["bear_market"].benchmark_in_regime is not None
+
+    def test_bar_returns_skips_a_missing_anchor_instead_of_comparing_none(self) -> None:
+        # Unit-level statement of the same rule: the anchor is outside
+        # bar_indices by construction, so it can be None.
+        assert sd_harness._bar_returns([1, 2, 3], [None, 100.0, 101.0, 102.0]) == [
+            pytest.approx(101.0 / 100.0 - 1.0),
+            pytest.approx(102.0 / 101.0 - 1.0),
+        ]
+        assert sd_harness._bar_returns([1], [100.0, None]) == []
 
     def test_single_position_run_carries_no_concurrency_caveat(self, tmp_path) -> None:
         run_dir = _write_run_fixture(tmp_path)

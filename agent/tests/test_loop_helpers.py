@@ -21,13 +21,16 @@ from src.agent.loop import (
     _llm_timeout_seconds,
     _stall_timeout_seconds,
     _verification_ledger,
+    _cleared_text,
 )
 
 
-def _apply_microcompact_gate(messages: list) -> None:
+def _apply_microcompact_gate(messages: list, called_ok: set | None = None) -> None:
     """Mirror AgentLoop layer-1 gate (``loop.py`` ~572-573)."""
     if estimate_tokens(messages) > MICROCOMPACT_THRESHOLD:
-        _microcompact(messages)
+        unreadable = _microcompact(messages)
+        if called_ok is not None:
+            called_ok.difference_update(unreadable)
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +73,14 @@ class TestMicrocompact:
 
         tool_msgs = [m for m in messages if m.get("role") == "tool"]
         # Old ones should be [cleared]
-        cleared = [m for m in tool_msgs if m["content"] == "[cleared]"]
-        preserved = [m for m in tool_msgs if m["content"] != "[cleared]"]
+        cleared = [
+            m for m in tool_msgs if m["content"].startswith("[CLEARED FROM CONTEXT:")
+        ]
+        preserved = [
+            m
+            for m in tool_msgs
+            if not m["content"].startswith("[CLEARED FROM CONTEXT:")
+        ]
         assert len(cleared) == 5
         assert len(preserved) == KEEP_RECENT
 
@@ -96,7 +105,7 @@ class TestMicrocompact:
             {"role": "tool", "content": "x" * 200, "tool_call_id": "tc_0"},
         ]
         _microcompact(messages)
-        assert messages[0]["content"] != "[cleared]"
+        assert not messages[0]["content"].startswith("[CLEARED FROM CONTEXT:")
 
     def test_does_not_touch_non_tool(self) -> None:
         messages = [
@@ -141,10 +150,82 @@ class TestMicrocompactThresholdGate:
         _apply_microcompact_gate(messages)
 
         tool_msgs = [m for m in messages if m.get("role") == "tool"]
-        cleared = [m for m in tool_msgs if m["content"] == "[cleared]"]
-        preserved = [m for m in tool_msgs if m["content"] != "[cleared]"]
+        cleared = [
+            m for m in tool_msgs if m["content"].startswith("[CLEARED FROM CONTEXT:")
+        ]
+        preserved = [
+            m
+            for m in tool_msgs
+            if not m["content"].startswith("[CLEARED FROM CONTEXT:")
+        ]
         assert len(cleared) == 5
         assert len(preserved) == KEEP_RECENT
+
+
+class TestMicrocompactDedupLedger:
+    """#1343: a cleared result cannot back "use the previous result", so the
+    tools it came from must leave the dedup ledger and become callable again."""
+
+    @staticmethod
+    def _tool(name: str, content: str) -> dict:
+        return {"role": "tool", "name": name, "content": content, "tool_call_id": f"tc_{name}_{len(content)}"}
+
+    def test_cleared_tool_is_returned_for_unblocking(self) -> None:
+        messages = [
+            self._tool("get_fund_flow", "x" * 200),
+            self._tool("get_stock_news", "y" * 200),
+            self._tool("recent_a", "a" * 200),
+            self._tool("recent_b", "b" * 200),
+            self._tool("recent_c", "c" * 200),
+        ]
+        assert _microcompact(messages) == ["get_fund_flow", "get_stock_news"]
+
+    def test_tool_with_surviving_result_stays_blocked(self) -> None:
+        # Same name has an old cleared result AND a result inside KEEP_RECENT:
+        # the model can still read one, so the dedup block must stay.
+        messages = [
+            self._tool("get_fund_flow", "x" * 200),
+            self._tool("other", "y" * 200),
+            self._tool("get_fund_flow", "fresh" + "z" * 200),
+            self._tool("recent_b", "b" * 200),
+            self._tool("recent_c", "c" * 200),
+        ]
+        assert _microcompact(messages) == ["other"]
+
+    def test_short_old_result_still_counts_as_readable(self) -> None:
+        messages = [
+            self._tool("get_fund_flow", "x" * 200),
+            self._tool("get_fund_flow", "ok"),
+            self._tool("recent_a", "a" * 200),
+            self._tool("recent_b", "b" * 200),
+            self._tool("recent_c", "c" * 200),
+        ]
+        assert _microcompact(messages) == []
+
+    def test_unnamed_messages_clear_without_unblocking(self) -> None:
+        messages = [{"role": "tool", "content": "x" * 200, "tool_call_id": f"tc_{i}"} for i in range(KEEP_RECENT + 2)]
+        assert _microcompact(messages) == []
+
+    def test_second_pass_reports_nothing_new(self) -> None:
+        messages = [
+            self._tool("get_fund_flow", "x" * 200),
+            self._tool("recent_a", "a" * 200),
+            self._tool("recent_b", "b" * 200),
+            self._tool("recent_c", "c" * 200),
+        ]
+        assert _microcompact(messages) == ["get_fund_flow"]
+        assert _microcompact(messages) == []
+
+    def test_gate_updates_dedup_ledger(self) -> None:
+        messages = [{"role": "system", "content": "sys"}]
+        messages.append({"role": "user", "content": "x" * (MICROCOMPACT_THRESHOLD * 4 + 1000)})
+        messages.append(self._tool("get_fund_flow", "y" * 200))
+        for name in ("recent_a", "recent_b", "recent_c"):
+            messages.append(self._tool(name, "z" * 200))
+
+        called_ok = {"get_fund_flow", "recent_a"}
+        _apply_microcompact_gate(messages, called_ok)
+        assert called_ok == {"recent_a"}
 
 
 # ---------------------------------------------------------------------------
@@ -177,13 +258,14 @@ class TestContextCollapse:
             assert msg["content"] == orig
 
     def test_skips_cleared_content(self) -> None:
+        marker = _cleared_text(5000)
         messages = [{"role": "system", "content": "sys"}]
         for _ in range(COLLAPSE_PRESERVE_RECENT + 3):
-            messages.append({"role": "tool", "content": "[cleared]"})
+            messages.append({"role": "tool", "content": marker})
         _context_collapse(messages)
-        # [cleared] should remain [cleared], not be collapsed
+        # A cleared marker must survive layer 2 untouched.
         for m in messages[1:]:
-            assert m["content"] == "[cleared]"
+            assert m["content"] == marker
 
     def test_no_op_when_too_few_messages(self) -> None:
         messages = [
@@ -598,3 +680,173 @@ def test_stall_timeout_seconds_default_and_override(monkeypatch) -> None:
     assert _stall_timeout_seconds() == 42.0
     monkeypatch.delattr(loop_module, "STALL_TIMEOUT_SECONDS", raising=False)
     assert _stall_timeout_seconds() > 0
+
+
+# ---------------------------------------------------------------------------
+# tool_calls[].function.arguments must count toward compaction sizing/relief
+# ---------------------------------------------------------------------------
+
+def test_tail_cut_index_counts_tool_call_arguments() -> None:
+    """#tail-budget: a fat tool_call (empty content, huge arguments) must be
+    pushed into the folded head, not counted as ~10 tokens in the tail."""
+    from src.agent.loop import _tail_cut_index  # new helper: absent on pre-fix code
+
+    fat = "X" * 90_000  # ~22.5K tokens once arguments are counted
+    body = [
+        {"role": "user", "content": "old header"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "t", "arguments": fat}}
+            ],
+        },
+    ]
+    # Old content-only sizing: both messages fit the 20K budget -> cut at 0.
+    # New sizing: the call alone exceeds it -> cut at len(body), tail empty,
+    # the oversized call goes into the folded head.
+    assert _tail_cut_index(body) == len(body)
+    assert _tail_cut_index(body) != 0
+
+
+def test_context_collapse_stubs_args_of_cleared_paired_call() -> None:
+    """#layer-2: a tool_call whose paired result was [cleared] gets its huge
+    arguments folded to a valid JSON '{}' stub (call id/name preserved)."""
+    fat = "Y" * (COLLAPSE_TEXT_MIN * 3)
+    call_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "c9", "type": "function", "function": {"name": "f", "arguments": fat}}],
+    }
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u0"},
+        call_msg,  # index 2 — inside the collapse window
+        # The real layer-1 marker, not the old "[cleared]" literal: it embeds
+        # the payload length, so _result_data_gone matches it by prefix.
+        {"role": "tool", "tool_call_id": "c9", "content": _cleared_text(9000)},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+    ]
+    _context_collapse(msgs)
+    assert call_msg["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert call_msg["tool_calls"][0]["function"]["name"] == "f"
+
+
+def test_context_collapse_keeps_args_when_result_intact_or_pending() -> None:
+    """#layer-2 negative arm: arguments are NOT stubbed when the result still
+    carries data, nor when the call is pending (no result in the transcript)."""
+    fat = "Y" * (COLLAPSE_TEXT_MIN * 3)
+    c1 = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": fat}}],
+    }
+    c2 = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "g", "arguments": fat}}],
+    }
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u0"},
+        c1,  # index 2 — inside the collapse window
+        {"role": "tool", "tool_call_id": "c1", "content": "still have the data"},
+        c2,  # pending — result never arrived
+        {"role": "assistant", "content": "continue"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    _context_collapse(msgs)
+    assert c1["tool_calls"][0]["function"]["arguments"] == fat
+    assert c2["tool_calls"][0]["function"]["arguments"] == fat
+
+
+def test_context_collapse_stubs_args_for_fix_tool_pairs_stub_result() -> None:
+    """#adversarial: layer-3's ``_fix_tool_pairs`` stub result marker must also
+    count as 'result data gone' — a call that survived a layer-3 fold gets its
+    huge arguments stubbed too, not only microcompact's ``[cleared]``."""
+    from src.agent.loop import _STUB_RESULT_CONTENT
+
+    fat = "Y" * (COLLAPSE_TEXT_MIN * 3)
+    call_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "c7", "type": "function", "function": {"name": "f", "arguments": fat}}],
+    }
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u0"},
+        call_msg,  # index 2 — inside the collapse window
+        {"role": "tool", "tool_call_id": "c7", "content": _STUB_RESULT_CONTENT},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+    ]
+    _context_collapse(msgs)
+    assert call_msg["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+def test_msg_estimate_chars_counts_dict_arguments() -> None:
+    """#adversarial: dict (non-string) arguments must count toward sizing,
+    consistent with ``estimate_tokens``' full serialization gate."""
+    from src.agent.loop import _msg_estimate_chars
+
+    big_dict = {"q": "X" * 4000}
+    msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"function": {"name": "f", "arguments": big_dict}}],
+    }
+    assert _msg_estimate_chars(msg) >= 4000
+    assert _msg_estimate_chars({"role": "user", "content": "hi"}) >= 2
+
+
+class TestMicrocompactMarkerIsStable:
+    """The cleared-result marker is >100 chars, i.e. longer than the pruning
+    threshold itself, so microcompact must not treat it as prunable payload."""
+
+    def _tool_msgs(self, payload_len: int) -> list:
+        msgs = [
+            {
+                "role": "tool",
+                "tool_call_id": "c0",
+                "name": "get_fund_flow",
+                "content": "x" * payload_len,
+            }
+        ]
+        msgs += [
+            {"role": "tool", "tool_call_id": f"p{i}", "name": "pad", "content": "y" * 200}
+            for i in range(KEEP_RECENT + 1)
+        ]
+        return msgs
+
+    def test_marker_keeps_the_original_payload_length(self) -> None:
+        payload_len = 4321
+        messages = self._tool_msgs(payload_len)
+        _microcompact(messages)
+        first = messages[0]["content"]
+        assert str(payload_len) in first, first
+
+        # A second pass must not rewrite the marker with the marker's own
+        # length, which would report a fabricated original size to the model.
+        _microcompact(messages)
+        assert messages[0]["content"] == first
+        assert str(payload_len) in messages[0]["content"]
+
+    def test_second_pass_reports_no_new_unreadable_tools(self) -> None:
+        messages = self._tool_msgs(4321)
+        assert _microcompact(messages) == ["get_fund_flow"]
+        assert _microcompact(messages) == [], (
+            "a tool already reported unreadable must not be re-reported, or the "
+            "ledger is re-opened and traced on every later iteration"
+        )

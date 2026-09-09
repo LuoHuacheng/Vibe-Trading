@@ -358,9 +358,9 @@ if __name__ == "__main__":
         def compute(self, alpha_id: str, panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
             close = panel["close"]
             if alpha_id == "fake_mom":
-                return close.pct_change(3)
+                return close.pct_change(3, fill_method=None)
             if alpha_id == "fake_rev":
-                return -close.pct_change(1)
+                return -close.pct_change(1, fill_method=None)
             raise KeyError(alpha_id)
 
     ls_engine = ZooSignalEngine.from_zoo(
