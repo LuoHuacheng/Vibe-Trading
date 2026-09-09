@@ -168,7 +168,11 @@ TRADING_COMMON_PARAMETERS = {
     "market_type": {
         "type": "string",
         "enum": ["spot", "usdm"],
-        "description": ("Optional Binance read market. USD-M is accepted only by the live read-only Binance profile."),
+        "description": (
+            "Optional Binance market: spot or usdm (USDⓈ-M futures). usdm "
+            "selects the USDⓈ-M futures host and pairs with the futures "
+            "trade profiles (binance-futures-paper-trade / binance-futures-live-trade)."
+        ),
     },
     "observation_absolute_tolerance": {
         "type": "number",
@@ -760,6 +764,30 @@ class TradingPlaceOrderTool(BaseTool):
             "order_type": {"type": "string", "enum": ["market", "limit"], "default": "market"},
             "limit_price": {"type": "number", "description": "Required for limit orders."},
             "time_in_force": {"type": "string", "enum": ["day", "gtc"], "default": "day"},
+            "margin_mode": {
+                "type": "string",
+                "enum": ["isolated", "cross"],
+                "description": (
+                    "Binance USDⓈ-M futures-only margin mode (isolated or "
+                    "cross); spot/equity profiles never receive it."
+                ),
+            },
+            "leverage": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 125,
+                "description": (
+                    "Binance USDⓈ-M futures-only leverage multiplier "
+                    "(1-125); spot/equity profiles never receive it."
+                ),
+            },
+            "reduce_only": {
+                "type": "boolean",
+                "description": (
+                    "Binance USDⓈ-M futures-only: reduce-only order flag; "
+                    "spot/equity profiles never receive it."
+                ),
+            },
         },
         "required": ["symbol", "side"],
     }
@@ -781,6 +809,7 @@ class TradingPlaceOrderTool(BaseTool):
             quantity = _num_or_none(kwargs.get("quantity"), "quantity") or None
             notional = _num_or_none(kwargs.get("notional"), "notional") or None
             limit_price = _num_or_none(kwargs.get("limit_price"), "limit_price")
+            leverage = _int_or_none(kwargs.get("leverage"), "leverage")
             overrides = _overrides(kwargs)
         except InvalidTradingArgument as exc:
             return _json_result({"status": "error", "error": str(exc)})
@@ -796,6 +825,9 @@ class TradingPlaceOrderTool(BaseTool):
                     order_type=str(kwargs.get("order_type") or "market"),
                     limit_price=limit_price,
                     time_in_force=str(kwargs.get("time_in_force") or "day"),
+                    margin_mode=_connection(kwargs.get("margin_mode")),
+                    leverage=leverage,
+                    reduce_only=bool(kwargs.get("reduce_only", False)),
                     **overrides,
                 )
             )
