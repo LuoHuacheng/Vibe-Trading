@@ -522,3 +522,58 @@ def test_usdm_observation_fails_closed_for_unsupported_or_incoherent_state(
 
     with pytest.raises(bn.BinanceConfigError, match=message):
         bn.get_account_snapshot(_usdm_config())
+
+
+def test_usdm_testnet_endpoints_approved_with_allow_testnet() -> None:
+    from src.trading.connectors.binance import usdm as usdm_mod
+
+    fake = SimpleNamespace(
+        urls={
+            "api": {
+                "fapiPrivateV2": "https://testnet.binancefuture.com/fapi/v2",
+                "fapiPrivateV3": "https://testnet.binancefuture.com/fapi/v3",
+            }
+        }
+    )
+    usdm_mod.assert_exchange_endpoints(fake, allow_testnet=True)  # 不抛
+
+
+def test_usdm_testnet_endpoints_rejected_without_allow_testnet() -> None:
+    from src.trading.connectors.binance import usdm as usdm_mod
+
+    fake = SimpleNamespace(
+        urls={
+            "api": {
+                "fapiPrivateV2": "https://testnet.binancefuture.com/fapi/v2",
+                "fapiPrivateV3": "https://testnet.binancefuture.com/fapi/v3",
+            }
+        }
+    )
+    with pytest.raises(usdm_mod.UsdMObservationError, match="unapproved host"):
+        usdm_mod.assert_exchange_endpoints(fake)
+
+
+def test_paper_usdm_exchange_accepts_sandbox_testnet_host(monkeypatch) -> None:
+    class TestnetUsdM:
+        def __init__(self, _config: dict[str, object]) -> None:
+            self.urls = {
+                "api": {
+                    "fapiPrivateV2": "https://testnet.binancefuture.com/fapi/v2",
+                    "fapiPrivateV3": "https://testnet.binancefuture.com/fapi/v3",
+                }
+            }
+
+        def set_sandbox_mode(self, _enabled: bool) -> None:
+            return None
+
+    monkeypatch.setattr(
+        bn,
+        "_require_ccxt",
+        lambda: SimpleNamespace(binanceusdm=TestnetUsdM),
+    )
+    monkeypatch.setattr(bn, "getproxies", lambda: {})
+
+    ex = bn._exchange(bn.BinanceConfig.from_mapping(
+        {"profile": "paper", "market_type": "usdm", "api_key": "k", "api_secret": "s"}
+    ))
+    assert ex is not None

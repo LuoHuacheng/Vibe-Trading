@@ -1307,7 +1307,7 @@ def _exchange(cfg: BinanceConfig):
     ex.set_sandbox_mode(cfg.is_testnet)
     if cfg.market_type == "usdm":
         try:
-            assert_exchange_endpoints(ex)
+            assert_exchange_endpoints(ex, allow_testnet=cfg.is_testnet)
         except UsdMObservationError as exc:
             raise BinanceConfigError(str(exc)) from None
     return ex

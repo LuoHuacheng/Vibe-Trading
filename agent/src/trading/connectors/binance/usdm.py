@@ -27,20 +27,29 @@ class UsdMObservationError(ValueError):
     """Raised when Binance reports an unsupported or incoherent account state."""
 
 
-def assert_exchange_endpoints(exchange: Any) -> None:
-    """Require exact HTTPS base URLs for the two signed USD-M reads."""
+def assert_exchange_endpoints(exchange: Any, *, allow_testnet: bool = False) -> None:
+    """Require exact HTTPS base URLs for the two signed USD-M reads.
+
+    Args:
+        exchange: The ccxt USD-M client whose urls table is inspected.
+        allow_testnet: When true the testnet host
+            (testnet.binancefuture.com) is accepted instead of the live
+            fapi.binance.com; used by paper/futures-testnet profiles whose
+            sandboxed client resolves signed endpoints there.
+    """
     urls = getattr(exchange, "urls", None)
     api_urls = urls.get("api") if isinstance(urls, Mapping) else None
     expected_paths = {
         "fapiPrivateV2": "/fapi/v2",
         "fapiPrivateV3": "/fapi/v3",
     }
+    expected_host = "testnet.binancefuture.com" if allow_testnet else "fapi.binance.com"
     for endpoint, expected_path in expected_paths.items():
         url = str(api_urls.get(endpoint, "")) if isinstance(api_urls, Mapping) else ""
         parsed = urlparse(url)
         if (
             parsed.scheme != "https"
-            or parsed.hostname != "fapi.binance.com"
+            or parsed.hostname != expected_host
             or parsed.port is not None
             or parsed.path.rstrip("/") != expected_path
             or parsed.query
