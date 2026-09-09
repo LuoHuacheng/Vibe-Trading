@@ -134,8 +134,18 @@ def test_usdm_config_reuses_live_readonly_profile_and_futures_host() -> None:
     assert config.host == "https://fapi.binance.com"
     assert config.is_testnet is False
 
-    with pytest.raises(bn.BinanceConfigError, match="live-readonly"):
-        bn.BinanceConfig.from_mapping({"profile": "live", "market_type": "usdm"})
+    # Tradable USDⓈ-M profiles are allowed since the dual-purpose split: live
+    # and paper resolve to the futures hosts while live-readonly stays the
+    # strict Shadow observation surface above.
+    live = bn.BinanceConfig.from_mapping({"profile": "live", "market_type": "usdm"})
+    assert live.market_type == "usdm"
+    assert live.host == "https://fapi.binance.com"
+    assert live.is_testnet is False
+
+    paper = bn.BinanceConfig.from_mapping({"profile": "paper", "market_type": "usdm"})
+    assert paper.host == "https://testnet.binancefuture.com"
+    assert paper.is_testnet is True
+
     with pytest.raises(bn.BinanceConfigError, match="market_type"):
         bn.BinanceConfig.from_mapping({"profile": "live-readonly", "market_type": "coinm"})
     with pytest.raises(bn.BinanceConfigError, match="observation_absolute_tolerance"):
@@ -385,7 +395,7 @@ def test_usdm_allows_only_the_two_curated_private_read_methods() -> None:
     assert BINANCE_TOOL_CLASS["fapiprivatev3_get_positionrisk"] is ToolClass.READ
 
 
-def test_usdm_rejects_non_shadow_read_surfaces_before_client_creation(
+def test_usdm_shadow_still_rejects_non_observation_read_surfaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exchange_calls = 0
@@ -398,13 +408,18 @@ def test_usdm_rejects_non_shadow_read_surfaces_before_client_creation(
     monkeypatch.setattr(bn, "_exchange", unexpected_exchange)
     config = _usdm_config()
 
+    # Only the Shadow profile (live-readonly) stays read-only now: quote/open-
+    # orders reject via reject_shadow_surface, while historical bars keep the
+    # older blanket usdm guard (tradable usdm quote/read coverage lives in
+    # test_binance_futures_reads.py).
     for call in (
         lambda: bn.get_open_orders(config),
         lambda: bn.get_quote("BTC-USDT-PERP", config=config),
-        lambda: bn.get_historical_bars("BTC-USDT-PERP", config=config),
     ):
-        with pytest.raises(bn.BinanceConfigError, match="account and position reads"):
+        with pytest.raises(bn.BinanceConfigError, match="read-only"):
             call()
+    with pytest.raises(bn.BinanceConfigError, match="account and position reads"):
+        bn.get_historical_bars("BTC-USDT-PERP", config=config)
     assert exchange_calls == 0
 
 

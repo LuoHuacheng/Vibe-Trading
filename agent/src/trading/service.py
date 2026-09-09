@@ -697,6 +697,9 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    margin_mode: str | None = None,
+    leverage: int | None = None,
+    reduce_only: bool = False,
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -707,6 +710,10 @@ def place_order(
     fail-closed pre-trade checks + audit) before any order reaches the broker.
     Only ``broker_sdk`` connectors are supported here; Robinhood keeps its MCP
     gate and IBKR stays read-only.
+
+    ``margin_mode``/``leverage``/``reduce_only`` are USDⓈ-M futures-only and
+    are forwarded to the connector SDK only when supplied; spot and other
+    connector profiles simply never receive them.
     """
     profile = profile_by_id(profile_id)
     if profile.transport != "broker_sdk":
@@ -725,6 +732,12 @@ def place_order(
         "limit_price": limit_price,
         "time_in_force": time_in_force,
     }
+    if margin_mode is not None:
+        place_kwargs["margin_mode"] = margin_mode
+    if leverage is not None:
+        place_kwargs["leverage"] = leverage
+    if reduce_only:
+        place_kwargs["reduce_only"] = True
 
     if profile.environment == "paper":
         return _with_profile(profile, module.place_order(config, **place_kwargs))

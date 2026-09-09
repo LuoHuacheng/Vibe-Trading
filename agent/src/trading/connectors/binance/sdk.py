@@ -796,8 +796,11 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    margin_mode: str | None = None,
+    leverage: int | None = None,
+    reduce_only: bool = False,
 ) -> dict[str, Any]:
-    """Place a spot order on Binance via ccxt's unified ``create_order``.
+    """Place a spot or USDⓈ-M futures order via ccxt's ``create_order``.
 
     The configured profile's host (testnet vs live) is the authoritative
     paper/live discriminator and is asserted before anything is submitted, so a
@@ -805,35 +808,77 @@ def place_order(
     intent the caller has already authorized; mandate/limit enforcement lives in
     a higher layer.
 
-    Either ``quantity`` (base-asset amount) or ``notional`` (quote-asset spend)
-    must be given, never both. ``notional`` is only supported for market orders:
-    ccxt's binance adapter forwards ``params={"quoteOrderQty": notional}`` so
-    Binance sizes the order in the quote asset (e.g. spend 50 USDT of BTC).
-    Limit orders require ``quantity`` and ``limit_price``.
+    Spot semantics: either ``quantity`` (base-asset amount) or ``notional``
+    (quote-asset spend) must be given, never both. ``notional`` is only
+    supported for market orders: ccxt's binance adapter forwards
+    ``params={"quoteOrderQty": notional}`` so Binance sizes the order in the
+    quote asset (e.g. spend 50 USDT of BTC). Limit orders require ``quantity``
+    and ``limit_price``. The ``margin_mode``/``leverage``/``reduce_only``
+    parameters are futures-only; passing any of them to a spot config returns an
+    error envelope and never touches the exchange.
+
+    USDⓈ-M semantics (``market_type="usdm"``): the strict Shadow profile
+    (``live-readonly``) stays read-only and returns an error envelope, while
+    tradable profiles (``paper``/``live``) require both ``margin_mode``
+    (``"isolated"`` or ``"cross"``) and ``leverage`` (integer 1..125). The
+    presets are applied through ``ex.set_margin_mode`` and ``ex.set_leverage``
+    in the same guarded block as ``ex.create_order`` — any exception becomes an
+    error envelope and no ``order_id`` is returned. ``reduce_only`` forwards
+    ``params["reduceOnly"]=True`` on the futures branch. Futures sells reject
+    ``notional`` (orders size by ``quantity``), and the symbol is normalized to
+    the ccxt unified perp form (``BASE/USDT:USDT``).
 
     Args:
         config: Connector config; falls back to the saved config when ``None``.
-        symbol: Trading pair in any accepted form (normalized to ``BASE/QUOTE``).
+        symbol: Trading pair in any accepted form (spot normalized to
+            ``BASE/QUOTE``; futures to ``BASE/USDT:USDT``).
         side: ``"buy"`` or ``"sell"``.
         quantity: Base-asset amount. Mutually exclusive with ``notional``.
         notional: Quote-asset spend (market orders only). Mutually exclusive
-            with ``quantity``.
+            with ``quantity``; not accepted for futures sells.
         order_type: ``"market"`` or ``"limit"``.
         limit_price: Required when ``order_type`` is ``"limit"``.
         time_in_force: Limit-order policy; ``"day"`` maps to Binance GTC.
+        margin_mode: Futures-only; ``"isolated"`` or ``"cross"`` (required on
+            tradable USDⓈ-M profiles).
+        leverage: Futures-only; integer 1..125 (required on tradable USDⓈ-M
+            profiles).
+        reduce_only: Futures-only; close-position-only order flag.
 
     Returns:
         On success: ``{"status": "ok", "order_id": str, "symbol", "side",
-        "profile", "order_type", "status", "filled", "amount", "price"}``. On
-        any validation or execution failure: ``{"status": "error", "error":
-        str}`` (fail-closed; nothing is submitted on a validation error).
+        "profile", "order_type", "status", "filled", "amount", "price"}`` (plus
+        ``market_type`` on futures). On any validation or execution failure:
+        ``{"status": "error", "error": str}`` (fail-closed; nothing is submitted
+        on a validation error).
     """
     cfg = config or load_config()
 
     if cfg.market_type == "usdm":
+        if is_usdm_shadow(cfg):
+            return {
+                "status": "error",
+                "error": "Binance USD-M Shadow Account is read-only",
+            }
+        return _place_usdm_order(
+            cfg,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            notional=notional,
+            order_type=order_type,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
+            margin_mode=margin_mode,
+            leverage=leverage,
+            reduce_only=reduce_only,
+        )
+
+    if margin_mode is not None or leverage is not None or reduce_only:
         return {
             "status": "error",
-            "error": "Binance USD-M Shadow Account is read-only",
+            "error": "margin_mode/leverage/reduce_only are futures-only "
+            "parameters; this is a spot profile.",
         }
 
     side_clean = str(side or "").strip().lower()
@@ -919,6 +964,127 @@ def place_order(
     }
 
 
+def _place_usdm_order(
+    cfg: BinanceConfig,
+    *,
+    symbol: str,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+    order_type: str,
+    limit_price: float | None,
+    time_in_force: str,
+    margin_mode: str | None,
+    leverage: int | None,
+    reduce_only: bool,
+) -> dict[str, Any]:
+    """Place a USDⓈ-M futures order on a tradable (non-Shadow) usdm profile.
+
+    Shared spot order rules apply (side/type validation, exactly one of
+    quantity/notional, market-only notional, limit price), plus the futures
+    contract: both presets are required and validated, futures sells never
+    size by notional, and reduce_only becomes params["reduceOnly"]. The
+    margin/leverage presets and create_order share one guarded block so any
+    exception yields a fail-closed error envelope with no order_id.
+    """
+    side_clean = str(side or "").strip().lower()
+    if side_clean not in ("buy", "sell"):
+        return {"status": "error", "error": "side must be 'buy' or 'sell'."}
+
+    type_clean = str(order_type or "").strip().lower()
+    if type_clean not in ("market", "limit"):
+        return {"status": "error", "error": "order_type must be 'market' or 'limit'."}
+
+    margin_clean = str(margin_mode or "").strip().lower()
+    if not margin_mode or not margin_clean:
+        return {"status": "error", "error": "margin_mode is required for USDⓈ-M orders ('isolated' or 'cross')."}
+    if margin_clean not in ("isolated", "cross"):
+        return {
+            "status": "error",
+            "error": f"margin_mode must be 'isolated' or 'cross', got '{margin_mode}'.",
+        }
+    if leverage is None:
+        return {"status": "error", "error": "leverage is required for USDⓈ-M orders (integer 1..125)."}
+    if isinstance(leverage, bool) or not isinstance(leverage, int) or not (1 <= leverage <= 125):
+        return {"status": "error", "error": "leverage must be an integer between 1 and 125."}
+    if reduce_only is not None and not isinstance(reduce_only, bool):
+        return {"status": "error", "error": "reduce_only must be a boolean."}
+
+    qty_given = quantity is not None
+    notional_given = notional is not None
+    if qty_given == notional_given:
+        return {"status": "error", "error": "provide exactly one of 'quantity' or 'notional'."}
+
+    qty_value = _to_float(quantity) if qty_given else None
+    notional_value = _to_float(notional) if notional_given else None
+    if qty_given and (qty_value is None or qty_value <= 0):
+        return {"status": "error", "error": "quantity must be a positive number."}
+    if notional_given and (notional_value is None or notional_value <= 0):
+        return {"status": "error", "error": "notional must be a positive number."}
+    if notional_given and side_clean == "sell":
+        # USDⓈ-M sells close/short in base contracts; sizing by quote spend is a
+        # spot-only convenience and is rejected up front.
+        return {"status": "error", "error": "USDⓈ-M sell orders require 'quantity', not 'notional'."}
+
+    if type_clean == "limit":
+        if notional_given:
+            return {"status": "error", "error": "limit orders require 'quantity', not 'notional'."}
+        price_value = _to_float(limit_price)
+        if price_value is None or price_value <= 0:
+            return {"status": "error", "error": "limit orders require a positive 'limit_price'."}
+    else:
+        price_value = None
+
+    clean_symbol = normalize_futures_symbol(symbol)
+    if clean_symbol is None:
+        return {
+            "status": "error",
+            "error": f"could not resolve a USDT-settled USDⓈ-M symbol from '{symbol}'.",
+        }
+
+    params: dict[str, Any] = {}
+    if type_clean == "limit":
+        tif = _TIME_IN_FORCE_MAP.get(str(time_in_force or "").strip().lower())
+        if tif is None:
+            return {"status": "error", "error": "time_in_force must be one of 'day', 'gtc', 'ioc', 'fok'."}
+        params["timeInForce"] = tif
+        amount: float | None = qty_value
+        price: float | None = price_value
+    elif notional_given:
+        params["quoteOrderQty"] = notional_value
+        amount = notional_value
+        price = None
+    else:
+        amount = qty_value
+        price = None
+    if reduce_only:
+        params["reduceOnly"] = True
+
+    try:
+        ex = _exchange(cfg)
+        ex.set_margin_mode(margin_clean, clean_symbol)
+        ex.set_leverage(leverage, clean_symbol)
+        order = ex.create_order(clean_symbol, type_clean, side_clean, amount, price, params)
+    except Exception as exc:  # noqa: BLE001 - surface any ccxt/auth/network error as fail-closed
+        return {"status": "error", "error": str(exc)}
+
+    return {
+        "status": "ok",
+        "order_id": str(_obj_get(order, "id", "")),
+        "symbol": _obj_get(order, "symbol", clean_symbol),
+        "side": str(_obj_get(order, "side", side_clean)),
+        "profile": cfg.profile,
+        "is_testnet": cfg.is_testnet,
+        "paper_guard": "host_separated",
+        "order_type": str(_obj_get(order, "type", type_clean)),
+        "order_status": str(_obj_get(order, "status", "")),
+        "filled": _obj_get(order, "filled"),
+        "amount": _obj_get(order, "amount"),
+        "price": _obj_get(order, "price"),
+        "market_type": "usdm",
+    }
+
+
 def cancel_order(
     config: BinanceConfig | None = None,
     order_id: str = "",
@@ -926,6 +1092,10 @@ def cancel_order(
     symbol: str | None = None,
 ) -> dict[str, Any]:
     """Cancel an open order by id. Binance REQUIRES the order's symbol.
+
+    Tradable USDⓈ-M profiles cancel through the futures client with the symbol
+    normalized to ccxt unified perp form; the strict Shadow profile
+    (``live-readonly``) is read-only and returns an error envelope instead.
 
     Args:
         config: Connector config; falls back to the saved config when ``None``.
@@ -939,7 +1109,7 @@ def cancel_order(
     """
     cfg = config or load_config()
 
-    if cfg.market_type == "usdm":
+    if cfg.market_type == "usdm" and is_usdm_shadow(cfg):
         return {
             "status": "error",
             "error": "Binance USD-M Shadow Account is read-only",
@@ -956,9 +1126,17 @@ def cancel_order(
     except BinanceConfigError as exc:
         return {"status": "error", "error": str(exc)}
 
-    clean_symbol = normalize_symbol(symbol)
-    if not clean_symbol or "/" not in clean_symbol:
-        return {"status": "error", "error": f"could not resolve a valid trading pair from symbol '{symbol}'."}
+    if cfg.market_type == "usdm":
+        clean_symbol = normalize_futures_symbol(symbol)
+        if clean_symbol is None:
+            return {
+                "status": "error",
+                "error": f"could not resolve a USDT-settled USDⓈ-M symbol from '{symbol}'.",
+            }
+    else:
+        clean_symbol = normalize_symbol(symbol)
+        if not clean_symbol or "/" not in clean_symbol:
+            return {"status": "error", "error": f"could not resolve a valid trading pair from symbol '{symbol}'."}
 
     try:
         ex = _exchange(cfg)
@@ -966,7 +1144,7 @@ def cancel_order(
     except Exception as exc:  # noqa: BLE001 - surface any ccxt/auth/network error as fail-closed
         return {"status": "error", "error": str(exc)}
 
-    return {
+    result = {
         "status": "ok",
         "order_id": str(_obj_get(order, "id", order_id_clean)),
         "symbol": _obj_get(order, "symbol", clean_symbol),
@@ -976,6 +1154,9 @@ def cancel_order(
         "paper_guard": "host_separated",
         "order_status": str(_obj_get(order, "status", "")),
     }
+    if cfg.market_type == "usdm":
+        result["market_type"] = "usdm"
+    return result
 
 
 # ---------------------------------------------------------------------------
