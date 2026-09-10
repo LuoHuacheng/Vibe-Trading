@@ -39,6 +39,8 @@ sys.path.insert(0, str(ROOT))
 READ_PROFILE = "binance-futures-paper-readonly"
 TRADE_PROFILE = "binance-futures-paper-trade"
 DEFAULT_TOP = 10
+DEFAULT_BARS = 100
+DEFAULT_MAX_POSITIONS = 5
 MAX_NOTIONAL = 1000.0
 LOG_PATH = Path.home() / ".vibe-trading" / "futures_signal_log.jsonl"
 STATE_PATH = Path.home() / ".vibe-trading" / "futures_trade_state.json"
@@ -62,7 +64,24 @@ For EACH pair in the data below decide:
 - confidence: 0.0-1.0
 - reason: one short sentence
 
+FIELD LEGEND (one line per symbol; chg/ema/vwap/fund/basis numbers are percentages):
+- last: last trade price
+- chg5 / chg20 / chgN: percent change over the last 5 / 20 / N bars
+- rng: lowest..highest price inside the window
+- pos: where last sits inside rng (0.0 = at the low, 1.0 = at the high)
+- volRatio: average volume of the last 5 bars versus the rest of the window (above 1 = expanding)
+- rsi: RSI(14) over the window (0..100)
+- atr%: ATR(14) as a percent of price (volatility scale; a stop closer than this is noise)
+- ema20 / ema50: percent distance of last from EMA20 / EMA50
+- vwap: percent distance of last from the window VWAP
+- fund: current funding rate in percent per funding interval (negative = shorts pay longs)
+- nextFund: hours until the next funding settlement
+- basis: mark price versus index price in percent (positive = perp rich)
+- oi: open interest, oiChg: percent change since the previous round
+
 Rules:
+- Prefer setups where several fields agree (trend, position in range, volume, RSI). A single reading is not a signal.
+- A funding-rate extreme together with a fast oiChg is a squeeze setup, not a trend.
 - Never exceed {max_notional} USDT notional per order.
 - Respect liquidation: a stop_loss must be much closer than a realistic liquidation price.
 - Only react to clear momentum or reversal setups. When unsure, hold.
@@ -153,10 +172,11 @@ def load_state() -> dict:
             if isinstance(data, dict):
                 data.setdefault("peaks", {})
                 data.setdefault("protection", {})
+                data.setdefault("open_interest", {})
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
             pass
-    return {"peaks": {}, "protection": {}}
+    return {"peaks": {}, "protection": {}, "open_interest": {}}
 
 
 def save_state(state: dict) -> None:
@@ -180,37 +200,161 @@ def fetch_top_symbols(ex, top: int) -> list[str]:
     return [symbol for symbol, _ in rows if symbol.split("/")[0] not in _STABLE_BASES][:top]
 
 
-def build_market_snapshot(symbols: list[str], ex) -> str:
-    """逐 symbol 拉 5m K 线压缩成一行；单 symbol 失败只跳过该行。"""
-    lines = []
+def _ema(values: list[float], period: int) -> float | None:
+    """指数移动平均（种子 = 前 period 个值的简单平均）。"""
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for value in values[period:]:
+        ema = value * k + ema * (1 - k)
+    return ema
+
+
+def _rsi(closes: list[float], period: int = 14) -> float | None:
+    """Wilder RSI（0..100）；样本不足返回 None。"""
+    if len(closes) <= period:
+        return None
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        delta = closes[i] - closes[i - 1]
+        gains += max(delta, 0.0)
+        losses += max(-delta, 0.0)
+    avg_gain, avg_loss = gains / period, losses / period
+    for i in range(period + 1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        avg_gain = (avg_gain * (period - 1) + max(delta, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-delta, 0.0)) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def _atr_pct(bars: list[list[float]], period: int = 14) -> float | None:
+    """ATR（Wilder）占现价的百分比，作为波动率刻度。"""
+    if len(bars) <= period:
+        return None
+    true_ranges = []
+    for i in range(1, len(bars)):
+        high, low, prev_close = bars[i][2], bars[i][3], bars[i - 1][4]
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    atr = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    last = bars[-1][4]
+    return atr / last * 100 if last > 0 else None
+
+
+def _vwap(bars: list[list[float]]) -> float | None:
+    """窗口内成交量加权的典型价。"""
+    total_volume = sum(bar[5] for bar in bars)
+    if total_volume <= 0:
+        return None
+    weighted = sum(((bar[2] + bar[3] + bar[4]) / 3) * bar[5] for bar in bars)
+    return weighted / total_volume
+
+
+def _pct_change(closes: list[float], lookback: int) -> float | None:
+    """最近 lookback 根 K 线的涨跌幅（百分比）。"""
+    if lookback <= 0 or len(closes) <= lookback:
+        return None
+    base = closes[-1 - lookback]
+    return (closes[-1] / base - 1) * 100 if base else None
+
+
+def _rel_pct(value: float | None, reference: float | None) -> float | None:
+    """value 相对 reference 的百分比距离。"""
+    if value is None or not reference:
+        return None
+    return (value / reference - 1) * 100
+
+
+def _context_text(symbol: str, context: dict | None, previous_oi: float | None) -> list[str]:
+    """衍生品上下文片段：资金费、下次结算、标记/指数基差、持仓量与跨轮变化。"""
+    if not context:
+        return []
+    parts: list[str] = []
+    funding = (context.get("funding") or {}).get(symbol) or {}
+    rate = funding.get("funding_rate")
+    if rate is not None:
+        parts.append(f"fund={rate * 100:+.4f}%")
+    next_ms = funding.get("next_funding_time")
+    if next_ms:
+        hours = (float(next_ms) - time.time() * 1000) / 3_600_000
+        if hours > 0:
+            parts.append(f"nextFund={hours:.1f}h")
+    basis = _rel_pct(funding.get("mark_price"), funding.get("index_price"))
+    if basis is not None:
+        parts.append(f"basis={basis:+.3f}%")
+    oi = (context.get("open_interest") or {}).get(symbol)
+    if oi is not None:
+        parts.append(f"oi={oi:.4g}")
+        if previous_oi:
+            parts.append(f"oiChg={(oi / previous_oi - 1) * 100:+.1f}%")
+    return parts
+
+
+def build_market_snapshot(
+    symbols: list[str],
+    ex,
+    *,
+    bars_limit: int,
+    context: dict | None = None,
+    previous_oi: dict | None = None,
+) -> tuple[str, dict[str, float]]:
+    """逐 symbol 拉 K 线并压成一行特征；返回 (文本, {symbol: 现价})。
+
+    每行的字段：现价、5/20/窗口涨跌幅、窗口高低、现价在区间中的位置、
+    近 5 根量能比、RSI、ATR%、距 EMA20/EMA50/VWAP 的百分比距离，以及
+    （开启衍生品时）资金费、下次结算、基差、持仓量与跨轮变化。单品种失败
+    只跳过该行，不影响整轮。
+    """
+    lines: list[str] = []
+    prices: dict[str, float] = {}
     for symbol in symbols:
         try:
-            bars = ex.fetch_ohlcv(symbol, timeframe="5m", limit=20)
+            bars = ex.fetch_ohlcv(symbol, timeframe="5m", limit=bars_limit)
         except Exception:  # noqa: BLE001 - 单品种失败不拖垮整轮
             continue
         if not bars:
             continue
         closes = [bar[4] for bar in bars]
-        volume = sum(bar[5] for bar in bars)
-        lines.append(
-            f"{symbol}: last={closes[-1]:.4f} prev20_min={closes[0]:.4f} "
-            f"chg%={(closes[-1] / closes[0] - 1) * 100:+.2f} vol20={volume:.0f}"
-        )
-    return "\n".join(lines)
-
-
-def snapshot_prices(snapshot: str) -> dict[str, float]:
-    """从快照文本里解析每个品种的 last 价。"""
-    prices: dict[str, float] = {}
-    for line in snapshot.splitlines():
-        if ":" not in line or "last=" not in line:
-            continue
-        symbol = line.split(":", 1)[0].strip()
-        try:
-            prices[symbol] = float(line.split("last=")[1].split(" ")[0])
-        except (IndexError, ValueError):
-            continue
-    return prices
+        highs = [bar[2] for bar in bars]
+        lows = [bar[3] for bar in bars]
+        volumes = [bar[5] for bar in bars]
+        last = closes[-1]
+        prices[symbol] = last
+        window = len(bars)
+        highest, lowest = max(highs), min(lows)
+        recent_volume = sum(volumes[-5:]) / max(1, len(volumes[-5:]))
+        earlier_volume = sum(volumes[:-5]) / max(1, len(volumes[:-5])) if len(volumes) > 5 else recent_volume
+        fields = [f"last={last:.4f}"]
+        # 窗口涨跌幅 = 首根到末根（lookback 用 window-1，否则 100 根时算不出来）
+        for label, lookback in (("chg5", 5), ("chg20", 20), (f"chg{window}", window - 1)):
+            change = _pct_change(closes, lookback)
+            if change is not None:
+                fields.append(f"{label}={change:+.2f}%")
+        fields.append(f"rng=[{lowest:.4f},{highest:.4f}]")
+        if highest > lowest:
+            fields.append(f"pos={(last - lowest) / (highest - lowest):.2f}")
+        if earlier_volume:
+            fields.append(f"volRatio={recent_volume / earlier_volume:.2f}")
+        rsi = _rsi(closes)
+        if rsi is not None:
+            fields.append(f"rsi={rsi:.1f}")
+        atr = _atr_pct(bars)
+        if atr is not None:
+            fields.append(f"atr%={atr:.2f}")
+        for label, period in (("ema20", 20), ("ema50", 50)):
+            distance = _rel_pct(last, _ema(closes, period))
+            if distance is not None:
+                fields.append(f"{label}={distance:+.2f}%")
+        vwap_distance = _rel_pct(last, _vwap(bars))
+        if vwap_distance is not None:
+            fields.append(f"vwap={vwap_distance:+.2f}%")
+        fields.extend(_context_text(symbol, context, (previous_oi or {}).get(symbol)))
+        lines.append(f"{symbol}: " + " ".join(fields))
+    return "\n".join(lines), prices
 
 
 def parse_signals(text: str) -> list[dict]:
@@ -632,7 +776,8 @@ def arm_protection(place, state: dict, symbol: str, position: dict, *,
 
 def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                      stop_loss: float, take_profit: float, trailing: float,
-                     margin_mode: str, leverage: int, protection: str) -> None:
+                     margin_mode: str, leverage: int, protection: str,
+                     resting: dict | None = None, can_arm: bool = True) -> None:
     """每轮先管持仓：触发止盈止损就以 reduce_only 平仓，未触发则确保有交易所侧保护。"""
     from src.trading.service import place_order
 
@@ -640,7 +785,8 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
     # 交易所侧移动止损在跑时，脚本侧那条就得让位：两边各按自己的极值算，
     # 同时开会互相打架（脚本会先平仓并把交易所单撤掉）。
     script_trailing = 0.0 if "trailing_stop_market" in legs else trailing
-    resting = _resting_protection_orders() if legs else {}
+    if resting is None:
+        resting = _resting_protection_orders() if legs else {}
     for symbol, broker_position in list((state.get("positions") or {}).items()):
         price = prices.get(symbol)
         if not price or price <= 0:
@@ -666,7 +812,9 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
         reason = check_exit(held, price, stop_price=stop_price, take_profit=target, trailing=script_trailing)
         state.setdefault("peaks", {})[symbol] = held["peak"]
         if not reason:
-            if not legs:
+            if not legs or not can_arm:
+                # 读不到保护状态时不动保护（不重复挂、也不清理），但脚本侧
+                # 的止盈止损照旧生效——平仓不该被一个读失败拖住。
                 continue
             held_orders = resting.get(symbol) or []
             have = {str(row.get("order_type") or "").strip().lower() for row in held_orders}
@@ -709,7 +857,9 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
 
 def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               stop_loss: float, take_profit: float, trailing: float,
-              margin_mode: str, leverage: int, protection: str = "fixed") -> None:
+              margin_mode: str, leverage: int, protection: str = "fixed",
+              bars_limit: int = DEFAULT_BARS, max_positions: int = DEFAULT_MAX_POSITIONS,
+              derivatives: bool = True) -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
     from src.trading.service import place_order
 
@@ -732,26 +882,51 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
     }
 
     # 1b) 交易所侧残留：仓位已经没了，止损/止盈还挂在那儿 → 撤掉
+    resting: dict[str, list[dict]] = {}
+    protection_readable = True
     if protection_legs(protection):
         try:
             resting = _resting_protection_orders()
-        except Exception as exc:  # noqa: BLE001 - 不知道残余保护就不动仓（fail-closed）
-            _log({"ts": _now(), "round": "error", "detail": f"algo orders: {exc}"})
-            return
+        except Exception as exc:  # noqa: BLE001
+            # 读不到就不碰保护：本轮不清理、不重挂、也不开新仓（新仓会失去
+            # 交易所侧保护）。已有仓位的脚本侧止盈止损继续生效。
+            protection_readable = False
+            _log({"ts": _now(), "round": "warn", "detail": f"algo orders unreadable: {exc}"})
         for symbol in [sym for sym in resting if sym not in state["positions"]]:
             _log({"ts": _now(), "symbol": symbol, "status": "cleanup",
                   "detail": "position closed; cancelling leftover protection"})
             disarm_protection(_cancel_algo, state, symbol, trade=trade,
                               resting_orders=resting.get(symbol))
 
-    # 2) 选品与快照
+    # 2) 选品 → 衍生品上下文 → 特征快照
     symbols = symbols_arg or fetch_top_symbols(ex, top)
-    snapshot = build_market_snapshot(symbols, ex)
+    context: dict | None = None
+    if derivatives:
+        try:
+            from src.trading.connectors.binance.sdk import get_futures_context
+
+            context = get_futures_context(_algo_config(), symbols)
+            if str(context.get("status")) != "ok":
+                _log({"ts": _now(), "round": "warn",
+                      "detail": f"derivatives: {context.get('error')}"})
+                context = None
+        except Exception as exc:  # noqa: BLE001 - 上下文缺失不该阻挡交易
+            _log({"ts": _now(), "round": "warn", "detail": f"derivatives: {exc}"})
+            context = None
+    snapshot, prices = build_market_snapshot(
+        symbols,
+        ex,
+        bars_limit=bars_limit,
+        context=context,
+        previous_oi=state.get("open_interest") or {},
+    )
     if not snapshot:
         _log({"ts": _now(), "round": "error", "detail": "no market data"})
         save_state(state)
         return
-    prices = snapshot_prices(snapshot)
+    if context and context.get("open_interest"):
+        # 下一轮的 oiChg 就是拿这一轮的值做基准（测试网没有 fapiData 历史接口）
+        state["open_interest"] = {**(state.get("open_interest") or {}), **context["open_interest"]}
 
     # 持仓品种可能不在 top 列表里：补一次报价，否则止盈止损检查不到
     for symbol in list(state["positions"]):
@@ -768,7 +943,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
     manage_positions(
         state, prices, trade=trade, stop_loss=stop_loss, take_profit=take_profit,
         trailing=trailing, margin_mode=margin_mode, leverage=leverage,
-        protection=protection,
+        protection=protection, resting=resting, can_arm=protection_readable,
     )
     save_state(state)
 
@@ -817,6 +992,16 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
                   "detail": "position already open"})
             continue
+        if not protection_readable:
+            _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
+                  "detail": "protection state unreadable; not opening unprotected positions"})
+            break
+        if len(state["positions"]) >= max_positions:
+            # 品种池可以放大，但同时在手的仓位数必须有闸：否则一轮就可能把
+            # 保证金铺满（测试网账户 ~4800 USDT，10 个 300 名义仓 = 3000）。
+            _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
+                  "detail": f"position cap {max_positions} reached"})
+            break
 
         notional = min(max(notional, 0.0), MAX_NOTIONAL)
         price = prices.get(symbol) or float(signal.get("entry") or 0)
@@ -869,6 +1054,25 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
 
     save_state(state)
     _refresh_portfolio()
+
+
+def _synth_bars(count: int = 100) -> list[list[float]]:
+    """构造一段震荡上行、量能递增的 OHLCV，供指标自测使用。"""
+    bars = []
+    for i in range(count):
+        base = 100.0 + i * 0.1 + (1.0 if i % 3 == 0 else -0.5)
+        bars.append([float(i), base - 0.2, base + 0.4, base - 0.5, base, float(i + 1)])
+    return bars
+
+
+class _FakeBarsExchange:
+    """只实现 build_market_snapshot 需要的 fetch_ohlcv。"""
+
+    def __init__(self, bars):
+        self._bars = bars
+
+    def fetch_ohlcv(self, symbol, timeframe=None, limit=None):
+        return self._bars[-limit:] if limit else self._bars
 
 
 class _FakeMarketExchange:
@@ -985,6 +1189,31 @@ def _selftest() -> None:
     quantity, reason = order_quantity(ex, "NOPE/USDT:USDT", 200.0, 10.0)
     assert quantity is None and "not a loaded market" in reason
 
+    # 指标：纯函数，用构造序列验证
+    rising = [float(i) for i in range(1, 101)]
+    assert _ema(rising, 10) is not None and _ema(rising, 10) < rising[-1]
+    assert _rsi(rising) == 100.0                      # 全涨 → 100
+    assert _rsi([float(100 - i) for i in range(100)]) == 0.0   # 全跌 → 0
+    assert abs(_pct_change(rising, 10) - (100 / 90 - 1) * 100) < 1e-9
+    assert _pct_change(rising, 200) is None           # 样本不足
+    assert _atr_pct(_synth_bars()) is not None
+    assert abs(_rel_pct(110.0, 100.0) - 10.0) < 1e-9
+    assert _rel_pct(None, 100.0) is None
+
+    # 快照行：新字段齐、价格表正确、上下文可拼进来
+    ex = _FakeBarsExchange(_synth_bars())
+    text, prices = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100)
+    assert prices == {"BTC/USDT:USDT": prices["BTC/USDT:USDT"]} and "BTC/USDT:USDT" in prices
+    for field in ("last=", "chg5=", "rng=[", "pos=", "volRatio=", "rsi=", "atr%=", "ema20=", "vwap="):
+        assert field in text, (field, text[:200])
+    assert "prev20_min" not in text                   # 名不副实的字段已去掉
+    context = {"funding": {"BTC/USDT:USDT": {"funding_rate": -0.0001, "mark_price": 101.0, "index_price": 100.0}},
+               "open_interest": {"BTC/USDT:USDT": 110.0}}
+    text, _ = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100,
+                                    context=context, previous_oi={"BTC/USDT:USDT": 100.0})
+    for field in ("fund=", "basis=", "oi=", "oiChg="):
+        assert field in text, (field, text[:220])
+
     print("selftest OK")
 
 
@@ -1006,6 +1235,12 @@ def main() -> int:
     parser.add_argument("--interval", type=int, default=300, help="轮询间隔秒（默认 300）")
     parser.add_argument("--runs", type=int, default=12, help="最大轮数（默认 12 = 1 小时）")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP, help=f"成交额 top N（默认 {DEFAULT_TOP}）")
+    parser.add_argument("--bars", type=int, default=DEFAULT_BARS,
+                        help=f"每个品种拉多少根 5m K 线（默认 {DEFAULT_BARS}）")
+    parser.add_argument("--max-positions", dest="max_positions", type=int, default=DEFAULT_MAX_POSITIONS,
+                        help=f"同时在手的最大仓位数（默认 {DEFAULT_MAX_POSITIONS}）")
+    parser.add_argument("--no-derivatives", action="store_true",
+                        help="不拉资金费/持仓量等衍生品上下文")
     parser.add_argument("--symbols", default="", help="逗号分隔的固定品种，覆盖 top N 选品")
     parser.add_argument("--stop-loss", type=float, default=5.0, help="止损百分比（默认 5）")
     parser.add_argument("--take-profit", type=float, default=8.0, help="止盈百分比（默认 8）")
@@ -1044,6 +1279,8 @@ def main() -> int:
           f"止盈 {args.take_profit}% | 移动止盈回撤 {args.trailing}% | "
           f"交易所侧保护 {protection_mode}"
           + (f"（{'/'.join(protection_legs(protection_mode))}）" if protection_legs(protection_mode) else ""))
+    print(f"[futures-loop] 品种 top {args.top} | 每品种 {args.bars} 根 5m | 最多同时 {args.max_positions} 仓 | "
+          f"衍生品上下文 {'关' if args.no_derivatives else '开'}")
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
 
@@ -1059,6 +1296,8 @@ def main() -> int:
                     stop_loss=args.stop_loss, take_profit=args.take_profit,
                     trailing=args.trailing, margin_mode=args.margin_mode,
                     leverage=args.leverage, protection=protection_mode,
+                    bars_limit=args.bars, max_positions=args.max_positions,
+                    derivatives=not args.no_derivatives,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})
