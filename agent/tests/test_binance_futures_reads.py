@@ -127,3 +127,65 @@ def test_traded_stats_guard_usdm(monkeypatch):
     out = bn.get_traded_stats(_cfg(), assets=["BTC"])
     assert out == {"status": "ok", "assets": []}
     assert not ex.calls  # 完全不发 myTrades
+
+
+# --- Derivatives context: one batch call for funding/basis, per-symbol OI ----
+
+
+class FakeContextExchange:
+    """premiumIndex 批量 + 逐品种 openInterest（含可注入的失败）。"""
+
+    def __init__(self, funding=None, oi=None, oi_error=None, funding_error=None):
+        self.funding = funding if funding is not None else [
+            {"symbol": "BCHUSDT", "markPrice": "247.5", "indexPrice": "247.77",
+             "lastFundingRate": "-0.00014348", "nextFundingTime": 1789056000000},
+        ]
+        self.oi = oi or {"BCHUSDT": "70934872027.7"}
+        self.oi_error = oi_error
+        self.funding_error = funding_error
+        self.oi_calls: list[str] = []
+
+    def fapiPublicGetPremiumIndex(self, params):
+        if self.funding_error is not None:
+            raise self.funding_error
+        return self.funding
+
+    def fetch_open_interest(self, symbol):
+        self.oi_calls.append(symbol)
+        if self.oi_error is not None:
+            raise self.oi_error
+        raw = symbol.split("/")[0] + "USDT"
+        return {"symbol": symbol, "openInterestAmount": self.oi.get(raw)}
+
+
+def test_futures_context_maps_funding_and_open_interest(monkeypatch):
+    ex = FakeContextExchange()
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.get_futures_context(_cfg(), ["BCH/USDT:USDT"])
+    assert out["status"] == "ok"
+    assert out["funding"]["BCH/USDT:USDT"]["funding_rate"] == -0.00014348
+    assert out["funding"]["BCH/USDT:USDT"]["mark_price"] == 247.5
+    assert out["open_interest"]["BCH/USDT:USDT"] == 70934872027.7
+    assert out["open_interest_errors"] == 0
+    assert ex.oi_calls == ["BCH/USDT:USDT"]
+
+
+def test_futures_context_rejects_spot_and_shadow():
+    spot = bn.BinanceConfig.from_mapping({"profile": "paper", "api_key": "k", "api_secret": "s"})
+    assert "futures-only" in bn.get_futures_context(spot)["error"]
+    assert "read-only" in bn.get_futures_context(_cfg(profile="live-readonly"))["error"]
+
+
+def test_futures_context_counts_open_interest_failures(monkeypatch):
+    ex = FakeContextExchange(oi_error=Exception("boom"))
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.get_futures_context(_cfg(), ["BCH/USDT:USDT"])
+    assert out["status"] == "ok"
+    assert out["open_interest"] == {} and out["open_interest_errors"] == 1
+
+
+def test_futures_context_surfaces_the_batch_failure(monkeypatch):
+    ex = FakeContextExchange(funding_error=Exception("boom"))
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.get_futures_context(_cfg())
+    assert out["status"] == "error" and "boom" in out["error"]

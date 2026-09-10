@@ -1323,8 +1323,12 @@ def cancel_order(
     return result
 
 
-def _algo_symbol(raw_symbol: Any) -> str:
-    """Return the ccxt unified perp symbol for a raw Algo-service symbol."""
+def _perp_symbol(raw_symbol: Any) -> str:
+    """Return the ccxt unified perp symbol for a raw Binance futures symbol.
+
+    Binance's raw market endpoints speak compact symbols (BCHUSDT); the
+    connector speaks the ccxt unified perp form (BCH/USDT:USDT).
+    """
     text = str(raw_symbol or "").strip().upper()
     if "/" in text:
         return normalize_futures_symbol(text) or text
@@ -1339,7 +1343,7 @@ def algo_order_row(item: Any) -> dict[str, Any] | None:
     Returns None when the row carries no algo id or no symbol (nothing a caller
     could cancel or match on).
     """
-    symbol = _algo_symbol(_obj_get(item, "symbol"))
+    symbol = _perp_symbol(_obj_get(item, "symbol"))
     algo_id = _obj_get(item, "algoId")
     if not symbol or algo_id is None or str(algo_id).strip() == "":
         return None
@@ -1480,6 +1484,90 @@ def cancel_algo_order(
     except Exception as exc:  # noqa: BLE001 - exchange construction failures
         return {"status": "error", "error": str(exc)}
     return _result(False)
+
+
+def get_futures_context(
+    config: BinanceConfig | None = None,
+    symbols: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read USDⓈ-M derivatives context: funding, basis and open interest.
+
+    Funding rate, mark price and index price come from ONE batch premiumIndex
+    call covering the whole market, so adding symbols to it is free. Open
+    interest has no batch endpoint and is read per requested symbol (a symbol
+    that fails is simply omitted, with the failures counted).
+
+    Open-interest *change* is deliberately not fetched here: Binance serves that
+    history from the fapiData endpoints, which ccxt refuses on testnet
+    ("does not have a testnet/sandbox URL for fapiData endpoints"). Callers that
+    want a change compare successive reads themselves.
+
+    Args:
+        config: Connector config; falls back to the saved config when None.
+        symbols: Optional unified perp symbols to read open interest for.
+
+    Returns:
+        On success: {"status": "ok", "funding": {symbol: {...}},
+        "open_interest": {symbol: float}, "open_interest_errors": int}. On
+        failure: {"status": "error", "error": str} (fail-closed).
+    """
+    cfg = config or load_config()
+    try:
+        _assert_host(cfg)
+    except BinanceConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+    if cfg.market_type != "usdm":
+        return {"status": "error", "error": "derivatives context is USDⓈ-M futures-only."}
+    if is_usdm_shadow(cfg):
+        return {"status": "error", "error": "Binance USD-M Shadow Account is read-only"}
+    try:
+        ex = _exchange(cfg)
+        raw = ex.fapiPublicGetPremiumIndex({})
+    except Exception as exc:  # noqa: BLE001 - surface auth/network errors fail-closed
+        return {"status": "error", "error": str(exc)}
+
+    funding: dict[str, dict[str, Any]] = {}
+    for item in _as_iter(raw):
+        symbol = _perp_symbol(_obj_get(item, "symbol"))
+        if not symbol:
+            continue
+        funding[symbol] = {
+            "mark_price": _to_float(_obj_get(item, "markPrice")),
+            "index_price": _to_float(_obj_get(item, "indexPrice")),
+            "funding_rate": _to_float(_obj_get(item, "lastFundingRate")),
+            "next_funding_time": _obj_get(item, "nextFundingTime"),
+        }
+
+    open_interest: dict[str, float] = {}
+    failures = 0
+    for symbol in symbols or []:
+        clean = normalize_futures_symbol(symbol)
+        if clean is None:
+            failures += 1
+            continue
+        try:
+            row = ex.fetch_open_interest(clean)
+        except Exception:  # noqa: BLE001 - one symbol must not sink the batch
+            failures += 1
+            continue
+        value = _to_float(_obj_get(row, "openInterestAmount"))
+        if value is None:
+            value = _to_float(_obj_get(row, "openInterestValue"))
+        if value is not None:
+            open_interest[clean] = value
+        else:
+            failures += 1
+
+    return {
+        "status": "ok",
+        "funding": funding,
+        "open_interest": open_interest,
+        "open_interest_errors": failures,
+        "profile": cfg.profile,
+        "is_testnet": cfg.is_testnet,
+        "paper_guard": "host_separated",
+        "market_type": "usdm",
+    }
 
 
 # ---------------------------------------------------------------------------
