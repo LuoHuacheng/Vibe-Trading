@@ -172,6 +172,83 @@ def test_futures_place_tolerates_margin_type_already_set_via_code(monkeypatch):
     assert len([c for c in ex.calls if c[0] == "create_order"]) == 1
 
 
+# --- Exchange-side conditional orders (stop / take-profit that rest on the
+# --- exchange, so protection outlives the process that placed them).
+
+
+def test_futures_place_stop_market_sends_stop_price_and_reduce_only(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="sell", quantity=0.01,
+                         order_type="stop_market", stop_price=59000.0,
+                         reduce_only=True, margin_mode="isolated", leverage=5)
+    assert out["status"] == "ok"
+    create = [c for c in fake.calls if c[0] == "create_order"][0]
+    _symbol, type_, side, amount, params = create[1:]
+    assert type_ == "STOP_MARKET"
+    assert side == "sell" and amount == 0.01
+    assert params["stopPrice"] == 59000.0
+    assert params["reduceOnly"] is True
+
+
+def test_futures_place_take_profit_market_uses_its_own_ccxt_type(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         order_type="take_profit_market", stop_price=81000.0,
+                         reduce_only=True, margin_mode="isolated", leverage=5)
+    assert out["status"] == "ok"
+    create = [c for c in fake.calls if c[0] == "create_order"][0]
+    assert create[2] == "TAKE_PROFIT_MARKET"
+    assert create[5]["stopPrice"] == 81000.0
+
+
+def test_conditional_orders_require_reduce_only(fake):
+    """A non-reduce-only conditional could open a position nobody is watching."""
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="sell", quantity=0.01,
+                         order_type="stop_market", stop_price=59000.0,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "reduce_only" in out["error"]
+    assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_conditional_orders_require_a_positive_stop_price(fake):
+    for bad in (None, 0, -1):
+        out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="sell", quantity=0.01,
+                             order_type="stop_market", stop_price=bad,
+                             reduce_only=True, margin_mode="isolated", leverage=5)
+        assert out["status"] == "error" and "stop_price" in out["error"], (bad, out)
+    assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_conditional_orders_reject_notional(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", notional=100.0,
+                         order_type="stop_market", stop_price=59000.0,
+                         reduce_only=True, margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "quantity" in out["error"]
+    assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_stop_price_is_rejected_on_plain_order_types(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         order_type="market", stop_price=59000.0,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "conditional" in out["error"]
+    assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_unknown_order_type_is_rejected(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         order_type="trailing_stop", margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "order_type" in out["error"]
+
+
+def test_spot_profile_rejects_stop_price(monkeypatch):
+    ex = FakeUsdmOrders()
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    cfg = bn.BinanceConfig.from_mapping({"profile": "paper", "api_key": "k", "api_secret": "s"})
+    out = bn.place_order(cfg, symbol="BTC/USDT", side="sell", quantity=0.01,
+                         order_type="stop_market", stop_price=59000.0, reduce_only=True)
+    assert out["status"] == "error" and "futures-only" in out["error"]
+    assert not ex.calls
+
+
 def test_futures_place_surfaces_other_margin_errors(monkeypatch):
     """Every other setMarginType failure still fails the order closed."""
     ex = FakeUsdmOrders(
@@ -182,3 +259,143 @@ def test_futures_place_surfaces_other_margin_errors(monkeypatch):
                          margin_mode="isolated", leverage=5)
     assert out["status"] == "error" and "Invalid API-key" in out["error"]
     assert not [c for c in ex.calls if c[0] == "create_order"]
+
+
+# --- Conditional orders live in Binance's Algo service, not in the standard
+# --- open-order endpoint, so they need their own read and cancel path.
+
+
+class FakeAlgoExchange:
+    """只实现 Algo 服务需要的两个原始接口。"""
+
+    def __init__(self, rows=None, delete_error=None):
+        self.rows = rows if rows is not None else []
+        self.delete_error = delete_error
+        self.deleted: list[dict] = []
+
+    def fapiPrivateGetOpenAlgoOrders(self, params):
+        return self.rows
+
+    def fapiPrivateDeleteAlgoOrder(self, params):
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted.append(dict(params))
+        return {"algoId": params.get("algoId"), "code": "200", "msg": "success"}
+
+
+def _algo_cfg(**kw):
+    return bn.BinanceConfig.from_mapping(
+        {**{"profile": "paper", "market_type": "usdm", "api_key": "k", "api_secret": "s"}, **kw}
+    )
+
+
+def test_open_algo_orders_maps_and_normalizes_the_raw_rows(monkeypatch):
+    ex = FakeAlgoExchange(rows=[
+        {"algoId": 1000000200157472, "symbol": "BCHUSDT", "orderType": "TAKE_PROFIT_MARKET",
+         "side": "BUY", "quantity": "0.806", "triggerPrice": "244.5", "algoStatus": "NEW"},
+        {"algoId": "", "symbol": "BCHUSDT", "orderType": "STOP_MARKET"},  # 无 id → 丢弃
+    ])
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.get_open_algo_orders(_algo_cfg())
+    assert out["status"] == "ok" and out["count"] == 1
+    row = out["orders"][0]
+    assert row["order_id"] == "1000000200157472"
+    assert row["symbol"] == "BCH/USDT:USDT"       # BCHUSDT → ccxt unified perp
+    assert row["order_type"] == "take_profit_market"
+    assert row["stop_price"] == 244.5
+    assert row["quantity"] == 0.806
+    assert row["status"] == "new"
+
+
+def test_open_algo_orders_is_rejected_off_usdm():
+    cfg = bn.BinanceConfig.from_mapping({"profile": "paper", "api_key": "k", "api_secret": "s"})
+    out = bn.get_open_algo_orders(cfg)
+    assert out["status"] == "error" and "futures-only" in out["error"]
+
+
+def test_algo_helpers_reject_the_shadow_profile():
+    cfg = _algo_cfg(profile="live-readonly")
+    assert "read-only" in bn.get_open_algo_orders(cfg)["error"]
+    assert "read-only" in bn.cancel_algo_order(cfg, "1")["error"]
+
+
+def test_cancel_algo_order_uses_the_algo_endpoint(monkeypatch):
+    ex = FakeAlgoExchange()
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.cancel_algo_order(_algo_cfg(), "1000000200157380", symbol="BCH/USDT:USDT")
+    assert out["status"] == "ok" and out["already_gone"] is False
+    assert ex.deleted == [{"algoId": "1000000200157380"}]
+
+
+def test_cancel_algo_order_is_idempotent_when_already_gone(monkeypatch):
+    """-2013 means the order triggered or was cancelled: the desired state."""
+    ex = FakeAlgoExchange(
+        delete_error=Exception('binanceusdm {"code":-2013,"msg":"Order does not exist."}')
+    )
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.cancel_algo_order(_algo_cfg(), "1000000200157380")
+    assert out["status"] == "ok" and out["already_gone"] is True
+
+
+def test_cancel_algo_order_surfaces_other_errors(monkeypatch):
+    ex = FakeAlgoExchange(delete_error=Exception('binanceusdm {"code":-2015,"msg":"Invalid API-key"}'))
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.cancel_algo_order(_algo_cfg(), "1")
+    assert out["status"] == "error" and "Invalid API-key" in out["error"]
+
+
+class FakeRetryAlgoExchange(FakeAlgoExchange):
+    """先失败 N 次（模拟 -1021 时钟漂移），之后成功。"""
+
+    def __init__(self, fail_times=1):
+        super().__init__()
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def fapiPrivateDeleteAlgoOrder(self, params):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise Exception(
+                'binanceusdm {"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}'
+            )
+        self.deleted.append(dict(params))
+        return {"algoId": params.get("algoId"), "code": "200", "msg": "success"}
+
+
+def test_cancel_algo_order_retries_once_on_a_timestamp_rejection(monkeypatch):
+    """-1021 is a clock-drift rejection, not a refusal: one retry lands."""
+    ex = FakeRetryAlgoExchange(fail_times=1)
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.cancel_algo_order(_algo_cfg(), "42")
+    assert out["status"] == "ok" and out["already_gone"] is False
+    assert ex.calls == 2 and ex.deleted == [{"algoId": "42"}]
+
+
+def test_cancel_algo_order_gives_up_after_the_retry(monkeypatch):
+    ex = FakeRetryAlgoExchange(fail_times=2)
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.cancel_algo_order(_algo_cfg(), "42")
+    assert out["status"] == "error" and "-1021" in out["error"]
+    assert ex.calls == 2
+
+
+def test_resting_orders_margin_rejection_names_the_cause(monkeypatch):
+    """-4067 with no position means resting orders; the message must say so."""
+    err = Exception(
+        'binanceusdm {"code":-4067,"msg":"Position side cannot be changed if there exists open orders."}'
+    )
+    ex = FakeUsdmOrders(margin_error=err)
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "error"
+    assert "open orders" in out["error"] and "-4067" in out["error"]
+    assert not [c for c in ex.calls if c[0] == "create_order"]
+
+
+def test_cancel_algo_order_requires_an_id(monkeypatch):
+    ex = FakeAlgoExchange()
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.cancel_algo_order(_algo_cfg(), "  ")
+    assert out["status"] == "error" and "algo_id" in out["error"]
+    assert ex.deleted == []

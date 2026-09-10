@@ -761,8 +761,21 @@ class TradingPlaceOrderTool(BaseTool):
                 "type": "number",
                 "description": "Order size as an account-currency amount. Exactly one of quantity/notional.",
             },
-            "order_type": {"type": "string", "enum": ["market", "limit"], "default": "market"},
+            "order_type": {
+                "type": "string",
+                "enum": ["market", "limit", "stop_market", "take_profit_market"],
+                "default": "market",
+                "description": (
+                    "Binance USDⓈ-M futures also accept stop_market / "
+                    "take_profit_market, which rest on the exchange and require "
+                    "stop_price plus reduce_only=true."
+                ),
+            },
             "limit_price": {"type": "number", "description": "Required for limit orders."},
+            "stop_price": {
+                "type": "number",
+                "description": "Trigger price for stop_market/take_profit_market orders.",
+            },
             "time_in_force": {"type": "string", "enum": ["day", "gtc"], "default": "day"},
             "margin_mode": {
                 "type": "string",
@@ -824,6 +837,7 @@ class TradingPlaceOrderTool(BaseTool):
                     notional=notional,
                     order_type=str(kwargs.get("order_type") or "market"),
                     limit_price=limit_price,
+                    stop_price=_num_or_none(kwargs.get("stop_price"), "stop_price"),
                     time_in_force=str(kwargs.get("time_in_force") or "day"),
                     margin_mode=_connection(kwargs.get("margin_mode")),
                     leverage=leverage,

@@ -799,6 +799,7 @@ def place_order(
     margin_mode: str | None = None,
     leverage: int | None = None,
     reduce_only: bool = False,
+    stop_price: float | None = None,
 ) -> dict[str, Any]:
     """Place a spot or USDⓈ-M futures order via ccxt's ``create_order``.
 
@@ -836,7 +837,10 @@ def place_order(
         quantity: Base-asset amount. Mutually exclusive with ``notional``.
         notional: Quote-asset spend (market orders only). Mutually exclusive
             with ``quantity``; not accepted for futures sells.
-        order_type: ``"market"`` or ``"limit"``.
+        order_type: ``"market"``, ``"limit"``, ``"stop_market"`` or
+            ``"take_profit_market"``. The two conditional types are
+            reduce-only exchange-side stop / take-profit orders (they survive
+            this process) and require ``stop_price``.
         limit_price: Required when ``order_type`` is ``"limit"``.
         time_in_force: Limit-order policy; ``"day"`` maps to Binance GTC.
         margin_mode: Futures-only; ``"isolated"`` or ``"cross"`` (required on
@@ -872,12 +876,13 @@ def place_order(
             margin_mode=margin_mode,
             leverage=leverage,
             reduce_only=reduce_only,
+            stop_price=stop_price,
         )
 
-    if margin_mode is not None or leverage is not None or reduce_only:
+    if margin_mode is not None or leverage is not None or reduce_only or stop_price is not None:
         return {
             "status": "error",
-            "error": "margin_mode/leverage/reduce_only are futures-only "
+            "error": "margin_mode/leverage/reduce_only/stop_price are futures-only "
             "parameters; this is a spot profile.",
         }
 
@@ -977,6 +982,7 @@ def _place_usdm_order(
     margin_mode: str | None,
     leverage: int | None,
     reduce_only: bool,
+    stop_price: float | None = None,
 ) -> dict[str, Any]:
     """Place a USDⓈ-M futures order on a tradable (non-Shadow) usdm profile.
 
@@ -992,8 +998,12 @@ def _place_usdm_order(
         return {"status": "error", "error": "side must be 'buy' or 'sell'."}
 
     type_clean = str(order_type or "").strip().lower()
-    if type_clean not in ("market", "limit"):
-        return {"status": "error", "error": "order_type must be 'market' or 'limit'."}
+    if type_clean not in ("market", "limit", "stop_market", "take_profit_market"):
+        return {
+            "status": "error",
+            "error": "order_type must be 'market', 'limit', 'stop_market' or 'take_profit_market'.",
+        }
+    conditional = type_clean in _CONDITIONAL_ORDER_TYPES
 
     margin_clean = str(margin_mode or "").strip().lower()
     if not margin_mode or not margin_clean:
@@ -1026,6 +1036,27 @@ def _place_usdm_order(
         # spot-only convenience and is rejected up front.
         return {"status": "error", "error": "USDⓈ-M sell orders require 'quantity', not 'notional'."}
 
+    stop_value: float | None = None
+    if conditional:
+        stop_value = _to_float(stop_price)
+        if stop_value is None or stop_value <= 0:
+            return {
+                "status": "error",
+                "error": "stop_price must be a positive number for stop_market/take_profit_market orders.",
+            }
+        if notional_given:
+            return {"status": "error", "error": "conditional USDⓈ-M orders require 'quantity', not 'notional'."}
+        if not reduce_only:
+            # A conditional order that is NOT reduce-only can open a fresh
+            # position the moment it triggers — with nobody watching and no
+            # margin preset applied at trigger time. Refuse that outright.
+            return {
+                "status": "error",
+                "error": "stop_market/take_profit_market orders must set reduce_only=True.",
+            }
+    elif stop_price is not None:
+        return {"status": "error", "error": "stop_price is only valid for conditional order types."}
+
     if type_clean == "limit":
         if notional_given:
             return {"status": "error", "error": "limit orders require 'quantity', not 'notional'."}
@@ -1050,6 +1081,13 @@ def _place_usdm_order(
         params["timeInForce"] = tif
         amount: float | None = qty_value
         price: float | None = price_value
+    elif conditional:
+        # Exchange-side stop / take-profit: the order rests on Binance, so the
+        # protection outlives this process. Sizing is by contract quantity and
+        # reduce_only was enforced above.
+        params["stopPrice"] = stop_value
+        amount = qty_value
+        price = None
     elif notional_given:
         params["quoteOrderQty"] = notional_value
         amount = notional_value
@@ -1069,7 +1107,14 @@ def _place_usdm_order(
         return {"status": "error", "error": margin_error}
     try:
         ex.set_leverage(leverage, clean_symbol)
-        order = ex.create_order(clean_symbol, type_clean, side_clean, amount, price, params)
+        order = ex.create_order(
+            clean_symbol,
+            _CONDITIONAL_ORDER_TYPES.get(type_clean, type_clean),
+            side_clean,
+            amount,
+            price,
+            params,
+        )
     except Exception as exc:  # noqa: BLE001 - surface any ccxt/auth/network error as fail-closed
         return {"status": "error", "error": str(exc)}
 
@@ -1088,6 +1133,13 @@ def _place_usdm_order(
         "price": _obj_get(order, "price"),
         "market_type": "usdm",
     }
+
+
+#: Caller-facing conditional order types mapped to the ccxt/Binance type string.
+_CONDITIONAL_ORDER_TYPES = {
+    "stop_market": "STOP_MARKET",
+    "take_profit_market": "TAKE_PROFIT_MARKET",
+}
 
 
 #: Binance answers setMarginType with -4046 ("No need to change margin type.")
@@ -1150,6 +1202,15 @@ def _ensure_futures_margin(ex: Any, symbol: str, margin_mode: str) -> str | None
     except Exception as exc:  # noqa: BLE001 - e.g. resting orders block the change
         if _margin_type_already_set(exc):
             return None
+        if "-4067" in str(exc):
+            # Binance refuses the change while the symbol carries resting orders
+            # (including conditional ones, which live in the Algo service). Say
+            # so, instead of leaving the caller with the raw envelope.
+            return (
+                "could not set margin mode " + margin_mode + " on " + symbol
+                + ": Binance refuses while the symbol has open orders (-4067); "
+                "cancel its open/conditional orders first. " + str(exc)
+            )
         return "could not set margin mode " + margin_mode + " on " + symbol + ": " + str(exc)
     return None
 
@@ -1226,6 +1287,158 @@ def cancel_order(
     if cfg.market_type == "usdm":
         result["market_type"] = "usdm"
     return result
+
+
+def _algo_symbol(raw_symbol: Any) -> str:
+    """Return the ccxt unified perp symbol for a raw Algo-service symbol."""
+    text = str(raw_symbol or "").strip().upper()
+    if "/" in text:
+        return normalize_futures_symbol(text) or text
+    if text.endswith("USDT") and len(text) > len("USDT"):
+        return text[: -len("USDT")] + "/USDT:USDT"
+    return text
+
+
+def algo_order_row(item: Any) -> dict[str, Any] | None:
+    """Map one Algo-service row to the connector's open-order shape.
+
+    Returns None when the row carries no algo id or no symbol (nothing a caller
+    could cancel or match on).
+    """
+    symbol = _algo_symbol(_obj_get(item, "symbol"))
+    algo_id = _obj_get(item, "algoId")
+    if not symbol or algo_id is None or str(algo_id).strip() == "":
+        return None
+    return {
+        "order_id": str(algo_id),
+        "symbol": symbol,
+        "side": str(_obj_get(item, "side") or "").lower(),
+        "order_type": str(_obj_get(item, "orderType") or "").lower(),
+        "stop_price": _to_float(_obj_get(item, "triggerPrice")),
+        "quantity": _to_float(_obj_get(item, "quantity")),
+        "status": str(_obj_get(item, "algoStatus") or "").lower(),
+    }
+
+
+def get_open_algo_orders(config: BinanceConfig | None = None) -> dict[str, Any]:
+    """List resting conditional (algo) orders on a tradable USDⓈ-M profile.
+
+    Binance routes stop_market / take_profit_market orders through its Algo
+    Order service, so they never appear in fetch_open_orders(). A caller that
+    only reads the standard open-order list cannot tell that its protection is
+    already armed, and cannot find the sibling leg left behind once one of them
+    triggers. This is the read for that surface.
+
+    Args:
+        config: Connector config; falls back to the saved config when None.
+
+    Returns:
+        On success: {"status": "ok", "orders": [row, ...]} where each row is
+        shaped by algo_order_row (order_id is the algo id). On failure:
+        {"status": "error", "error": str} (fail-closed).
+    """
+    cfg = config or load_config()
+    try:
+        _assert_host(cfg)
+    except BinanceConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+    if cfg.market_type != "usdm":
+        return {"status": "error", "error": "conditional (algo) orders are USDⓈ-M futures-only."}
+    if is_usdm_shadow(cfg):
+        return {"status": "error", "error": "Binance USD-M Shadow Account is read-only"}
+    try:
+        ex = _exchange(cfg)
+        raw = ex.fapiPrivateGetOpenAlgoOrders({})
+    except Exception as exc:  # noqa: BLE001 - surface auth/network errors fail-closed
+        return {"status": "error", "error": str(exc)}
+    orders = [row for row in (algo_order_row(item) for item in _as_iter(raw)) if row is not None]
+    return {
+        "status": "ok",
+        "orders": orders,
+        "count": len(orders),
+        "profile": cfg.profile,
+        "is_testnet": cfg.is_testnet,
+        "paper_guard": "host_separated",
+        "market_type": "usdm",
+    }
+
+
+def cancel_algo_order(
+    config: BinanceConfig | None = None,
+    algo_id: str = "",
+    *,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Cancel one resting conditional (algo) order by its algo id.
+
+    Conditional orders cannot be cancelled through the standard order endpoint:
+    Binance answers -2013 ("Order does not exist") because the order lives in
+    the Algo service. The cancel is idempotent — an order that already
+    triggered, or was already cancelled, is reported as already_gone rather
+    than as a failure, which is the state the caller asked for.
+
+    Args:
+        config: Connector config; falls back to the saved config when None.
+        algo_id: The algo order id (order_id from get_open_algo_orders).
+        symbol: Optional trading pair, echoed back for the caller's bookkeeping.
+
+    Returns:
+        On success: {"status": "ok", "order_id", "symbol", "already_gone": bool}.
+        On failure: {"status": "error", "error": str} (fail-closed).
+    """
+    cfg = config or load_config()
+    try:
+        _assert_host(cfg)
+    except BinanceConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+    if cfg.market_type != "usdm":
+        return {"status": "error", "error": "conditional (algo) orders are USDⓈ-M futures-only."}
+    if is_usdm_shadow(cfg):
+        return {"status": "error", "error": "Binance USD-M Shadow Account is read-only"}
+    algo_clean = str(algo_id or "").strip()
+    if not algo_clean:
+        return {"status": "error", "error": "algo_id is required to cancel a conditional order."}
+    def _gone(text: str) -> bool:
+        """-2013 means the order already triggered or was already cancelled."""
+        lowered = text.lower()
+        return "does not exist" in lowered or "-2013" in lowered
+
+    def _result(already_gone: bool) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "order_id": algo_clean,
+            "symbol": symbol,
+            "already_gone": already_gone,
+            "profile": cfg.profile,
+            "is_testnet": cfg.is_testnet,
+            "paper_guard": "host_separated",
+            "market_type": "usdm",
+        }
+
+    try:
+        ex = _exchange(cfg)
+        delete = lambda: ex.fapiPrivateDeleteAlgoOrder({"algoId": algo_clean})  # noqa: E731
+        try:
+            delete()
+        except Exception as exc:  # noqa: BLE001 - fail-closed except the idempotent cases
+            text = str(exc)
+            if _gone(text):
+                return _result(True)
+            if "-1021" not in text:
+                return {"status": "error", "error": text}
+            # -1021 is the recvWindow/timestamp check: this machine's clock had
+            # drifted from Binance's for that request, which is transient. One
+            # retry almost always lands, and leaving the order resting would
+            # block new entries on the symbol with -4067.
+            try:
+                delete()
+            except Exception as retry_exc:  # noqa: BLE001
+                if _gone(str(retry_exc)):
+                    return _result(True)
+                return {"status": "error", "error": str(retry_exc)}
+    except Exception as exc:  # noqa: BLE001 - exchange construction failures
+        return {"status": "error", "error": str(exc)}
+    return _result(False)
 
 
 # ---------------------------------------------------------------------------
