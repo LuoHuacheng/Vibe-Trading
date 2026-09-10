@@ -45,6 +45,23 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   against the live testnet: three short entries filled and all four open
   positions closed through the same loop.
 
+- **Exchange-side stop-loss / take-profit for USDⓈ-M futures** — the connector
+  now places `stop_market` / `take_profit_market` orders (reduce-only is
+  enforced, so a triggered conditional can never open a new book), and the
+  futures signal loop arms both legs the moment it opens a position, so
+  protection survives the process that placed it. Binance routes these orders
+  through its Algo Order service: they never appear in `fetch_open_orders()`
+  and cannot be cancelled through the standard order endpoint (-2013), so
+  `get_open_algo_orders` / `cancel_algo_order` were added alongside (the
+  cancel is idempotent on an order that already triggered and retries once on a
+  -1021 clock-drift rejection). The loop reconciles every round — two legs
+  present means leave it alone, one leg left means cancel and re-arm, no
+  position means cancel the orphan, because a leftover conditional blocks
+  re-entry on that symbol with -4067. Stop/take-profit levels now prefer the
+  prices the signal itself proposed (validated for direction and distance,
+  falling back to the CLI percentages otherwise), and the in-process exit check
+  compares prices rather than percentages so both paths agree.
+
 ### Fixed
 
 - USDⓈ-M futures positions reach the portfolio as **exposure** instead of
