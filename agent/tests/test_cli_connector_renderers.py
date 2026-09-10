@@ -259,3 +259,81 @@ def test_connector_orders_still_renders_the_nested_ibkr_row(capsys) -> None:
     assert "100" in out
     assert "401.25" in out
     assert "PreSubmitted" in out  # the dict branch must survive the flat-row fix
+
+
+# --- Wallet balances: Binance returns per-asset free/used/total rows keyed by
+# --- asset (spot) or symbol (USDⓈ-M), so the IBKR column set rendered six empty
+# --- cells for every Binance account read.
+
+
+def test_is_wallet_balance_row_detects_only_wallet_shapes() -> None:
+    assert _legacy._is_wallet_balance_row({"symbol": "BTC", "free": 0.01, "total": 0.01})
+    assert _legacy._is_wallet_balance_row({"asset": "ETH", "used": 0.5, "total": 2.0})
+    # An IBKR/Longbridge row keeps its own column set.
+    assert not _legacy._is_wallet_balance_row(
+        {"currency": "USD", "net_assets": 1.0, "total_cash": 1.0}
+    )
+    assert not _legacy._is_wallet_balance_row({"currency": "USD"})
+
+
+def test_connector_account_renders_usdm_wallet_balances(capsys) -> None:
+    usdm_account = {
+        "status": "ok",
+        "profile_id": "binance-futures-paper-trade",
+        "market_type": "usdm",
+        "equity_usd": 4864.96,
+        "balances": [
+            {"symbol": "BTC", "free": 0.01, "used": 0.0, "total": 0.01},
+            {"symbol": "USDT", "free": 4864.96, "used": 0.0, "total": 4864.96},
+        ],
+    }
+    rc = _legacy._print_connector_account(usdm_account)
+
+    assert rc == _legacy.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "BTC" in out and "USDT" in out
+    assert "4864.96" in out
+    assert "0.01" in out
+    assert "Equity (USD)" in out
+    assert "Net Assets" not in out  # IBKR columns must not render wallet rows
+
+
+def test_connector_account_renders_spot_wallet_balances(capsys) -> None:
+    spot_account = {
+        "status": "ok",
+        "profile_id": "binance-paper-trade",
+        "balances": [{"asset": "ETH", "free": 1.5, "used": 0.5, "total": 2.0}],
+    }
+    rc = _legacy._print_connector_account(spot_account)
+
+    assert rc == _legacy.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "ETH" in out
+    assert "2.0" in out
+    assert "0.5" in out
+    assert "Net Assets" not in out
+
+
+def test_connector_account_keeps_ibkr_columns_for_performance_rows(capsys) -> None:
+    """A net_assets row must not be mistaken for a wallet row."""
+    result = {
+        "status": "ok",
+        "profile_id": "longbridge-paper-trade",
+        "balances": [
+            {
+                "currency": "USD",
+                "net_assets": 12_345.0,
+                "total_cash": 10_000.0,
+                "buy_power": 20_000.0,
+                "init_margin": 0.0,
+                "maintenance_margin": 0.0,
+            }
+        ],
+    }
+    rc = _legacy._print_connector_account(result)
+
+    assert rc == _legacy.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "Net Assets" in out
+    assert "12" in out and "345" in out
+    assert "Free" not in out

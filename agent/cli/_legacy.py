@@ -4536,8 +4536,57 @@ def _first_present(row: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+#: Keys that only the IBKR/Longbridge balance row shape carries. Their absence,
+#: together with free/used/total, identifies a wallet row.
+_IBKR_BALANCE_KEYS = ("net_assets", "total_cash", "buy_power", "init_margin", "maintenance_margin")
+_WALLET_BALANCE_KEYS = ("free", "used", "total")
+
+
+def _is_wallet_balance_row(row: dict[str, Any]) -> bool:
+    """Return True for a per-asset free/used/total wallet balance row."""
+    if any(row.get(key) is not None for key in _IBKR_BALANCE_KEYS):
+        return False
+    return any(row.get(key) is not None for key in _WALLET_BALANCE_KEYS)
+
+
+def _print_wallet_balances(result: dict[str, Any], rows: list[dict[str, Any]]) -> int:
+    """Render free/used/total wallet balances (Binance spot and USDⓈ-M)."""
+    cell = lambda v: "" if v is None else str(v)  # noqa: E731
+    table = Table(title=f"Account Balances · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Currency")
+    table.add_column("Free", justify="right")
+    table.add_column("Used", justify="right")
+    table.add_column("Total", justify="right")
+    for row in rows:
+        table.add_row(
+            cell(row.get("symbol") or row.get("asset") or row.get("currency")),
+            cell(row.get("free")),
+            cell(row.get("used")),
+            cell(row.get("total")),
+        )
+    console.print(table)
+    equity = result.get("equity_usd")
+    if equity is not None:
+        console.print(f"[dim]Equity (USD): {cell(equity)}[/dim]")
+    return EXIT_SUCCESS
+
+
 def _print_connector_balances(result: dict[str, Any]) -> int:
-    """Render the multi-currency balances table returned by ``broker_sdk`` connectors."""
+    """Render the multi-currency balances table returned by ``broker_sdk`` connectors.
+
+    Two row shapes reach this function and they are not interchangeable:
+
+    * IBKR/Longbridge style: currency plus net_assets/total_cash/buy_power/
+      init_margin/maintenance_margin;
+    * wallet style: the per-asset free/used/total rows Binance returns for both
+      spot and USDⓈ-M, keyed by asset (spot) or symbol (USDⓈ-M).
+
+    Reading the IBKR keys off a wallet row renders six empty cells, so the row
+    shape selects its own column set.
+    """
+    balances = [row for row in (result.get("balances") or []) if isinstance(row, dict)]
+    if balances and all(_is_wallet_balance_row(row) for row in balances):
+        return _print_wallet_balances(result, balances)
     cell = lambda v: "" if v is None else str(v)  # noqa: E731
     table = Table(title=f"Account Balances · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("Currency")
@@ -4546,7 +4595,7 @@ def _print_connector_balances(result: dict[str, Any]) -> int:
     table.add_column("Buy Power", justify="right")
     table.add_column("Init Margin", justify="right")
     table.add_column("Maint Margin", justify="right")
-    for row in result.get("balances", []):
+    for row in balances:
         table.add_row(
             cell(row.get("currency")),
             cell(row.get("net_assets")),
