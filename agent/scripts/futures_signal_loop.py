@@ -357,14 +357,25 @@ def build_market_snapshot(
     return "\n".join(lines), prices
 
 
-def parse_signals(text: str) -> list[dict]:
-    """解析 LLM 输出：优先严格 JSON，失败回退 markdown 表格。"""
+def parse_signals(text: str) -> list[dict] | None:
+    """解析 LLM 输出，返回信号列表或 None。
+
+    关键区分：合法的 `{"signals": []}` 表示「本轮没有机会」，是正常结果；
+    只有完全解析不出 payload 才算不守契约（None）。把前者当成失败会白白
+    重试一次 LLM，还会把一轮记成 error。
+    """
     try:
         start, end = text.index("{"), text.rindex("}")
         payload = json.loads(text[start : end + 1])
     except (ValueError, json.JSONDecodeError):
-        return _parse_markdown_signals(text)
-    return payload.get("signals") or []
+        markdown = _parse_markdown_signals(text)
+        return markdown or None
+    if not isinstance(payload, dict):
+        return None
+    signals = payload.get("signals")
+    if signals is None:
+        return None
+    return list(signals) if isinstance(signals, list) else None
 
 
 # 固定单笔金额（保守档，低于 MAX_NOTIONAL 上限）
@@ -711,7 +722,8 @@ def disarm_protection(cancel, state: dict, symbol: str, *, trade: bool,
 
 def arm_protection(place, state: dict, symbol: str, position: dict, *,
                    mode: str, stop_price: float, take_profit_price: float,
-                   trailing_pct: float, margin_mode: str, leverage: int, trade: bool) -> None:
+                   trailing_pct: float, margin_mode: str, leverage: int, trade: bool,
+                   only: set[str] | None = None) -> None:
     """按保护模式给持仓挂 reduce_only 条件单（进程死了也有效）。
 
     fixed    : stop_market + take_profit_market（固定止损 + 止盈）
@@ -722,7 +734,8 @@ def arm_protection(place, state: dict, symbol: str, position: dict, *,
     下一轮的残留清理撤掉（交易所不会自动撤）。
     """
     quantity = abs(float(position.get("quantity") or 0))
-    legs = protection_legs(mode)
+    # only 用于「补齐」场景：只挂缺的那几条腿，不重新挂已有的
+    legs = tuple(leg for leg in protection_legs(mode) if only is None or leg in only)
     if quantity <= 0 or take_profit_price <= 0 or ("stop_market" in legs and stop_price <= 0):
         return
     if "trailing_stop_market" in legs and not (0.1 <= trailing_pct <= 5.0):
@@ -748,21 +761,32 @@ def arm_protection(place, state: dict, symbol: str, position: dict, *,
         return
     record: dict = {}
     for order_type, extra, price in plan:
-        try:
-            result = place(
-                symbol, TRADE_PROFILE, side=close_side, quantity=quantity,
-                order_type=order_type, reduce_only=True,
-                margin_mode=margin_mode, leverage=leverage,
-                session_id=f"futures-protect-{int(time.time())}", **extra,
-            )
-            _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
-                  "status": "protect", "detail": order_type, "price": price,
-                  "result": result})
+        result: dict = {}
+        for attempt in range(2):
+            try:
+                result = place(
+                    symbol, TRADE_PROFILE, side=close_side, quantity=quantity,
+                    order_type=order_type, reduce_only=True,
+                    margin_mode=margin_mode, leverage=leverage,
+                    session_id=f"futures-protect-{int(time.time())}", **extra,
+                )
+            except Exception as exc:  # noqa: BLE001 - 挂不上就靠脚本侧兜底
+                result = {"status": "error", "error": str(exc)}
             if str((result or {}).get("status")) == "ok":
-                record[_LEG_KEYS[order_type]] = (result or {}).get("order_id")
-        except Exception as exc:  # noqa: BLE001 - 挂不上就靠脚本侧兜底
-            _log({"ts": _now(), "symbol": symbol, "status": "error",
-                  "detail": f"{order_type} at {price}: {exc}"})
+                break
+            # 第一次失败最常见的原因是校验保证金模式时读持仓的瞬时网络抖动
+            # （实测：紧接着的止盈腿就成功了）。隔两秒重试一次，仍失败就留给
+            # 下一轮补齐——但要把「保护不完整」明确记下来。
+            if attempt == 0:
+                time.sleep(2)
+        _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
+              "status": "protect", "detail": order_type, "price": price, "result": result})
+        if str((result or {}).get("status")) == "ok":
+            record[_LEG_KEYS[order_type]] = (result or {}).get("order_id")
+    missing = [leg for leg in legs if _LEG_KEYS[leg] not in record]
+    if missing and trade:
+        _log({"ts": _now(), "symbol": symbol, "status": "warn",
+              "detail": f"protection incomplete: missing {','.join(missing)}; re-arms next round"})
     if record:
         state.setdefault("protection", {})[symbol] = {
             **record,
@@ -816,18 +840,41 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                 # 读不到保护状态时不动保护（不重复挂、也不清理），但脚本侧
                 # 的止盈止损照旧生效——平仓不该被一个读失败拖住。
                 continue
-            held_orders = resting.get(symbol) or []
-            have = {str(row.get("order_type") or "").strip().lower() for row in held_orders}
-            if have == set(legs):
-                continue  # 该模式要的腿都在，无需动作
-            if have:
-                # 只剩部分腿（兄弟单成交/被手动撤掉）：先清干净再重挂，避免残缺状态
-                disarm_protection(_cancel_algo, state, symbol, trade=trade, resting_orders=held_orders)
+            # 以**本地记录**为准判断保护是否齐全。Binance 的条件单列表接口在
+            # 测试网会偶发读丢已挂的腿，照着「读到的才存在」补挂就会挂出重复单
+            # （实测发生过）。交易所读取只用于「仓位已消失 → 清残留」。
+            expected = set(legs)
+            tracked = (state.get("protection") or {}).get(symbol) or {}
+            current_qty = abs(float(broker_position.get("quantity") or 0))
+            recorded_qty = float(tracked.get("quantity") or 0)
+            if tracked and str(tracked.get("mode") or "") != protection:
+                # 保护模式换过：用记录里的 id 撤掉旧腿（不依赖交易所列表），再按新模式挂
+                disarm_protection(_cancel_algo, state, symbol, trade=trade)
+                tracked = {}
+            tracked_types = {leg for leg in expected if tracked.get(_LEG_KEYS[leg])}
+            size_matches = recorded_qty > 0 and abs(recorded_qty - current_qty) < 1e-9
+            if tracked_types == expected and size_matches:
+                continue  # 记录齐全且仓位没变 → 不查交易所、不动保护
+            if tracked_types and not size_matches:
+                # 仓位数量变了（部分成交/加仓）：旧腿的数量已不匹配，清了重挂
+                disarm_protection(_cancel_algo, state, symbol, trade=trade)
+                tracked_types = set()
+            missing = expected - tracked_types
+            if missing:
+                # 记录里没有的腿，才去交易所确认一次；两次都读不到才补挂
+                try:
+                    confirm = _resting_protection_orders().get(symbol) or []
+                except Exception:  # noqa: BLE001 - 确认不了就不补挂
+                    confirm = []
+                confirmed = {str(row.get("order_type") or "").strip().lower() for row in confirm}
+                missing = {leg for leg in missing if leg not in confirmed}
+                if not missing:
+                    continue
             arm_protection(
                 place_order, state, symbol, broker_position,
                 mode=protection, stop_price=stop_price, take_profit_price=target,
                 trailing_pct=trailing, margin_mode=margin_mode, leverage=leverage,
-                trade=trade,
+                trade=trade, only=missing,
             )
             continue
         # 触发：先撤交易所侧挂单，再市价平仓（避免两边同时动作）
@@ -962,8 +1009,29 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         return
 
     signals = parse_signals(text)
+    if signals is None:
+        # 真的解析不出 payload 才算不守契约。一轮报废太贵，带一句提醒重试一次，
+        # 并把原文片段留证。
+        _log({"ts": _now(), "round": "warn", "detail": "llm output unparseable; retrying once",
+              "raw": text[:200]})
+        try:
+            retry_reply = llm.invoke(
+                prompt + "\n\nREMINDER: reply with ONE JSON object and nothing else."
+            )
+            retry_text = retry_reply.content if hasattr(retry_reply, "content") else str(retry_reply)
+            signals = parse_signals(retry_text)
+            if signals:
+                text = retry_text
+        except Exception as exc:  # noqa: BLE001 - 重试失败就按本轮无信号处理
+            _log({"ts": _now(), "round": "warn", "detail": f"llm retry failed: {exc}"})
+            signals = []
+    if signals is None:
+        _log({"ts": _now(), "round": "error", "detail": "llm returned no parseable signals",
+              "raw": text[:200]})
+        return
     if not signals:
-        _log({"ts": _now(), "round": "error", "detail": "llm returned no parseable signals"})
+        # 合法的空信号集：本轮没有值得做的机会，安静跳过
+        _log({"ts": _now(), "round": "idle", "detail": "no setups this round (empty signal set)"})
         return
 
     # 4) 执行
@@ -1189,6 +1257,12 @@ def _selftest() -> None:
     quantity, reason = order_quantity(ex, "NOPE/USDT:USDT", 200.0, 10.0)
     assert quantity is None and "not a loaded market" in reason
 
+    # 信号解析的三种结果必须区分开：合法空集 / 不守契约 / 正常信号
+    assert parse_signals('{"signals": []}') == []
+    assert parse_signals("完全没有 JSON 的一段话") is None
+    parsed = parse_signals('{"signals": [{"symbol": "BTC/USDT:USDT", "side": "hold"}]}')
+    assert parsed is not None and len(parsed) == 1 and parsed[0]["side"] == "hold"
+
     # 指标：纯函数，用构造序列验证
     rising = [float(i) for i in range(1, 101)]
     assert _ema(rising, 10) is not None and _ema(rising, 10) < rising[-1]
@@ -1213,6 +1287,36 @@ def _selftest() -> None:
                                     context=context, previous_oi={"BTC/USDT:USDT": 100.0})
     for field in ("fund=", "basis=", "oi=", "oiChg="):
         assert field in text, (field, text[:220])
+
+    # 挂保护腿：第一次失败（瞬时读抖动）要重试一次，第二次成功即记下 id。
+    # 自测不碰真日志：临时把 LOG_PATH 指到临时目录。
+    import tempfile
+
+    global LOG_PATH
+    saved_log, LOG_PATH = LOG_PATH, Path(tempfile.mkdtemp()) / "selftest.jsonl"
+    try:
+        calls: list[str] = []
+
+        def flaky_place(*args, **kwargs):
+            order_type = str(kwargs.get("order_type"))
+            calls.append(order_type)
+            if order_type == "trailing_stop_market" and calls.count(order_type) == 1:
+                return {"status": "error", "error": "transient position read failure"}
+            return {"status": "ok", "order_id": "id-" + order_type}
+
+        state = {"protection": {}}
+        arm_protection(
+            flaky_place, state, "BTC/USDT:USDT",
+            {"side": "long", "quantity": 1.0, "entry": 100.0},
+            mode="trailing", stop_price=95.0, take_profit_price=110.0,
+            trailing_pct=3.0, margin_mode="isolated", leverage=5, trade=True,
+        )
+        recorded = state["protection"]["BTC/USDT:USDT"]
+        assert recorded["trailing_order_id"] == "id-trailing_stop_market"
+        assert recorded["take_profit_order_id"] == "id-take_profit_market"
+        assert calls.count("trailing_stop_market") == 2, calls
+    finally:
+        LOG_PATH = saved_log
 
     print("selftest OK")
 
