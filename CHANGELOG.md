@@ -74,6 +74,25 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   extremes (entry-to-date peak versus the exchange's own), so running both would
   close the position on whichever fires first.
 
+- **Richer per-symbol analysis and a position cap for the futures signal loop** —
+  the loop used to hand the model four numbers per pair (last price, the window's
+  first close, percent change, total volume). Each line now carries seventeen:
+  5/20/window changes, the window's low..high and where the last price sits
+  inside it, a recent-versus-earlier volume ratio, RSI(14), ATR%, distance from
+  EMA20/EMA50/VWAP, plus funding rate, hours to the next settlement, the
+  mark-index basis, open interest and its change since the previous round
+  (Binance serves open-interest history from the fapiData endpoints, which ccxt
+  refuses on testnet, so the loop derives the change by comparing successive
+  reads). Funding and basis arrive in ONE batch premiumIndex call covering the
+  whole market, so widening the universe costs nothing for them; open interest
+  is read per symbol and a failure only drops that pair's context. `--bars`
+  (default 100) and `--no-derivatives` control the depth. A new
+  `--max-positions` (default 5) caps concurrent positions, because widening the
+  universe without it lets a single round commit the whole margin. When the
+  exchange-side protection state cannot be read, the loop now skips new entries
+  and protection maintenance instead of aborting the round, while in-process
+  exits keep working.
+
 ### Fixed
 
 - USDⓈ-M futures positions reach the portfolio as **exposure** instead of
