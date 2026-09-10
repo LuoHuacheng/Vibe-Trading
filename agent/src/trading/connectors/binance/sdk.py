@@ -1308,6 +1308,10 @@ def futures_position_row(row: Any) -> dict[str, Any] | None:
         "side": side,
         "price": mark_price,
         "mark_price": mark_price,
+        # Entry price is the position's cost basis. The Shadow observation row
+        # has always carried it as entry_price; the trade read needs it too, or
+        # every downstream cost / break-even view shows a blank.
+        "entry_price": _to_float(_obj_get(row, "entryPrice")),
         "unrealized_pnl": _to_float(_obj_get(row, "unrealizedPnl")),
         "leverage": _obj_get(row, "leverage"),
         "margin_mode": _obj_get(row, "marginMode"),

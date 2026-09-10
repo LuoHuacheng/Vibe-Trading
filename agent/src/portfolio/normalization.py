@@ -167,8 +167,14 @@ def normalize_position(broker: str, row: dict[str, Any]) -> dict[str, Any]:
                     row.get(
                         "avg_entry_price",
                         row.get(
-                            "average_price",
-                            row.get("price_open", row.get("open_rate")),
+                            # USDⓈ-M positions report their cost basis as
+                            # entry_price, the same name the Shadow observation
+                            # row uses.
+                            "entry_price",
+                            row.get(
+                                "average_price",
+                                row.get("price_open", row.get("open_rate")),
+                            ),
                         ),
                     ),
                 ),

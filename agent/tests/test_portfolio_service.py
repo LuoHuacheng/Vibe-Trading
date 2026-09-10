@@ -116,7 +116,15 @@ def test_refresh_aggregates_three_readonly_connectors(tmp_path):
 
 
 def _usdm_snapshot(
-    tmp_path, monkeypatch, *, symbol, quantity, top_symbols, balances=None, unrealized_pnl=0.0
+    tmp_path,
+    monkeypatch,
+    *,
+    symbol,
+    quantity,
+    top_symbols,
+    balances=None,
+    unrealized_pnl=0.0,
+    entry_price=95.0,
 ):
     settings = PortfolioSettingsStore(tmp_path / "portfolio.json")
     settings.connection_store.ensure(
@@ -147,6 +155,7 @@ def _usdm_snapshot(
                 "side": "long",
                 "price": 100.0,
                 "mark_price": 100.0,
+                "entry_price": entry_price,
                 "unrealized_pnl": unrealized_pnl,
                 "leverage": 5,
                 "margin_mode": "isolated",
@@ -233,6 +242,25 @@ def test_usdm_wallet_asset_outside_stablecoins_becomes_a_holding(tmp_path, monke
     assert len(wallet) == 1
     assert wallet[0]["market_value_usd"] == pytest.approx(1.0)  # 0.01 x 100
     assert snapshot["totals"]["usd"] == pytest.approx(1.0)
+
+
+def test_usdm_position_carries_its_entry_price_as_cost(tmp_path, monkeypatch):
+    """The futures row's entry_price must reach the cost column."""
+    snapshot, _ = _usdm_snapshot(
+        tmp_path,
+        monkeypatch,
+        symbol="BTC/USDT:USDT",
+        quantity=0.5,
+        top_symbols={"BTC/USDT"},
+        entry_price=90.0,
+        unrealized_pnl=None,
+    )
+    row = snapshot["positions"][0]
+
+    assert row["cost_price"] == pytest.approx(90.0)
+    # No broker-reported P/L: derive it from (mark - entry) x quantity.
+    assert row["unrealized_pnl_usd"] == pytest.approx(5.0)
+    assert row["exposure_usd"] == pytest.approx(50.0)
 
 
 def test_usdm_unrealized_pnl_lands_in_the_account_total(tmp_path, monkeypatch):

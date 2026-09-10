@@ -66,6 +66,9 @@ def test_trade_positions_are_direct_rows(monkeypatch):
     assert row["symbol"] == "BTC/USDT:USDT"
     assert row["quantity"] == 1.0 and row["side"] == "long"
     assert row["price"] == 61000.0
+    # The cost basis travels with the row so downstream cost / P&L views are
+    # not blank on a futures position.
+    assert row["entry_price"] == 60000.0
 
 
 def test_shadow_positions_still_use_observation(monkeypatch):
