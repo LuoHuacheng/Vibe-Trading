@@ -31,7 +31,55 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   open-order read -> cancel, market open, reduce_only close, net-zero account
   impact) was verified against the live testnet endpoint.
 
+- **Binance USDⓈ-M futures signal loop** — `agent/scripts/futures_signal_loop.py`
+  runs an LLM analysis → order loop against the futures testnet with contract
+  semantics the spot loop cannot express: USDT-settled perp symbols
+  (`BTC/USDT:USDT`), `quantity` + `margin_mode` + `leverage` instead of spot
+  `notional`, every close sent with `reduce_only` so a reversal can never open
+  a new book, long *and* short entries, exchange minimum amount/notional
+  checked locally before the order (no -4164 round-trip), and direction-aware
+  take-profit / stop-loss / trailing stops. Positions come from the broker
+  (`get_positions` on `binance-futures-paper-readonly`) rather than a local
+  cost file, which only carries the trailing peak/trough. Dry-run by default;
+  `--trade` arms it, `--selftest` covers both directions offline. Verified
+  against the live testnet: three short entries filled and all four open
+  positions closed through the same loop.
+
 ### Fixed
+
+- USDⓈ-M futures positions reach the portfolio as **exposure** instead of
+  market value, and the margin wallet is counted as cash. Previously the wallet
+  balance was dropped entirely (so an account holding 4,864 USDT with an open
+  position reported only the position's notional, 78.39 USD), while a leveraged
+  notional was summed as if it were an owned asset. A Binance account is now
+  worth priced holdings + cash + unrealized P/L, the perpetual row reports
+  `exposure_usd` (shown as "notional exposure" with no NAV weight) and the
+  wallet's non-stablecoin assets stay holdings rows. New read-only profile
+  `binance-futures-paper-readonly` backs the portfolio source, and portfolio
+  compatibility resolves per market type so a USDⓈ-M profile is no longer
+  described as `spot` (`futures_positions`).
+- USDⓈ-M position rows carry `entry_price` from ccxt's `entryPrice`, so the
+  portfolio cost column and any (mark − entry) × quantity P/L derivation are no
+  longer blank; the field matches the name the Shadow observation row already
+  used.
+- Binance `set_margin_mode` treating -4046 ("No need to change margin type.")
+  as a failure: margin type is a persistent per-symbol account setting, so
+  after the first order every position-less order that asked for the same type
+  was refused. The no-op is now tolerated; any other setMarginType error still
+  fails the order closed.
+- `connector account` rendered an empty table for Binance spot and USDⓈ-M:
+  the shared renderer only knew the IBKR `currency`/`net_assets` row shape,
+  while wallet rows are `asset`/`symbol` + `free`/`used`/`total`. The row
+  shape now selects its own column set.
+- A `NODE_ENV=production` inherited from the shell no longer breaks the dev
+  server or the test suite: Vite computed `isProduction`, which made
+  `@vitejs/plugin-react` skip the React Refresh preamble while the Oxc JSX
+  transform still emitted `$RefreshReg$` (every JSX module threw
+  `$RefreshReg$ is not defined`), and Vitest resolved react-dom's production
+  build, where `React.act` does not exist (every @testing-library render
+  failed). Both configs now normalize `NODE_ENV`.
+- Portuguese (pt-BR) locale was missing 17 keys (`portfolio.holdings` and
+  `portfolio.traded`), which failed the locale-parity test and `tsc`.
 
 - Binance USD-M endpoint allowlist (`assert_exchange_endpoints`) now accepts
   the futures testnet host for paper profiles instead of hard-coding
