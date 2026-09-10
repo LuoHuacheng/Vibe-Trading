@@ -471,6 +471,28 @@ def _cancel_algo(order_id: str, profile_id: str | None = None, *, symbol: str | 
     return cancel_algo_order(_algo_config(), order_id, symbol=symbol)
 
 
+def _read_protection_rows() -> list[dict]:
+    """读交易所侧条件单，最多问两次：空答复或读失败都再确认一遍。
+
+    测试网实测出现过「明明挂着却回空列表」以及偶发读失败。把一次空答复当成
+    「没挂保护」会重复挂单，把一次读失败当成「没挂单」会漏掉要清理的残留，
+    所以两次都不行才下结论（失败即抛，由调用方 fail-closed）。
+    """
+    from src.trading.connectors.binance.sdk import get_open_algo_orders
+
+    last_error = "algo order read failed"
+    for attempt in range(2):
+        payload = get_open_algo_orders(_algo_config())
+        if isinstance(payload, dict) and str(payload.get("status")) == "ok":
+            rows = payload.get("orders") or []
+            if rows or attempt == 1:
+                return rows
+        else:
+            last_error = str((payload or {}).get("error") or last_error)
+        time.sleep(1)
+    raise RuntimeError(last_error)
+
+
 def _resting_protection_orders() -> dict[str, list[dict]]:
     """返回 {symbol: [条件单行]} —— 交易所上还挂着的 stop/take-profit。
 
@@ -478,14 +500,7 @@ def _resting_protection_orders() -> dict[str, list[dict]]:
     fetch_open_orders() 永远看不到它们（实测踩过）。所以这里必须用
     get_open_algo_orders()，否则既发现不了已挂的保护，也找不到要撤的兄弟单。
     """
-    from src.trading.connectors.binance.sdk import get_open_algo_orders
-
-    payload = get_open_algo_orders(_algo_config())
-    if not isinstance(payload, dict) or str(payload.get("status")) != "ok":
-        # 读不到就不敢往下走：否则「读失败」会被当成「没有挂单」，
-        # 既可能重复挂保护，也会漏掉要清理的残留（实测踩过）。
-        raise RuntimeError(str((payload or {}).get("error") or "algo order read failed"))
-    rows = payload.get("orders") or []
+    rows = _read_protection_rows()
     result: dict[str, list[dict]] = {}
     for row in rows or []:
         if not isinstance(row, dict):
