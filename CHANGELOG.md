@@ -62,6 +62,18 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   falling back to the CLI percentages otherwise), and the in-process exit check
   compares prices rather than percentages so both paths agree.
 
+- **Trailing stop for USDⓈ-M futures** — `trailing_stop_market` orders are now
+  placeable: Binance's native TRAILING_STOP_MARKET takes a 0.1-5%
+  `callback_rate` and maintains the trigger itself, so a ratcheting stop
+  survives the process exactly like the fixed one. The futures signal loop
+  gained `--protection fixed|trailing|both|off` (default `fixed`, `trailing`
+  recommended): `trailing` arms the ratcheting stop plus the take-profit,
+  `both` keeps a fixed stop as a floor, and switching modes cancels the legs
+  that no longer match before re-arming. When the exchange-side trailing leg is
+  armed the loop disables its own trailing check — the two measure different
+  extremes (entry-to-date peak versus the exchange's own), so running both would
+  close the position on whichever fires first.
+
 ### Fixed
 
 - USDⓈ-M futures positions reach the portfolio as **exposure** instead of
