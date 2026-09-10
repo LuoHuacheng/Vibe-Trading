@@ -94,6 +94,39 @@ _LOADER_MARKET_SUFFIXES = frozenset({"US", "HK", "SZ", "SH", "BJ", "KS", "KQ", "
 _NON_EQUITY_ASSET_TYPES = frozenset({"crypto", "stablecoin", "cash"})
 
 
+def _with_usdm_wallet_holdings(
+    account: dict[str, Any],
+    positions_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Add a USDⓈ-M wallet's non-stablecoin assets as holdings rows.
+
+    A futures read returns open positions only, so a wallet asset that is not a
+    stablecoin (a testnet gift, or collateral posted in coin) would otherwise be
+    dropped without saying so. Stablecoins are the account's cash and are
+    counted by account_cash_usd() instead, so they are skipped here.
+
+    Args:
+        account: The raw USDⓈ-M account payload.
+        positions_payload: The raw positions payload from the same read.
+
+    Returns:
+        A copy of the positions payload whose position list also carries the
+        wallet assets.
+    """
+    rows = [dict(row) for row in (positions_payload.get("positions") or []) if isinstance(row, dict)]
+    for balance in account.get("balances") or []:
+        if not isinstance(balance, dict):
+            continue
+        asset = str(balance.get("symbol") or "").strip().upper()
+        quantity = _decimal(balance.get("total"))
+        if not asset or asset in STABLECOINS or quantity == 0:
+            continue
+        rows.append({"symbol": asset, "quantity": float(quantity), "source": "wallet"})
+    merged = dict(positions_payload)
+    merged["positions"] = rows
+    return merged
+
+
 _AUTH_REQUIRED_MARKERS = (
     "not_authorized",
     "not authorized",
@@ -335,19 +368,37 @@ class PortfolioService:
                 (_decimal(row.get("market_value_usd")) for row in broker_positions),
                 Decimal("0"),
             )
-            account_total = account_total_usd(
-                broker,
-                result["account"],
-                usd_hkd,
-                usd_cny,
-                priced_total,
+            # Derivatives contribute exposure and unrealized P/L, never market
+            # value: a leveraged notional is not an owned asset, and the wallet
+            # balance behind it is already counted as cash.
+            exposure_total = sum(
+                (_decimal(row.get("exposure_usd")) for row in broker_positions),
+                Decimal("0"),
             )
+            derivatives_pnl = sum(
+                (
+                    _decimal(row.get("unrealized_pnl_usd"))
+                    for row in broker_positions
+                    if row.get("exposure_usd") is not None
+                ),
+                Decimal("0"),
+            )
+            reported_cash = account_cash_usd(broker, result["account"], usd_hkd, usd_cny)
             if broker == "binance":
-                account_total = priced_total
-            cash_total = min(
-                account_total,
-                account_cash_usd(broker, result["account"], usd_hkd, usd_cny),
-            )
+                # Binance reports no account-level net liquidation. The account
+                # is worth its priced holdings plus cash plus derivatives P/L,
+                # and a futures margin wallet is exactly that: cash.
+                account_total = priced_total + reported_cash + derivatives_pnl
+                cash_total = reported_cash + derivatives_pnl
+            else:
+                account_total = account_total_usd(
+                    broker,
+                    result["account"],
+                    usd_hkd,
+                    usd_cny,
+                    priced_total,
+                )
+                cash_total = min(account_total, reported_cash)
             if not source.include_cash:
                 account_total = max(Decimal("0"), account_total - cash_total)
                 cash_total = Decimal("0")
@@ -364,6 +415,7 @@ class PortfolioService:
                     "total_usd": _number(account_total),
                     "total_cny": _number(account_total * usd_cny),
                     "priced_value_usd": _number(priced_total),
+                    "exposure_usd": _number(exposure_total),
                     "cash_usd": _number(cash_total),
                     "unpriced_or_other_usd": _number(unpriced_or_other),
                     "position_count": len(broker_positions),
@@ -967,6 +1019,8 @@ class PortfolioService:
                 raise RuntimeError(
                     str(payload.get("error") or f"{broker} {label} read failed")
                 )
+        if broker == "binance" and str(account.get("market_type") or "").strip().lower() == "usdm":
+            positions_payload = _with_usdm_wallet_holdings(account, positions_payload)
         account, positions_payload = adapt_and_validate_payloads(broker, account, positions_payload)
         normalized_rows = [normalize_position(broker, raw) for raw in positions_payload.get("positions", [])]
         for row in normalized_rows:

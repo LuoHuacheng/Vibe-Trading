@@ -115,7 +115,9 @@ def test_refresh_aggregates_three_readonly_connectors(tmp_path):
 # futures position was dropped out of pricing and the page showed $0.
 
 
-def _usdm_snapshot(tmp_path, monkeypatch, *, symbol, quantity, top_symbols):
+def _usdm_snapshot(
+    tmp_path, monkeypatch, *, symbol, quantity, top_symbols, balances=None, unrealized_pnl=0.0
+):
     settings = PortfolioSettingsStore(tmp_path / "portfolio.json")
     settings.connection_store.ensure(
         "binance-futures-paper",
@@ -128,7 +130,12 @@ def _usdm_snapshot(tmp_path, monkeypatch, *, symbol, quantity, top_symbols):
             "sources": [{"connection_id": "binance-futures-paper", "order": 0}],
         }
     )
-    account = {"status": "ok", "is_testnet": True, "market_type": "usdm", "balances": []}
+    account = {
+        "status": "ok",
+        "is_testnet": True,
+        "market_type": "usdm",
+        "balances": list(balances or []),
+    }
     positions = {
         "status": "ok",
         "is_testnet": True,
@@ -140,7 +147,7 @@ def _usdm_snapshot(tmp_path, monkeypatch, *, symbol, quantity, top_symbols):
                 "side": "long",
                 "price": 100.0,
                 "mark_price": 100.0,
-                "unrealized_pnl": 0.0,
+                "unrealized_pnl": unrealized_pnl,
                 "leverage": 5,
                 "margin_mode": "isolated",
             }
@@ -164,7 +171,7 @@ def _usdm_snapshot(tmp_path, monkeypatch, *, symbol, quantity, top_symbols):
     return service.refresh(), quoted
 
 
-def test_usdm_position_quotes_the_spot_pair_and_prices(tmp_path, monkeypatch):
+def test_usdm_position_quotes_the_spot_pair_and_reports_exposure(tmp_path, monkeypatch):
     snapshot, quoted = _usdm_snapshot(
         tmp_path, monkeypatch, symbol="BTC/USDT:USDT", quantity=0.5, top_symbols={"BTC/USDT"}
     )
@@ -173,7 +180,13 @@ def test_usdm_position_quotes_the_spot_pair_and_prices(tmp_path, monkeypatch):
     assert quoted == ["BTC/USDT"]  # not BTC/USDT:USDT/USDT
     assert row["priced"] is True
     assert row["market_price"] == 100.0
-    assert row["market_value_usd"] == pytest.approx(50.0)
+    assert row["source"] == "futures"
+    # A leveraged notional is exposure, not an owned asset: it never becomes
+    # market value, and an unfunded book is worth nothing.
+    assert row["exposure_usd"] == pytest.approx(50.0)
+    assert row["market_value_usd"] == 0.0
+    assert snapshot["accounts"][0]["exposure_usd"] == pytest.approx(50.0)
+    assert snapshot["totals"]["usd"] == 0.0
 
 
 def test_usdm_position_on_a_non_mainstream_base_prices_from_the_top_list(tmp_path, monkeypatch):
@@ -184,7 +197,58 @@ def test_usdm_position_on_a_non_mainstream_base_prices_from_the_top_list(tmp_pat
 
     assert quoted == ["ALT/USDT"]
     assert row["priced"] is True
-    assert row["market_value_usd"] == pytest.approx(200.0)
+    assert row["exposure_usd"] == pytest.approx(200.0)
+
+
+def test_usdm_wallet_stablecoins_are_cash(tmp_path, monkeypatch):
+    """The margin wallet is the account's value; positions are not."""
+    snapshot, _ = _usdm_snapshot(
+        tmp_path,
+        monkeypatch,
+        symbol="BTC/USDT:USDT",
+        quantity=0.5,
+        top_symbols={"BTC/USDT"},
+        balances=[
+            {"symbol": "USDT", "free": 1000.0, "used": 0.0, "total": 1000.0},
+            {"symbol": "USDC", "free": 500.0, "used": 0.0, "total": 500.0},
+        ],
+    )
+
+    assert snapshot["accounts"][0]["cash_usd"] == pytest.approx(1500.0)
+    assert snapshot["totals"]["usd"] == pytest.approx(1500.0)
+
+
+def test_usdm_wallet_asset_outside_stablecoins_becomes_a_holding(tmp_path, monkeypatch):
+    """Coin collateral (or a testnet gift) is a holding, not cash."""
+    snapshot, _ = _usdm_snapshot(
+        tmp_path,
+        monkeypatch,
+        symbol="BTC/USDT:USDT",
+        quantity=0.5,
+        top_symbols={"BTC/USDT"},
+        balances=[{"symbol": "BTC", "free": 0.01, "used": 0.0, "total": 0.01}],
+    )
+    wallet = [row for row in snapshot["positions"] if row["symbol"] == "BTC"]
+
+    assert len(wallet) == 1
+    assert wallet[0]["market_value_usd"] == pytest.approx(1.0)  # 0.01 x 100
+    assert snapshot["totals"]["usd"] == pytest.approx(1.0)
+
+
+def test_usdm_unrealized_pnl_lands_in_the_account_total(tmp_path, monkeypatch):
+    """Equity = wallet + unrealized P/L; the notional stays out of it."""
+    snapshot, _ = _usdm_snapshot(
+        tmp_path,
+        monkeypatch,
+        symbol="BTC/USDT:USDT",
+        quantity=0.5,
+        top_symbols={"BTC/USDT"},
+        balances=[{"symbol": "USDT", "free": 1000.0, "used": 0.0, "total": 1000.0}],
+        unrealized_pnl=25.0,
+    )
+
+    assert snapshot["accounts"][0]["cash_usd"] == pytest.approx(1025.0)
+    assert snapshot["totals"]["usd"] == pytest.approx(1025.0)
 
 
 def test_binance_perp_normalization_keeps_symbol_and_strips_settlement():

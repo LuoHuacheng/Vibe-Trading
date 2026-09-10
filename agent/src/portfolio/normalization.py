@@ -127,7 +127,14 @@ def normalize_position(broker: str, row: dict[str, Any]) -> dict[str, Any]:
         }
 
     symbol = str(row.get("symbol") or row.get("code") or row.get("ticker") or "").upper()
-    source = str(row.get("source") or ("spot" if broker == "binance" else "account"))
+    # A ccxt USDⓈ-M symbol carries its settlement currency after a colon
+    # (BTC/USDT:USDT). That is a derivative position, not a spot balance: the
+    # portfolio reports its notional as exposure instead of counting it as an
+    # owned asset, so a leveraged book cannot inflate the account total.
+    is_perpetual = broker == "binance" and ":" in symbol
+    source = str(
+        row.get("source") or ("futures" if is_perpetual else "spot" if broker == "binance" else "account")
+    )
     market = str(row.get("market") or row.get("exchange") or broker).upper()
     currency = str(row.get("currency") or "").upper()
     if not currency:
@@ -248,12 +255,20 @@ def value_position(row: dict[str, Any], *, usd_hkd: Decimal, usd_cny: Decimal) -
         if priced and cost > 0
         else None
     )
+    # A derivative position is exposure, not an owned asset: its notional does
+    # not belong in the account total (the wallet balance already carries the
+    # equity, and unrealized P/L is added to it separately), but it is reported
+    # so the holding is visible.
+    exposure_only = str(row.get("source") or "").strip().lower() == "futures"
     row.update(
         priced=priced,
-        market_value_usd=_number(market_usd),
-        market_value_cny=_number(market_usd * usd_cny),
+        market_value_usd=0.0 if exposure_only else _number(market_usd),
+        market_value_cny=0.0 if exposure_only else _number(market_usd * usd_cny),
         unrealized_pnl_usd=_number(pnl_usd) if pnl_usd is not None else None,
     )
+    if exposure_only:
+        row["exposure_usd"] = _number(abs(market_usd))
+        row["exposure_cny"] = _number(abs(market_usd) * usd_cny)
     for key in (
         "quote_symbol",
         "exchange",
@@ -341,6 +356,22 @@ def account_cash_usd(broker: str, account: dict[str, Any], usd_hkd: Decimal, usd
         Cash in USD, never negative and never inferred from an unpriced
         position.
     """
+    if broker == "binance" and str(account.get("market_type") or "").strip().lower() == "usdm":
+        # A USDⓈ-M wallet is settled in stablecoins, and those balances are the
+        # account's cash. The connector reports no account-level net
+        # liquidation, and a wallet asset outside this set is exported as a
+        # holdings row instead of being guessed at here.
+        return max(
+            Decimal("0"),
+            sum(
+                (
+                    _decimal(row.get("total"))
+                    for row in account.get("balances") or []
+                    if str(row.get("symbol") or "").strip().upper() in STABLECOINS
+                ),
+                Decimal("0"),
+            ),
+        )
     rows = account.get("balances", []) if broker == "longbridge" else []
     if rows:
         return max(
