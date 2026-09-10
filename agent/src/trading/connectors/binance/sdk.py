@@ -1433,9 +1433,16 @@ def cancel_algo_order(
     if not algo_clean:
         return {"status": "error", "error": "algo_id is required to cancel a conditional order."}
     def _gone(text: str) -> bool:
-        """-2013 means the order already triggered or was already cancelled."""
+        """Already gone: -2013 ("Order does not exist") on the standard order
+        endpoint, -2011 ("Unknown order sent") on the Algo one. Either way the
+        order triggered or was cancelled, which is the state the caller wants."""
         lowered = text.lower()
-        return "does not exist" in lowered or "-2013" in lowered
+        return (
+            "does not exist" in lowered
+            or "unknown order" in lowered
+            or "-2013" in lowered
+            or "-2011" in lowered
+        )
 
     def _result(already_gone: bool) -> dict[str, Any]:
         return {

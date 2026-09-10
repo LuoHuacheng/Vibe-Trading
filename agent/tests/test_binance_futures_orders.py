@@ -369,13 +369,19 @@ def test_cancel_algo_order_uses_the_algo_endpoint(monkeypatch):
 
 
 def test_cancel_algo_order_is_idempotent_when_already_gone(monkeypatch):
-    """-2013 means the order triggered or was cancelled: the desired state."""
-    ex = FakeAlgoExchange(
-        delete_error=Exception('binanceusdm {"code":-2013,"msg":"Order does not exist."}')
-    )
-    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
-    out = bn.cancel_algo_order(_algo_cfg(), "1000000200157380")
-    assert out["status"] == "ok" and out["already_gone"] is True
+    """An order that triggered or was cancelled already is the desired state.
+
+    The standard endpoint answers -2013; the Algo endpoint answers -2011
+    ("Unknown order sent") once a conditional order has fired.
+    """
+    for payload in (
+        'binanceusdm {"code":-2013,"msg":"Order does not exist."}',
+        'binanceusdm {"code":-2011,"msg":"Unknown order sent."}',
+    ):
+        ex = FakeAlgoExchange(delete_error=Exception(payload))
+        monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+        out = bn.cancel_algo_order(_algo_cfg(), "1000000200157380")
+        assert out["status"] == "ok" and out["already_gone"] is True, payload
 
 
 def test_cancel_algo_order_surfaces_other_errors(monkeypatch):
