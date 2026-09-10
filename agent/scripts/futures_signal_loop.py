@@ -1383,7 +1383,8 @@ def main() -> int:
           f"止盈 {args.take_profit}% | 移动止盈回撤 {args.trailing}% | "
           f"交易所侧保护 {protection_mode}"
           + (f"（{'/'.join(protection_legs(protection_mode))}）" if protection_legs(protection_mode) else ""))
-    print(f"[futures-loop] 品种 top {args.top} | 每品种 {args.bars} 根 5m | 最多同时 {args.max_positions} 仓 | "
+    universe = f"固定 {len(symbols_arg)} 个品种" if symbols_arg else f"成交额 top {args.top}"
+    print(f"[futures-loop] 品种 {universe} | 每品种 {args.bars} 根 5m | 最多同时 {args.max_positions} 仓 | "
           f"衍生品上下文 {'关' if args.no_derivatives else '开'}")
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")

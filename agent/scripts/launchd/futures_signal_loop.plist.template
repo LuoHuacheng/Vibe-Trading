@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Binance USDⓈ-M testnet futures signal loop as a launchd user agent (macOS).
+
+  This file is a TEMPLATE: the __PLACEHOLDERS__ are rendered by install.sh.
+  Do not load it directly — run:
+
+      bash agent/scripts/launchd/install.sh install
+
+  Re-rendering is what makes the service portable: the repo path, the venv
+  python and the trading parameters all come from the machine that installs it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vibe-trading.futures-signal-loop</string>
+
+  <!-- -u keeps stdout unbuffered, so the log below is live rather than
+       arriving in 8 KB chunks. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-u</string>
+    <string>__ROOT__/agent/scripts/futures_signal_loop.py</string>
+    <string>__TRADE_FLAG__</string>
+    <string>--symbols</string>
+    <string>__SYMBOLS__</string>
+    <string>--interval</string>
+    <string>__INTERVAL__</string>
+    <string>--runs</string>
+    <string>__RUNS__</string>
+    <string>--protection</string>
+    <string>__PROTECTION__</string>
+    <string>--trailing</string>
+    <string>__TRAILING__</string>
+    <string>--max-positions</string>
+    <string>__MAX_POSITIONS__</string>
+    <string>--leverage</string>
+    <string>__LEVERAGE__</string>
+    <string>--margin-mode</string>
+    <string>__MARGIN_MODE__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart on any exit: the loop is bounded by --runs, so a clean exit
+       means "a cycle finished", not "stay down". -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__ROOT__/.vibe-dev/logs/futures-loop.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/.vibe-dev/logs/futures-loop.launchd.err.log</string>
+
+  <!-- launchd starts jobs with a minimal environment: no PATH inheritance. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
