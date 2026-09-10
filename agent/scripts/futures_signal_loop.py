@@ -152,10 +152,11 @@ def load_state() -> dict:
             data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 data.setdefault("peaks", {})
+                data.setdefault("protection", {})
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
             pass
-    return {"peaks": {}}
+    return {"peaks": {}, "protection": {}}
 
 
 def save_state(state: dict) -> None:
@@ -343,29 +344,86 @@ def order_quantity(ex, symbol: str, notional: float, price: float) -> tuple[floa
     return quantity, ""
 
 
+#: 信号给出的止损/止盈点位距入场价的合法区间（百分比）。太近会被交易所
+#: 当作无效触发价拒单（或上一根 K 线就扫掉），太远则形同没有保护。
+_MIN_LEVEL_DISTANCE_PCT = 0.05
+_MAX_LEVEL_DISTANCE_PCT = 60.0
+
+
+def _distance_pct(entry: float, level: float) -> float:
+    """返回点位距入场价的百分比距离（绝对值）。"""
+    return abs(level - entry) / entry * 100 if entry > 0 else 0.0
+
+
+def resolve_exit_levels(
+    signal: dict,
+    side: str,
+    entry: float,
+    *,
+    stop_loss_pct: float,
+    take_profit_pct: float,
+) -> tuple[float, float, str]:
+    """解析该用哪个止损/止盈价，返回 (stop_price, take_profit_price, source)。
+
+    优先采用 LLM 信号里给出的点位（更贴合形态），但只在结构上合法时：
+    方向正确（多头 stop < entry < take_profit，空头相反）、为正、
+    且距离落在 _MIN/_MAX_LEVEL_DISTANCE_PCT 之间。任一条件不满足即回退到
+    --stop-loss / --take-profit 两个百分比换算出的价位，source 标 "percent"。
+    """
+    long_side = side != "short"
+    if entry <= 0:
+        return 0.0, 0.0, "percent"
+    pct_stop = entry * (1 - stop_loss_pct / 100) if long_side else entry * (1 + stop_loss_pct / 100)
+    pct_target = entry * (1 + take_profit_pct / 100) if long_side else entry * (1 - take_profit_pct / 100)
+    try:
+        stop = float(signal.get("stop_loss")) if signal.get("stop_loss") is not None else None
+        target = float(signal.get("take_profit")) if signal.get("take_profit") is not None else None
+    except (TypeError, ValueError):
+        return pct_stop, pct_target, "percent"
+    if stop is None or target is None or stop <= 0 or target <= 0:
+        return pct_stop, pct_target, "percent"
+    ordered = stop < entry < target if long_side else target < entry < stop
+    if not ordered:
+        return pct_stop, pct_target, "percent"
+    stop_distance = _distance_pct(entry, stop)
+    target_distance = _distance_pct(entry, target)
+    if not (_MIN_LEVEL_DISTANCE_PCT <= stop_distance <= _MAX_LEVEL_DISTANCE_PCT):
+        return pct_stop, pct_target, "percent"
+    if not (_MIN_LEVEL_DISTANCE_PCT <= target_distance <= _MAX_LEVEL_DISTANCE_PCT):
+        return pct_stop, pct_target, "percent"
+    return stop, target, "signal"
+
+
 def check_exit(
     position: dict,
     price: float,
     *,
-    stop_loss: float,
+    stop_price: float,
     take_profit: float,
     trailing: float,
 ) -> str | None:
-    """方向感知的止盈/止损/移动止盈止损判定，返回平仓原因或 None。
+    """方向感知的止损/止盈/移动止盈判定，返回平仓原因或 None。
 
     position: {"side": "long"|"short", "entry": price, "peak": price}。
-    多头跟踪最高价、空头跟踪最低价；三个阈值均为正百分比。
+    stop_price / take_profit 是**价格**（来自 LLM 信号或百分比兜底，由
+    resolve_exit_levels 决定）；trailing 是移动止盈回撤百分比，多头跟踪
+    最高价、空头跟踪最低价。
     """
     entry = float(position.get("entry") or 0)
-    if entry <= 0 or price <= 0:
+    stop = float(stop_price or 0)
+    target = float(take_profit or 0)
+    if entry <= 0 or price <= 0 or stop <= 0 or target <= 0:
         return None
     side = str(position.get("side") or "long").lower()
     long_side = side != "short"
-    gain_pct = (price - entry) / entry * 100 if long_side else (entry - price) / entry * 100
-    if gain_pct <= -stop_loss:
-        return f"stop-loss {gain_pct:+.1f}% (entry {entry:.4f})"
-    if gain_pct >= take_profit:
-        return f"take-profit {gain_pct:+.1f}% (entry {entry:.4f})"
+    if long_side and price <= stop:
+        return f"stop-loss {price:.4f} <= {stop:.4f} (entry {entry:.4f})"
+    if long_side and price >= target:
+        return f"take-profit {price:.4f} >= {target:.4f} (entry {entry:.4f})"
+    if not long_side and price >= stop:
+        return f"stop-loss {price:.4f} >= {stop:.4f} (entry {entry:.4f})"
+    if not long_side and price <= target:
+        return f"take-profit {price:.4f} <= {target:.4f} (entry {entry:.4f})"
 
     extreme = float(position.get("peak") or entry)
     if long_side:
@@ -395,26 +453,174 @@ def _broker_positions() -> list[dict]:
     return list(payload.get("positions") or [])
 
 
+def _algo_config():
+    """条件单所在 profile 的配置（Binance 把它们放在 Algo 服务里）。"""
+    from src.trading.connectors.binance.sdk import build_config
+
+    return build_config({"profile": "paper", "market_type": "usdm"})
+
+
+def _cancel_algo(order_id: str, profile_id: str | None = None, *, symbol: str | None = None) -> dict:
+    """撤一条条件单：走 Algo 接口，普通撤单接口对它只会回 -2013。
+
+    签名与 service.cancel_order 对齐（profile_id 忽略——本脚本固定用合约测试网
+    profile），这样 disarm_protection 的 cancel 注入点可以直接互换。
+    """
+    from src.trading.connectors.binance.sdk import cancel_algo_order
+
+    return cancel_algo_order(_algo_config(), order_id, symbol=symbol)
+
+
+def _resting_protection_orders() -> dict[str, list[dict]]:
+    """返回 {symbol: [条件单行]} —— 交易所上还挂着的 stop/take-profit。
+
+    这些单**不在**普通挂单接口里：Binance 把条件单放进独立的 Algo 服务，
+    fetch_open_orders() 永远看不到它们（实测踩过）。所以这里必须用
+    get_open_algo_orders()，否则既发现不了已挂的保护，也找不到要撤的兄弟单。
+    """
+    from src.trading.connectors.binance.sdk import get_open_algo_orders
+
+    payload = get_open_algo_orders(_algo_config())
+    if not isinstance(payload, dict) or str(payload.get("status")) != "ok":
+        # 读不到就不敢往下走：否则「读失败」会被当成「没有挂单」，
+        # 既可能重复挂保护，也会漏掉要清理的残留（实测踩过）。
+        raise RuntimeError(str((payload or {}).get("error") or "algo order read failed"))
+    rows = payload.get("orders") or []
+    result: dict[str, list[dict]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        order_type = str(row.get("order_type") or "").strip().lower()
+        if order_type not in ("stop_market", "take_profit_market"):
+            continue
+        symbol = str(row.get("symbol") or "")
+        if symbol:
+            result.setdefault(symbol, []).append(row)
+    return result
+
+
+def disarm_protection(cancel, state: dict, symbol: str, *, trade: bool,
+                      resting_orders: list[dict] | None = None) -> None:
+    """撤掉该品种的条件单：本地记录的 id 加上交易所上的残留。"""
+    tracked = (state.get("protection") or {}).pop(symbol, None) or {}
+    order_ids: dict[str, str] = {}
+    for key in ("stop_order_id", "take_profit_order_id"):
+        if tracked.get(key):
+            order_ids[str(tracked[key])] = key
+    for row in resting_orders or []:
+        order_id = str(row.get("order_id") or "")
+        if order_id:
+            order_ids.setdefault(order_id, str(row.get("order_type") or ""))
+    for order_id, label in order_ids.items():
+        if not trade:
+            _log({"ts": _now(), "symbol": symbol, "status": "dry-run",
+                  "detail": f"would cancel {label} {order_id}"})
+            continue
+        try:
+            result = cancel(order_id, TRADE_PROFILE, symbol=symbol)
+            _log({"ts": _now(), "symbol": symbol, "status": "cancel", "detail": label,
+                  "order_id": order_id, "result": result})
+        except Exception as exc:  # noqa: BLE001 - 撤不掉也不能拖垮循环
+            _log({"ts": _now(), "symbol": symbol, "status": "error",
+                  "detail": f"cancel {label} {order_id}: {exc}"})
+
+
+def arm_protection(place, state: dict, symbol: str, position: dict, *,
+                   stop_price: float, take_profit_price: float,
+                   margin_mode: str, leverage: int, trade: bool) -> None:
+    """给持仓挂上交易所侧的两条 reduce_only 条件单（进程死了也有效）。
+
+    止损用 stop_market、止盈用 take_profit_market，两条都是 reduce_only，
+    所以任何一条成交都只会减仓、不会反向开仓；剩下那条由下一轮的残留清理
+    撤掉（交易所不会自动撤销兄弟单）。
+    """
+    quantity = abs(float(position.get("quantity") or 0))
+    if quantity <= 0 or stop_price <= 0 or take_profit_price <= 0:
+        return
+    close_side = "sell" if position["side"] == "long" else "buy"
+    if not trade:
+        _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
+              "status": "dry-run", "detail": "would arm exchange-side protection",
+              "stop_price": stop_price, "take_profit": take_profit_price})
+        return
+    record: dict = {}
+    for order_type, key, price in (
+        ("stop_market", "stop_order_id", stop_price),
+        ("take_profit_market", "take_profit_order_id", take_profit_price),
+    ):
+        try:
+            result = place(
+                symbol, TRADE_PROFILE, side=close_side, quantity=quantity,
+                order_type=order_type, stop_price=price, reduce_only=True,
+                margin_mode=margin_mode, leverage=leverage,
+                session_id=f"futures-protect-{int(time.time())}",
+            )
+            _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
+                  "status": "protect", "detail": order_type, "stop_price": price,
+                  "result": result})
+            if str((result or {}).get("status")) == "ok":
+                record[key] = (result or {}).get("order_id")
+        except Exception as exc:  # noqa: BLE001 - 挂不上就靠脚本侧兜底
+            _log({"ts": _now(), "symbol": symbol, "status": "error",
+                  "detail": f"{order_type} at {price}: {exc}"})
+    if record:
+        state.setdefault("protection", {})[symbol] = {
+            **record,
+            "stop_price": stop_price,
+            "take_profit": take_profit_price,
+            "quantity": quantity,
+        }
+
+
 def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                      stop_loss: float, take_profit: float, trailing: float,
-                     margin_mode: str, leverage: int) -> None:
-    """每轮先对券商持仓做止盈止损，触发即以 reduce_only 平仓。"""
+                     margin_mode: str, leverage: int, protection: bool) -> None:
+    """每轮先管持仓：触发止盈止损就以 reduce_only 平仓，未触发则确保有交易所侧保护。"""
     from src.trading.service import place_order
 
-    positions = state.get("positions") or {}
-    for symbol, broker_position in positions.items():
+    resting = _resting_protection_orders() if protection else {}
+    for symbol, broker_position in list((state.get("positions") or {}).items()):
         price = prices.get(symbol)
         if not price or price <= 0:
             continue
+        tracked = (state.get("protection") or {}).get(symbol) or {}
+        if tracked.get("stop_price") and tracked.get("take_profit"):
+            stop_price = float(tracked["stop_price"])
+            target = float(tracked["take_profit"])
+        else:
+            # 首次接管或本地文件丢失：用 --stop-loss/--take-profit 从入场价换算
+            stop_price, target, _ = resolve_exit_levels(
+                {},
+                broker_position["side"],
+                float(broker_position["entry"]),
+                stop_loss_pct=stop_loss,
+                take_profit_pct=take_profit,
+            )
         held = {
             "side": broker_position["side"],
             "entry": broker_position["entry"],
             "peak": (state.get("peaks") or {}).get(symbol) or broker_position["entry"],
         }
-        reason = check_exit(held, price, stop_loss=stop_loss, take_profit=take_profit, trailing=trailing)
+        reason = check_exit(held, price, stop_price=stop_price, take_profit=target, trailing=trailing)
         state.setdefault("peaks", {})[symbol] = held["peak"]
         if not reason:
+            if not protection:
+                continue
+            held_orders = resting.get(symbol) or []
+            have = {str(row.get("order_type") or "").strip().lower() for row in held_orders}
+            if have == {"stop_market", "take_profit_market"}:
+                continue  # 两条都在，无需动作
+            if have:
+                # 只剩一条（兄弟单成交/被手动撤掉）：先清干净再重挂，避免残缺状态
+                disarm_protection(_cancel_algo, state, symbol, trade=trade, resting_orders=held_orders)
+            arm_protection(
+                place_order, state, symbol, broker_position,
+                stop_price=stop_price, take_profit_price=target,
+                margin_mode=margin_mode, leverage=leverage, trade=trade,
+            )
             continue
+        # 触发：先撤交易所侧挂单，再市价平仓（避免两边同时动作）
+        disarm_protection(_cancel_algo, state, symbol, trade=trade, resting_orders=resting.get(symbol))
         quantity = abs(float(broker_position["quantity"]))
         if quantity <= 0:
             continue
@@ -440,7 +646,7 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
 
 def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               stop_loss: float, take_profit: float, trailing: float,
-              margin_mode: str, leverage: int) -> None:
+              margin_mode: str, leverage: int, protection: bool = True) -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
     from src.trading.service import place_order
 
@@ -461,6 +667,19 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         for row in raw_positions
         if row.get("symbol") and float(row.get("quantity") or 0) != 0
     }
+
+    # 1b) 交易所侧残留：仓位已经没了，止损/止盈还挂在那儿 → 撤掉
+    if protection:
+        try:
+            resting = _resting_protection_orders()
+        except Exception as exc:  # noqa: BLE001 - 不知道残余保护就不动仓（fail-closed）
+            _log({"ts": _now(), "round": "error", "detail": f"algo orders: {exc}"})
+            return
+        for symbol in [sym for sym in resting if sym not in state["positions"]]:
+            _log({"ts": _now(), "symbol": symbol, "status": "cleanup",
+                  "detail": "position closed; cancelling leftover protection"})
+            disarm_protection(_cancel_algo, state, symbol, trade=trade,
+                              resting_orders=resting.get(symbol))
 
     # 2) 选品与快照
     symbols = symbols_arg or fetch_top_symbols(ex, top)
@@ -486,6 +705,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
     manage_positions(
         state, prices, trade=trade, stop_loss=stop_loss, take_profit=take_profit,
         trailing=trailing, margin_mode=margin_mode, leverage=leverage,
+        protection=protection,
     )
     save_state(state)
 
@@ -562,8 +782,23 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                 filled = float(result.get("filled") or 0) or quantity
                 entry = float(result.get("price") or price or 0)
                 if entry > 0 and filled > 0:
-                    state["positions"][symbol] = {"side": side, "quantity": filled, "entry": entry}
+                    position = {"side": side, "quantity": filled, "entry": entry}
+                    state["positions"][symbol] = position
                     state.setdefault("peaks", {})[symbol] = entry
+                    if protection:
+                        # 立刻把保护挂到交易所：进程死了它也还在
+                        stop_price, target, source = resolve_exit_levels(
+                            signal, side, entry,
+                            stop_loss_pct=stop_loss, take_profit_pct=take_profit,
+                        )
+                        _log({"ts": _now(), "symbol": symbol, "status": "levels",
+                              "detail": source, "stop_price": stop_price,
+                              "take_profit": target})
+                        arm_protection(
+                            place_order, state, symbol, position,
+                            stop_price=stop_price, take_profit_price=target,
+                            margin_mode=margin_mode, leverage=leverage, trade=trade,
+                        )
         except Exception as exc:  # noqa: BLE001 - 单笔失败继续循环
             _log({"ts": _now(), "symbol": symbol, "side": side, "quantity": quantity,
                   "status": "error", "detail": str(exc)})
@@ -588,37 +823,73 @@ class _FakeMarketExchange:
 
 
 def _selftest() -> None:
-    """离线自测：方向感知的止盈止损 + 名义额/最小量校验（不触网）。"""
-    # 多头：跌 6% (>5) 触发止损
-    assert check_exit({"side": "long", "entry": 100.0}, 94.0, stop_loss=5, take_profit=8, trailing=3)
-    # 多头：跌 4% 不触发
-    assert check_exit({"side": "long", "entry": 100.0}, 96.0, stop_loss=5, take_profit=8, trailing=3) is None
-    # 多头：涨 9% 触发止盈
-    assert check_exit({"side": "long", "entry": 100.0}, 109.0, stop_loss=5, take_profit=8, trailing=3)
-    # 空头：价格上涨才是亏损，涨 6% 触发止损
-    assert check_exit({"side": "short", "entry": 100.0}, 106.0, stop_loss=5, take_profit=8, trailing=3)
-    # 空头：跌 9% 触发止盈
-    assert check_exit({"side": "short", "entry": 100.0}, 91.0, stop_loss=5, take_profit=8, trailing=3)
-    # 空头：跌 4% 不触发
-    assert check_exit({"side": "short", "entry": 100.0}, 96.0, stop_loss=5, take_profit=8, trailing=3) is None
+    """离线自测：方向感知的止损/止盈、点位解析、名义额/最小量校验（不触网）。"""
+    # 多头：价格跌破止损价
+    long_pos = {"side": "long", "entry": 100.0}
+    assert check_exit(long_pos, 94.0, stop_price=95.0, take_profit=108.0, trailing=3)
+    # 多头：未跌破止损也未到止盈
+    assert check_exit(long_pos, 96.0, stop_price=95.0, take_profit=108.0, trailing=3) is None
+    # 多头：触及止盈
+    assert check_exit(long_pos, 109.0, stop_price=95.0, take_profit=108.0, trailing=3)
+    # 空头：涨过止损价才是亏损
+    short_pos = {"side": "short", "entry": 100.0}
+    assert check_exit(short_pos, 106.0, stop_price=105.0, take_profit=92.0, trailing=3)
+    # 空头：触及止盈
+    assert check_exit(short_pos, 91.0, stop_price=105.0, take_profit=92.0, trailing=3)
+    # 空头：中间区域不动
+    assert check_exit(short_pos, 96.0, stop_price=105.0, take_profit=92.0, trailing=3) is None
 
-    # 多头移动止盈：peak 120 → 115（回撤 4.2% > 3）触发
+    # 移动止盈（多头）：peak 120 → 115（回撤 4.2% > 3）
     assert check_exit({"side": "long", "entry": 115.0, "peak": 120.0}, 115.0,
-                      stop_loss=5, take_profit=8, trailing=3)
-    # 多头未创新高前（peak == entry）不因小回撤离场
-    assert check_exit({"side": "long", "entry": 100.0}, 97.0, stop_loss=5, take_profit=8, trailing=3) is None
-    # 多头创新高：peak 上移且不触发
+                      stop_price=100.0, take_profit=130.0, trailing=3)
+    # 未创新高前（peak == entry）不因小回撤离场
+    assert check_exit({"side": "long", "entry": 100.0}, 97.0,
+                      stop_price=90.0, take_profit=120.0, trailing=3) is None
+    # 创新高：peak 上移且不触发
     rising = {"side": "long", "entry": 112.0, "peak": 112.0}
-    assert check_exit(rising, 114.0, stop_loss=5, take_profit=8, trailing=3) is None
+    assert check_exit(rising, 114.0, stop_price=100.0, take_profit=130.0, trailing=3) is None
     assert rising["peak"] == 114.0
 
-    # 空头移动止盈：谷值 80 → 84（反弹 5% > 3）触发
+    # 移动止盈（空头）：谷值 80 → 84（反弹 5% > 3）
     assert check_exit({"side": "short", "entry": 85.0, "peak": 80.0}, 84.0,
-                      stop_loss=5, take_profit=8, trailing=3)
-    # 空头创新低：谷值下移且不触发
+                      stop_price=90.0, take_profit=75.0, trailing=3)
+    # 创新低：谷值下移且不触发
     falling = {"side": "short", "entry": 85.0, "peak": 85.0}
-    assert check_exit(falling, 82.0, stop_loss=5, take_profit=8, trailing=3) is None
+    assert check_exit(falling, 82.0, stop_price=90.0, take_profit=75.0, trailing=3) is None
     assert falling["peak"] == 82.0
+
+    # 点位解析：合法的信号价优先采用
+    stop, target, source = resolve_exit_levels(
+        {"stop_loss": 95.0, "take_profit": 110.0}, "long", 100.0,
+        stop_loss_pct=5, take_profit_pct=8,
+    )
+    assert source == "signal" and (stop, target) == (95.0, 110.0)
+    stop, target, source = resolve_exit_levels(
+        {"stop_loss": 105.0, "take_profit": 90.0}, "short", 100.0,
+        stop_loss_pct=5, take_profit_pct=8,
+    )
+    assert source == "signal" and (stop, target) == (105.0, 90.0)
+    # 方向反了 → 回退百分比
+    stop, target, source = resolve_exit_levels(
+        {"stop_loss": 105.0, "take_profit": 90.0}, "long", 100.0,
+        stop_loss_pct=5, take_profit_pct=8,
+    )
+    assert source == "percent" and (round(stop, 4), round(target, 4)) == (95.0, 108.0)
+    # 缺失点位 → 回退百分比
+    stop, target, source = resolve_exit_levels({}, "long", 100.0, stop_loss_pct=5, take_profit_pct=8)
+    assert source == "percent" and (round(stop, 4), round(target, 4)) == (95.0, 108.0)
+    # 贴得太近（距离 < 0.05%）→ 回退百分比
+    stop, target, source = resolve_exit_levels(
+        {"stop_loss": 99.99, "take_profit": 110.0}, "long", 100.0,
+        stop_loss_pct=5, take_profit_pct=8,
+    )
+    assert source == "percent"
+    # 非数字 → 回退百分比
+    stop, target, source = resolve_exit_levels(
+        {"stop_loss": "soon", "take_profit": None}, "long", 100.0,
+        stop_loss_pct=5, take_profit_pct=8,
+    )
+    assert source == "percent"
 
     # 数量换算：名义额 → 数量，按精度取整
     ex = _FakeMarketExchange(
@@ -665,6 +936,8 @@ def main() -> int:
     parser.add_argument("--leverage", type=int, default=5, help="杠杆倍数（默认 5）")
     parser.add_argument("--margin-mode", default="isolated", choices=("isolated", "cross"),
                         help="保证金模式（默认 isolated）")
+    parser.add_argument("--no-protection", action="store_true",
+                        help="不挂交易所侧条件单（只靠脚本轮询止损；默认会挂）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
     args = parser.parse_args()
 
@@ -682,7 +955,8 @@ def main() -> int:
           f"每 {args.interval}s 一轮 | 最多 {args.runs} 轮")
     print(f"[futures-loop] 读 profile {READ_PROFILE} | 下单 profile {TRADE_PROFILE}")
     print(f"[futures-loop] {args.margin_mode} {args.leverage}x | 止损 {args.stop_loss}% | "
-          f"止盈 {args.take_profit}% | 移动止盈回撤 {args.trailing}%")
+          f"止盈 {args.take_profit}% | 移动止盈回撤 {args.trailing}% | "
+          f"交易所侧保护 {'关' if args.no_protection else '开'}")
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
 
@@ -697,7 +971,7 @@ def main() -> int:
                     ex, llm, trade=args.trade, top=args.top, symbols_arg=symbols_arg,
                     stop_loss=args.stop_loss, take_profit=args.take_profit,
                     trailing=args.trailing, margin_mode=args.margin_mode,
-                    leverage=args.leverage,
+                    leverage=args.leverage, protection=not args.no_protection,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})
