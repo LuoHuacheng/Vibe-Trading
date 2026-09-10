@@ -1531,13 +1531,33 @@
       "colPnl": "P/L não realizado",
       "colData": "Dados",
       "priced": "Com preço",
-      "unpriced": "Sem preço"
+      "unpriced": "Sem preço",
+      "exposure": "exposição nocional",
+      "hideUnpriced": "Ocultar sem preço",
+      "allTypes": "Todos os tipos",
+      "refresh": "Atualizar"
     },
     "history": {
       "title": "Histórico de ativos",
       "hint": "Apenas instantâneos completos; as alterações podem incluir fluxos de caixa.",
       "count": "Instantâneos completos {{count}}",
       "empty": "O histórico começa após uma atualização completa"
+    },
+    "traded": {
+      "title": "Histórico de negociações",
+      "subtitle": "Todos os ativos negociados nesta conta — posições encerradas primeiro.",
+      "refresh": "Atualizar",
+      "empty": "Nenhum ativo negociado ainda",
+      "colSymbol": "Símbolo",
+      "colStatus": "Status",
+      "colTrades": "Execuções",
+      "colBuy": "Total de compras",
+      "colSell": "Total de vendas",
+      "colRealized": "P/L realizado",
+      "colLast": "Última negociação",
+      "open": "Aberto",
+      "closed": "Encerrado",
+      "fillsDetail": "{{buys}} compras / {{sells}} vendas"
     },
     "credentials": {
       "title": "Conexões e credenciais",

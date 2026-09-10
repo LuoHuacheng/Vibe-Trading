@@ -77,6 +77,8 @@ export interface PortfolioPosition {
   market_price?: number | null;
   market_value_usd: number;
   market_value_cny: number;
+  /** Notional exposure of a derivative position; absent for spot holdings. */
+  exposure_usd?: number | null;
   unrealized_pnl_usd?: number | null;
   priced: boolean;
   updated_at: string;
@@ -109,6 +111,8 @@ export interface PortfolioAccount {
   total_usd?: number | null;
   total_cny?: number | null;
   priced_value_usd?: number;
+  /** Gross notional of derivative positions; never part of the account total. */
+  exposure_usd?: number;
   cash_usd?: number;
   unpriced_or_other_usd?: number;
   position_count?: number;

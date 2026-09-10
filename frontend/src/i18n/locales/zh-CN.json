@@ -1532,6 +1532,7 @@
       "colData": "数据状态",
       "priced": "已定价",
       "unpriced": "未定价",
+      "exposure": "名义敞口",
       "hideUnpriced": "隐藏未定价",
       "allTypes": "全部类别",
       "refresh": "刷新"

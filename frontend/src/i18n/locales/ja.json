@@ -1532,6 +1532,7 @@
       "colData": "データ",
       "priced": "評価済み",
       "unpriced": "未評価",
+      "exposure": "想定エクスポージャー",
       "hideUnpriced": "未評価を隠す",
       "allTypes": "すべてのタイプ",
       "refresh": "更新"

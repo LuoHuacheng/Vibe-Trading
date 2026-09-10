@@ -1532,6 +1532,7 @@
       "colData": "Data",
       "priced": "Priced",
       "unpriced": "Unpriced",
+      "exposure": "notional exposure",
       "hideUnpriced": "Hide unpriced",
       "allTypes": "All types",
       "refresh": "Refresh"

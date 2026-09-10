@@ -1532,6 +1532,7 @@
       "colData": "Datos",
       "priced": "Con precio",
       "unpriced": "Sin precio",
+      "exposure": "exposición nocional",
       "hideUnpriced": "Ocultar sin precio",
       "allTypes": "Todos los tipos",
       "refresh": "Actualizar"

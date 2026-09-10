@@ -1532,6 +1532,7 @@
       "colData": "Daten",
       "priced": "Bewertet",
       "unpriced": "Ohne Kurs",
+      "exposure": "Nominales Engagement",
       "hideUnpriced": "Unbewertete ausblenden",
       "allTypes": "Alle Typen",
       "refresh": "Aktualisieren"

@@ -1532,6 +1532,7 @@
       "colData": "البيانات",
       "priced": "مُسعَّر",
       "unpriced": "غير مُسعَّر",
+      "exposure": "التعرض الاسمي",
       "hideUnpriced": "إخفاء غير المُسعّرة",
       "allTypes": "كل الأنواع",
       "refresh": "تحديث"

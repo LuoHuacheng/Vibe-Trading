@@ -1532,6 +1532,7 @@
       "colData": "데이터",
       "priced": "평가 완료",
       "unpriced": "미평가",
+      "exposure": "명목 익스포저",
       "hideUnpriced": "미평가 숨기기",
       "allTypes": "모든 유형",
       "refresh": "새로고침"
