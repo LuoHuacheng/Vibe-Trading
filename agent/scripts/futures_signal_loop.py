@@ -406,8 +406,9 @@ def check_exit(
 
     position: {"side": "long"|"short", "entry": price, "peak": price}。
     stop_price / take_profit 是**价格**（来自 LLM 信号或百分比兜底，由
-    resolve_exit_levels 决定）；trailing 是移动止盈回撤百分比，多头跟踪
-    最高价、空头跟踪最低价。
+    resolve_exit_levels 决定）；trailing 是移动止盈回撤百分比（多头跟踪
+    最高价、空头跟踪最低价），传 0 表示禁用——交易所侧移动止损在跑时由它
+    接管，两边不能同时裁决。
     """
     entry = float(position.get("entry") or 0)
     stop = float(stop_price or 0)
@@ -424,6 +425,9 @@ def check_exit(
         return f"stop-loss {price:.4f} >= {stop:.4f} (entry {entry:.4f})"
     if not long_side and price <= target:
         return f"take-profit {price:.4f} <= {target:.4f} (entry {entry:.4f})"
+
+    if not trailing or trailing <= 0:
+        return None
 
     extreme = float(position.get("peak") or entry)
     if long_side:
@@ -514,12 +518,33 @@ def _resting_protection_orders() -> dict[str, list[dict]]:
     return result
 
 
+#: 每个条件单类型在本地状态里对应的键。
+_LEG_KEYS = {
+    "stop_market": "stop_order_id",
+    "take_profit_market": "take_profit_order_id",
+    "trailing_stop_market": "trailing_order_id",
+}
+
+#: 保护模式 → 要挂在交易所上的条件单类型。
+_PROTECTION_LEGS = {
+    "fixed": ("stop_market", "take_profit_market"),
+    "trailing": ("trailing_stop_market", "take_profit_market"),
+    "both": ("stop_market", "trailing_stop_market", "take_profit_market"),
+    "off": (),
+}
+
+
+def protection_legs(mode: str) -> tuple[str, ...]:
+    """返回该保护模式下应挂在交易所的条件单类型（未知模式按 fixed）。"""
+    return _PROTECTION_LEGS.get(str(mode or "").strip().lower(), _PROTECTION_LEGS["fixed"])
+
+
 def disarm_protection(cancel, state: dict, symbol: str, *, trade: bool,
                       resting_orders: list[dict] | None = None) -> None:
     """撤掉该品种的条件单：本地记录的 id 加上交易所上的残留。"""
     tracked = (state.get("protection") or {}).pop(symbol, None) or {}
     order_ids: dict[str, str] = {}
-    for key in ("stop_order_id", "take_profit_order_id"):
+    for key in _LEG_KEYS.values():
         if tracked.get(key):
             order_ids[str(tracked[key])] = key
     for row in resting_orders or []:
@@ -541,59 +566,81 @@ def disarm_protection(cancel, state: dict, symbol: str, *, trade: bool,
 
 
 def arm_protection(place, state: dict, symbol: str, position: dict, *,
-                   stop_price: float, take_profit_price: float,
-                   margin_mode: str, leverage: int, trade: bool) -> None:
-    """给持仓挂上交易所侧的两条 reduce_only 条件单（进程死了也有效）。
+                   mode: str, stop_price: float, take_profit_price: float,
+                   trailing_pct: float, margin_mode: str, leverage: int, trade: bool) -> None:
+    """按保护模式给持仓挂 reduce_only 条件单（进程死了也有效）。
 
-    止损用 stop_market、止盈用 take_profit_market，两条都是 reduce_only，
-    所以任何一条成交都只会减仓、不会反向开仓；剩下那条由下一轮的残留清理
-    撤掉（交易所不会自动撤销兄弟单）。
+    fixed    : stop_market + take_profit_market（固定止损 + 止盈）
+    trailing : trailing_stop_market（交易所自己跟市价、回调 trailing_pct%）+ 止盈
+    both     : 三者都挂（移动单被撤/失效时仍有固定底线）
+
+    所有腿都是 reduce_only，任何一条成交只会减仓、不会反向开仓；兄弟单由
+    下一轮的残留清理撤掉（交易所不会自动撤）。
     """
     quantity = abs(float(position.get("quantity") or 0))
-    if quantity <= 0 or stop_price <= 0 or take_profit_price <= 0:
+    legs = protection_legs(mode)
+    if quantity <= 0 or take_profit_price <= 0 or ("stop_market" in legs and stop_price <= 0):
+        return
+    if "trailing_stop_market" in legs and not (0.1 <= trailing_pct <= 5.0):
+        # Binance only accepts a 0.1..5.0 callback; refuse here with a reason
+        # instead of letting the exchange reject a half-armed set.
+        _log({"ts": _now(), "symbol": symbol, "status": "error",
+              "detail": f"trailing {trailing_pct}% outside Binance's 0.1-5.0 callback range"})
         return
     close_side = "sell" if position["side"] == "long" else "buy"
+    plan: list[tuple[str, dict, float]] = []
+    for order_type in legs:
+        if order_type == "take_profit_market":
+            plan.append((order_type, {"stop_price": take_profit_price}, take_profit_price))
+        elif order_type == "trailing_stop_market":
+            plan.append((order_type, {"callback_rate": trailing_pct}, trailing_pct))
+        else:
+            plan.append((order_type, {"stop_price": stop_price}, stop_price))
     if not trade:
         _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
               "status": "dry-run", "detail": "would arm exchange-side protection",
-              "stop_price": stop_price, "take_profit": take_profit_price})
+              "legs": [item[0] for item in plan], "stop_price": stop_price,
+              "take_profit": take_profit_price, "trailing": trailing_pct})
         return
     record: dict = {}
-    for order_type, key, price in (
-        ("stop_market", "stop_order_id", stop_price),
-        ("take_profit_market", "take_profit_order_id", take_profit_price),
-    ):
+    for order_type, extra, price in plan:
         try:
             result = place(
                 symbol, TRADE_PROFILE, side=close_side, quantity=quantity,
-                order_type=order_type, stop_price=price, reduce_only=True,
+                order_type=order_type, reduce_only=True,
                 margin_mode=margin_mode, leverage=leverage,
-                session_id=f"futures-protect-{int(time.time())}",
+                session_id=f"futures-protect-{int(time.time())}", **extra,
             )
             _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
-                  "status": "protect", "detail": order_type, "stop_price": price,
+                  "status": "protect", "detail": order_type, "price": price,
                   "result": result})
             if str((result or {}).get("status")) == "ok":
-                record[key] = (result or {}).get("order_id")
+                record[_LEG_KEYS[order_type]] = (result or {}).get("order_id")
         except Exception as exc:  # noqa: BLE001 - 挂不上就靠脚本侧兜底
             _log({"ts": _now(), "symbol": symbol, "status": "error",
                   "detail": f"{order_type} at {price}: {exc}"})
     if record:
         state.setdefault("protection", {})[symbol] = {
             **record,
+            "mode": mode,
             "stop_price": stop_price,
             "take_profit": take_profit_price,
+            "trailing": trailing_pct,
             "quantity": quantity,
         }
 
 
 def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                      stop_loss: float, take_profit: float, trailing: float,
-                     margin_mode: str, leverage: int, protection: bool) -> None:
+                     margin_mode: str, leverage: int, protection: str) -> None:
     """每轮先管持仓：触发止盈止损就以 reduce_only 平仓，未触发则确保有交易所侧保护。"""
     from src.trading.service import place_order
 
-    resting = _resting_protection_orders() if protection else {}
+    legs = protection_legs(protection)
+    # 交易所侧移动止损在跑时，脚本侧那条就得让位：两边各按自己的极值算，
+    # 同时开会互相打架（脚本会先平仓并把交易所单撤掉）。
+    script_trailing = 0.0 if "trailing_stop_market" in legs else trailing
+    resting = _resting_protection_orders() if legs else {}
     for symbol, broker_position in list((state.get("positions") or {}).items()):
         price = prices.get(symbol)
         if not price or price <= 0:
@@ -616,22 +663,23 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
             "entry": broker_position["entry"],
             "peak": (state.get("peaks") or {}).get(symbol) or broker_position["entry"],
         }
-        reason = check_exit(held, price, stop_price=stop_price, take_profit=target, trailing=trailing)
+        reason = check_exit(held, price, stop_price=stop_price, take_profit=target, trailing=script_trailing)
         state.setdefault("peaks", {})[symbol] = held["peak"]
         if not reason:
-            if not protection:
+            if not legs:
                 continue
             held_orders = resting.get(symbol) or []
             have = {str(row.get("order_type") or "").strip().lower() for row in held_orders}
-            if have == {"stop_market", "take_profit_market"}:
-                continue  # 两条都在，无需动作
+            if have == set(legs):
+                continue  # 该模式要的腿都在，无需动作
             if have:
-                # 只剩一条（兄弟单成交/被手动撤掉）：先清干净再重挂，避免残缺状态
+                # 只剩部分腿（兄弟单成交/被手动撤掉）：先清干净再重挂，避免残缺状态
                 disarm_protection(_cancel_algo, state, symbol, trade=trade, resting_orders=held_orders)
             arm_protection(
                 place_order, state, symbol, broker_position,
-                stop_price=stop_price, take_profit_price=target,
-                margin_mode=margin_mode, leverage=leverage, trade=trade,
+                mode=protection, stop_price=stop_price, take_profit_price=target,
+                trailing_pct=trailing, margin_mode=margin_mode, leverage=leverage,
+                trade=trade,
             )
             continue
         # 触发：先撤交易所侧挂单，再市价平仓（避免两边同时动作）
@@ -661,7 +709,7 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
 
 def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               stop_loss: float, take_profit: float, trailing: float,
-              margin_mode: str, leverage: int, protection: bool = True) -> None:
+              margin_mode: str, leverage: int, protection: str = "fixed") -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
     from src.trading.service import place_order
 
@@ -684,7 +732,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
     }
 
     # 1b) 交易所侧残留：仓位已经没了，止损/止盈还挂在那儿 → 撤掉
-    if protection:
+    if protection_legs(protection):
         try:
             resting = _resting_protection_orders()
         except Exception as exc:  # noqa: BLE001 - 不知道残余保护就不动仓（fail-closed）
@@ -800,7 +848,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                     position = {"side": side, "quantity": filled, "entry": entry}
                     state["positions"][symbol] = position
                     state.setdefault("peaks", {})[symbol] = entry
-                    if protection:
+                    if protection_legs(protection):
                         # 立刻把保护挂到交易所：进程死了它也还在
                         stop_price, target, source = resolve_exit_levels(
                             signal, side, entry,
@@ -811,7 +859,8 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                               "take_profit": target})
                         arm_protection(
                             place_order, state, symbol, position,
-                            stop_price=stop_price, take_profit_price=target,
+                            mode=protection, stop_price=stop_price,
+                            take_profit_price=target, trailing_pct=trailing,
                             margin_mode=margin_mode, leverage=leverage, trade=trade,
                         )
         except Exception as exc:  # noqa: BLE001 - 单笔失败继续循环
@@ -906,6 +955,19 @@ def _selftest() -> None:
     )
     assert source == "percent"
 
+    # 保护模式 → 该挂哪几条腿
+    assert protection_legs("fixed") == ("stop_market", "take_profit_market")
+    assert protection_legs("trailing") == ("trailing_stop_market", "take_profit_market")
+    assert protection_legs("both") == ("stop_market", "trailing_stop_market", "take_profit_market")
+    assert protection_legs("off") == ()
+    assert protection_legs("nonsense") == ("stop_market", "take_profit_market")
+
+    # 交易所侧移动止损在跑时，脚本侧那条必须让位（trailing=0 即禁用）
+    armed = {"side": "long", "entry": 115.0, "peak": 120.0}
+    assert check_exit(armed, 115.0, stop_price=100.0, take_profit=130.0, trailing=0) is None
+    assert check_exit({"side": "long", "entry": 115.0, "peak": 120.0}, 115.0,
+                      stop_price=100.0, take_profit=130.0, trailing=3) is not None
+
     # 数量换算：名义额 → 数量，按精度取整
     ex = _FakeMarketExchange(
         {"BTC/USDT:USDT": {"limits": {"amount": {"min": 0.001}, "cost": {"min": 100}}}},
@@ -951,8 +1013,11 @@ def main() -> int:
     parser.add_argument("--leverage", type=int, default=5, help="杠杆倍数（默认 5）")
     parser.add_argument("--margin-mode", default="isolated", choices=("isolated", "cross"),
                         help="保证金模式（默认 isolated）")
+    parser.add_argument("--protection", default="fixed", choices=("fixed", "trailing", "both", "off"),
+                        help="交易所侧保护：fixed=固定止损+止盈（默认）、trailing=移动止损+止盈"
+                             "（推荐）、both=三者都挂、off=不挂")
     parser.add_argument("--no-protection", action="store_true",
-                        help="不挂交易所侧条件单（只靠脚本轮询止损；默认会挂）")
+                        help="等同 --protection off（只靠脚本轮询止损）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
     args = parser.parse_args()
 
@@ -963,6 +1028,12 @@ def main() -> int:
     from src.providers.llm import build_llm
     from src.trading.connectors.binance.sdk import _exchange, build_config
 
+    protection_mode = "off" if args.no_protection else args.protection
+    if "trailing_stop_market" in protection_legs(protection_mode) and not (0.1 <= args.trailing <= 5.0):
+        print(f"[futures-loop] --trailing {args.trailing}% 超出 Binance 的回调区间 0.1~5.0，"
+              f"请改小或改用 --protection fixed")
+        return 2
+
     symbols_arg = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
     llm = build_llm()
     ex = _exchange(build_config({"profile": "paper", "market_type": "usdm"}))
@@ -971,7 +1042,8 @@ def main() -> int:
     print(f"[futures-loop] 读 profile {READ_PROFILE} | 下单 profile {TRADE_PROFILE}")
     print(f"[futures-loop] {args.margin_mode} {args.leverage}x | 止损 {args.stop_loss}% | "
           f"止盈 {args.take_profit}% | 移动止盈回撤 {args.trailing}% | "
-          f"交易所侧保护 {'关' if args.no_protection else '开'}")
+          f"交易所侧保护 {protection_mode}"
+          + (f"（{'/'.join(protection_legs(protection_mode))}）" if protection_legs(protection_mode) else ""))
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
 
@@ -986,7 +1058,7 @@ def main() -> int:
                     ex, llm, trade=args.trade, top=args.top, symbols_arg=symbols_arg,
                     stop_loss=args.stop_loss, take_profit=args.take_profit,
                     trailing=args.trailing, margin_mode=args.margin_mode,
-                    leverage=args.leverage, protection=not args.no_protection,
+                    leverage=args.leverage, protection=protection_mode,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})
