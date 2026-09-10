@@ -699,6 +699,7 @@ def place_order(
     limit_price: float | None = None,
     time_in_force: str = "day",
     stop_price: float | None = None,
+    callback_rate: float | None = None,
     margin_mode: str | None = None,
     leverage: int | None = None,
     reduce_only: bool = False,
@@ -734,11 +735,15 @@ def place_order(
         "limit_price": limit_price,
         "time_in_force": time_in_force,
     }
-    if stop_price is not None and "stop_price" in inspect.signature(module.place_order).parameters:
+    placement_params = inspect.signature(module.place_order).parameters
+    if stop_price is not None and "stop_price" in placement_params:
         # Conditional orders (exchange-side stop / take-profit) only exist on
         # connectors that declare the parameter; passing it to the others would
         # be a TypeError instead of a clean error envelope.
         place_kwargs["stop_price"] = stop_price
+    if callback_rate is not None and "callback_rate" in placement_params:
+        # Same seam for the trailing-stop flavour of a conditional order.
+        place_kwargs["callback_rate"] = callback_rate
     if margin_mode is not None:
         place_kwargs["margin_mode"] = margin_mode
     if leverage is not None:

@@ -800,6 +800,7 @@ def place_order(
     leverage: int | None = None,
     reduce_only: bool = False,
     stop_price: float | None = None,
+    callback_rate: float | None = None,
 ) -> dict[str, Any]:
     """Place a spot or USDⓈ-M futures order via ccxt's ``create_order``.
 
@@ -877,13 +878,20 @@ def place_order(
             leverage=leverage,
             reduce_only=reduce_only,
             stop_price=stop_price,
+            callback_rate=callback_rate,
         )
 
-    if margin_mode is not None or leverage is not None or reduce_only or stop_price is not None:
+    if (
+        margin_mode is not None
+        or leverage is not None
+        or reduce_only
+        or stop_price is not None
+        or callback_rate is not None
+    ):
         return {
             "status": "error",
-            "error": "margin_mode/leverage/reduce_only/stop_price are futures-only "
-            "parameters; this is a spot profile.",
+            "error": "margin_mode/leverage/reduce_only/stop_price/callback_rate are "
+            "futures-only parameters; this is a spot profile.",
         }
 
     side_clean = str(side or "").strip().lower()
@@ -983,6 +991,7 @@ def _place_usdm_order(
     leverage: int | None,
     reduce_only: bool,
     stop_price: float | None = None,
+    callback_rate: float | None = None,
 ) -> dict[str, Any]:
     """Place a USDⓈ-M futures order on a tradable (non-Shadow) usdm profile.
 
@@ -998,12 +1007,16 @@ def _place_usdm_order(
         return {"status": "error", "error": "side must be 'buy' or 'sell'."}
 
     type_clean = str(order_type or "").strip().lower()
-    if type_clean not in ("market", "limit", "stop_market", "take_profit_market"):
+    if type_clean not in ("market", "limit", "stop_market", "take_profit_market", "trailing_stop_market"):
         return {
             "status": "error",
-            "error": "order_type must be 'market', 'limit', 'stop_market' or 'take_profit_market'.",
+            "error": (
+                "order_type must be 'market', 'limit', 'stop_market', "
+                "'take_profit_market' or 'trailing_stop_market'."
+            ),
         }
     conditional = type_clean in _CONDITIONAL_ORDER_TYPES
+    trailing = type_clean == "trailing_stop_market"
 
     margin_clean = str(margin_mode or "").strip().lower()
     if not margin_mode or not margin_clean:
@@ -1037,25 +1050,42 @@ def _place_usdm_order(
         return {"status": "error", "error": "USDⓈ-M sell orders require 'quantity', not 'notional'."}
 
     stop_value: float | None = None
+    callback_value: float | None = None
     if conditional:
-        stop_value = _to_float(stop_price)
-        if stop_value is None or stop_value <= 0:
-            return {
-                "status": "error",
-                "error": "stop_price must be a positive number for stop_market/take_profit_market orders.",
-            }
         if notional_given:
             return {"status": "error", "error": "conditional USDⓈ-M orders require 'quantity', not 'notional'."}
         if not reduce_only:
             # A conditional order that is NOT reduce-only can open a fresh
             # position the moment it triggers — with nobody watching and no
             # margin preset applied at trigger time. Refuse that outright.
-            return {
-                "status": "error",
-                "error": "stop_market/take_profit_market orders must set reduce_only=True.",
-            }
-    elif stop_price is not None:
-        return {"status": "error", "error": "stop_price is only valid for conditional order types."}
+            return {"status": "error", "error": "conditional orders must set reduce_only=True."}
+        if trailing:
+            # A trailing stop follows the market itself, so it takes a callback
+            # rate rather than a trigger price. Binance accepts 0.1%..5% only,
+            # so anything outside that is rejected here instead of
+            # round-tripping to the exchange.
+            if stop_price is not None:
+                return {
+                    "status": "error",
+                    "error": "'stop_price' is not valid for trailing_stop_market; use 'callback_rate'.",
+                }
+            callback_value = _to_float(callback_rate)
+            if callback_value is None or not (0.1 <= callback_value <= 5.0):
+                return {
+                    "status": "error",
+                    "error": "callback_rate must be between 0.1 and 5.0 (percent) for trailing_stop_market orders.",
+                }
+        else:
+            stop_value = _to_float(stop_price)
+            if stop_value is None or stop_value <= 0:
+                return {
+                    "status": "error",
+                    "error": "stop_price must be a positive number for stop_market/take_profit_market orders.",
+                }
+            if callback_rate is not None:
+                return {"status": "error", "error": "'callback_rate' is only valid for trailing_stop_market orders."}
+    elif stop_price is not None or callback_rate is not None:
+        return {"status": "error", "error": "stop_price/callback_rate are only valid for conditional order types."}
 
     if type_clean == "limit":
         if notional_given:
@@ -1082,10 +1112,13 @@ def _place_usdm_order(
         amount: float | None = qty_value
         price: float | None = price_value
     elif conditional:
-        # Exchange-side stop / take-profit: the order rests on Binance, so the
-        # protection outlives this process. Sizing is by contract quantity and
-        # reduce_only was enforced above.
-        params["stopPrice"] = stop_value
+        # Exchange-side stop / take-profit / trailing stop: the order rests on
+        # Binance, so the protection outlives this process. Sizing is by
+        # contract quantity and reduce_only was enforced above.
+        if trailing:
+            params["callbackRate"] = callback_value
+        else:
+            params["stopPrice"] = stop_value
         amount = qty_value
         price = None
     elif notional_given:
@@ -1139,6 +1172,7 @@ def _place_usdm_order(
 _CONDITIONAL_ORDER_TYPES = {
     "stop_market": "STOP_MARKET",
     "take_profit_market": "TAKE_PROFIT_MARKET",
+    "trailing_stop_market": "TRAILING_STOP_MARKET",
 }
 
 

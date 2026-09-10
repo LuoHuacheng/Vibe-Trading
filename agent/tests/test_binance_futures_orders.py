@@ -239,6 +239,47 @@ def test_unknown_order_type_is_rejected(fake):
     assert out["status"] == "error" and "order_type" in out["error"]
 
 
+def test_futures_place_trailing_stop_sends_the_callback_rate(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         order_type="trailing_stop_market", callback_rate=3.0,
+                         reduce_only=True, margin_mode="isolated", leverage=5)
+    assert out["status"] == "ok"
+    create = [c for c in fake.calls if c[0] == "create_order"][0]
+    assert create[2] == "TRAILING_STOP_MARKET"
+    assert create[5]["callbackRate"] == 3.0
+    assert create[5]["reduceOnly"] is True
+    assert "stopPrice" not in create[5]
+
+
+def test_trailing_stop_requires_a_callback_rate_in_range(fake):
+    for bad in (None, 0.0, 0.05, 5.5):
+        out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                             order_type="trailing_stop_market", callback_rate=bad,
+                             reduce_only=True, margin_mode="isolated", leverage=5)
+        assert out["status"] == "error" and "callback_rate" in out["error"], (bad, out)
+    assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_trailing_stop_rejects_a_stop_price_and_vice_versa(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         order_type="trailing_stop_market", callback_rate=2.0,
+                         stop_price=59000.0, reduce_only=True,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "stop_price" in out["error"]
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="sell", quantity=0.01,
+                         order_type="stop_market", stop_price=59000.0, callback_rate=2.0,
+                         reduce_only=True, margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "callback_rate" in out["error"]
+    assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_trailing_stop_still_requires_reduce_only(fake):
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         order_type="trailing_stop_market", callback_rate=3.0,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "reduce_only" in out["error"]
+
+
 def test_spot_profile_rejects_stop_price(monkeypatch):
     ex = FakeUsdmOrders()
     monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)

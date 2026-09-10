@@ -763,18 +763,32 @@ class TradingPlaceOrderTool(BaseTool):
             },
             "order_type": {
                 "type": "string",
-                "enum": ["market", "limit", "stop_market", "take_profit_market"],
+                "enum": [
+                    "market",
+                    "limit",
+                    "stop_market",
+                    "take_profit_market",
+                    "trailing_stop_market",
+                ],
                 "default": "market",
                 "description": (
                     "Binance USDⓈ-M futures also accept stop_market / "
-                    "take_profit_market, which rest on the exchange and require "
-                    "stop_price plus reduce_only=true."
+                    "take_profit_market (which rest on the exchange and require "
+                    "stop_price plus reduce_only=true) and trailing_stop_market "
+                    "(which follows the market itself and takes callback_rate)."
                 ),
             },
             "limit_price": {"type": "number", "description": "Required for limit orders."},
             "stop_price": {
                 "type": "number",
                 "description": "Trigger price for stop_market/take_profit_market orders.",
+            },
+            "callback_rate": {
+                "type": "number",
+                "description": (
+                    "Trailing-stop callback in percent (0.1-5.0) for "
+                    "trailing_stop_market orders."
+                ),
             },
             "time_in_force": {"type": "string", "enum": ["day", "gtc"], "default": "day"},
             "margin_mode": {
@@ -838,6 +852,7 @@ class TradingPlaceOrderTool(BaseTool):
                     order_type=str(kwargs.get("order_type") or "market"),
                     limit_price=limit_price,
                     stop_price=_num_or_none(kwargs.get("stop_price"), "stop_price"),
+                    callback_rate=_num_or_none(kwargs.get("callback_rate"), "callback_rate"),
                     time_in_force=str(kwargs.get("time_in_force") or "day"),
                     margin_mode=_connection(kwargs.get("margin_mode")),
                     leverage=leverage,
