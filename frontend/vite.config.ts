@@ -20,7 +20,19 @@ const PROXY_PATHS = [
   "/options",
 ];
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
+  // A dev server must never inherit NODE_ENV=production. Vite then computes
+  // `isProduction: true`, which makes @vitejs/plugin-react skip the React
+  // Refresh preamble (and `config.server.hmr === false` is not involved),
+  // while the Oxc JSX transform — enabled whenever `command === "serve"` —
+  // still emits `$RefreshReg$` calls. Every JSX module then dies with
+  // "Uncaught ReferenceError: $RefreshReg$ is not defined".
+  // Some shells/tooling export NODE_ENV=production globally, so normalize the
+  // dev case here. Only the "production" value is rewritten: builds keep it
+  // (command === "build"), and vitest's NODE_ENV=test is left alone.
+  if (command === "serve" && process.env.NODE_ENV === "production") {
+    process.env.NODE_ENV = "development";
+  }
   const env = loadEnv(mode, process.cwd(), "");
   const apiTarget = env.VITE_API_URL || "http://127.0.0.1:8899";
   const apiProxy = { target: apiTarget, changeOrigin: true };
