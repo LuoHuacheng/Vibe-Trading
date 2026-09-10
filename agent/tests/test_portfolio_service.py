@@ -108,6 +108,105 @@ def test_refresh_aggregates_three_readonly_connectors(tmp_path):
     assert "quantity" not in context["holdings"][0]
 
 
+# --- Plan A: a USDⓈ-M testnet reading on the portfolio page -----------------
+# Two defects met on the same futures row: the perpetual symbol reached the
+# quote chain as BTC/USDT:USDT/USDT (nothing resolves it), and the testnet gift
+# filter compared a pair symbol against a base-asset whitelist, so every
+# futures position was dropped out of pricing and the page showed $0.
+
+
+def _usdm_snapshot(tmp_path, monkeypatch, *, symbol, quantity, top_symbols):
+    settings = PortfolioSettingsStore(tmp_path / "portfolio.json")
+    settings.connection_store.ensure(
+        "binance-futures-paper",
+        "binance-futures-paper-readonly",
+        "Binance USDⓈ-M Testnet · ccxt Read-Only",
+    )
+    settings.save(
+        {
+            "display_currency": "USD",
+            "sources": [{"connection_id": "binance-futures-paper", "order": 0}],
+        }
+    )
+    account = {"status": "ok", "is_testnet": True, "market_type": "usdm", "balances": []}
+    positions = {
+        "status": "ok",
+        "is_testnet": True,
+        "market_type": "usdm",
+        "positions": [
+            {
+                "symbol": symbol,
+                "quantity": quantity,
+                "side": "long",
+                "price": 100.0,
+                "mark_price": 100.0,
+                "unrealized_pnl": 0.0,
+                "leverage": 5,
+                "margin_mode": "isolated",
+            }
+        ],
+    }
+    quoted: list[str] = []
+
+    def get_quote(quote_symbol, profile_id, **kwargs):
+        quoted.append(quote_symbol)
+        return {"quote": {"last": 100.0}}
+
+    monkeypatch.setattr(portfolio_service, "_testnet_top_symbols", lambda: frozenset(top_symbols))
+    service = PortfolioService(
+        PortfolioStore(tmp_path / "portfolio.sqlite3"),
+        settings_store=settings,
+        get_account=lambda profile_id, **kwargs: account,
+        get_positions=lambda profile_id, **kwargs: positions,
+        get_quote=get_quote,
+        fx_fetcher=lambda: (Decimal("7.2"), Decimal("7.8"), "2026-08-10T00:00:00+00:00"),
+    )
+    return service.refresh(), quoted
+
+
+def test_usdm_position_quotes_the_spot_pair_and_prices(tmp_path, monkeypatch):
+    snapshot, quoted = _usdm_snapshot(
+        tmp_path, monkeypatch, symbol="BTC/USDT:USDT", quantity=0.5, top_symbols={"BTC/USDT"}
+    )
+    row = snapshot["positions"][0]
+
+    assert quoted == ["BTC/USDT"]  # not BTC/USDT:USDT/USDT
+    assert row["priced"] is True
+    assert row["market_price"] == 100.0
+    assert row["market_value_usd"] == pytest.approx(50.0)
+
+
+def test_usdm_position_on_a_non_mainstream_base_prices_from_the_top_list(tmp_path, monkeypatch):
+    snapshot, quoted = _usdm_snapshot(
+        tmp_path, monkeypatch, symbol="ALT/USDT:USDT", quantity=2.0, top_symbols={"ALT/USDT"}
+    )
+    row = snapshot["positions"][0]
+
+    assert quoted == ["ALT/USDT"]
+    assert row["priced"] is True
+    assert row["market_value_usd"] == pytest.approx(200.0)
+
+
+def test_binance_perp_normalization_keeps_symbol_and_strips_settlement():
+    from src.portfolio.normalization import normalize_position
+
+    row = normalize_position(
+        "binance",
+        {"symbol": "BTC/USDT:USDT", "quantity": 0.001, "price": 78385.0, "margin_mode": "isolated"},
+    )
+
+    assert row["symbol"] == "BTC/USDT:USDT"
+    assert row["quote_symbol"] == "BTC/USDT"
+
+
+def test_binance_spot_normalization_keeps_its_pair():
+    from src.portfolio.normalization import normalize_position
+
+    row = normalize_position("binance", {"symbol": "BTC", "quantity": 1.0})
+
+    assert row["quote_symbol"] == "BTC/USDT"
+
+
 def test_latest_enriches_legacy_snapshot_with_current_compatibility(tmp_path):
     store = PortfolioStore(tmp_path / "portfolio.sqlite3")
     settings = _settings_store(tmp_path)

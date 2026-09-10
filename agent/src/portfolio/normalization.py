@@ -39,6 +39,18 @@ MAINSTREAM_CRYPTO = frozenset(
     }
 )
 
+def _binance_quote_symbol(symbol: str) -> str:
+    """Return the spot-form pair the quote chain speaks for a Binance symbol.
+
+    A USDⓈ-M perpetual symbol is BASE/QUOTE:SETTLE (BTC/USDT:USDT), so the
+    spot pair is everything before the colon. Appending /USDT to the whole
+    perpetual string yields BTC/USDT:USDT/USDT, which no quote endpoint
+    resolves. A bare balance asset (BTC, the spot shape) still gets the suffix.
+    """
+    pair = symbol.split(":", 1)[0]
+    return pair if "/" in pair else f"{pair}/USDT"
+
+
 _TRANSPORT_AUTH = {
     "remote_mcp": ("OAuth", "automatic"),
     "local_tws": ("Local broker session", "session"),
@@ -177,7 +189,9 @@ def normalize_position(broker: str, row: dict[str, Any]) -> dict[str, Any]:
     return {
         "broker": broker,
         "symbol": symbol,
-        "quote_symbol": str(row.get("quote_symbol") or (f"{symbol}/USDT" if broker == "binance" else symbol)),
+        "quote_symbol": str(
+            row.get("quote_symbol") or (_binance_quote_symbol(symbol) if broker == "binance" else symbol)
+        ),
         "name": str(
             row.get("name")
             or row.get("symbol_name")

@@ -1046,13 +1046,20 @@ class PortfolioService:
                     # （覆盖信号循环开仓品种）∪ 静态白名单；高价赠送币即使成交额
                     # 高也显式排除（否则 WBTC/PAXG 的"每币 1 个"赠送仓位会把总
                     # 资产抬到几十万美元）。
+                    # The whitelist and the gift list are keyed by base asset,
+                    # while a USDⓈ-M position reports a pair (BTC/USDT:USDT).
+                    # Comparing the raw symbol against a base-asset set can
+                    # never match, which dropped every futures position out of
+                    # pricing; the top-volume test compares spot pairs, so it
+                    # uses the row's quote symbol.
+                    base_asset = normalized["symbol"].split("/", 1)[0].split(":", 1)[0]
                     if (
                         broker in {"binance", "okx"}
                         and is_testnet_paper
-                        and normalized["symbol"] not in MAINSTREAM_CRYPTO
+                        and base_asset not in MAINSTREAM_CRYPTO
                         and (
-                            normalized["symbol"] in _EXCLUDED_TESTNET_GIFTS
-                            or f"{normalized['symbol']}/USDT" not in _testnet_top_symbols()
+                            base_asset in _EXCLUDED_TESTNET_GIFTS
+                            or normalized["quote_symbol"] not in _testnet_top_symbols()
                         )
                     ):
                         normalized["market_price"] = None
