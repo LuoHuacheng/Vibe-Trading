@@ -112,8 +112,30 @@ class PortfolioContractError(RuntimeError):
     """Raised when a connector payload cannot be aggregated without guessing."""
 
 
+#: Connector-level metadata is not always fine-grained enough: Binance ships
+#: both spot and USDⓈ-M profiles, and those hold different assets. A profile
+#: whose market type is known refines the connector default here. Keyed by
+#: (connector, market_type).
+_MARKET_TYPE_COMPATIBILITY: dict[tuple[str, str], PortfolioCompatibility] = {
+    ("binance", "usdm"): PortfolioCompatibility(
+        "native",
+        1,
+        "futures_positions",
+        "Dedicated USDⓈ-M futures balance, position and open-order handling.",
+    ),
+}
+
+
 def profile_compatibility(profile: TradingProfile) -> dict[str, Any]:
-    """Return compatibility metadata for a built-in or local profile."""
+    """Return compatibility metadata for a built-in or local profile.
+
+    The profile's market type wins over the connector default when one is
+    declared, so a USDⓈ-M futures profile is never described as a spot source.
+    """
+    market_type = str((profile.config or {}).get("market_type") or "").strip().lower()
+    scoped = _MARKET_TYPE_COMPATIBILITY.get((profile.connector, market_type))
+    if scoped is not None:
+        return scoped.to_dict()
     return _CONNECTOR_COMPATIBILITY.get(profile.connector, _EXPERIMENTAL_DEFAULT).to_dict()
 
 

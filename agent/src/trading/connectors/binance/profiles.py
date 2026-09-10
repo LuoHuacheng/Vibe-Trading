@@ -42,6 +42,22 @@ BINANCE_PROFILES: tuple[TradingProfile, ...] = (
         ),
     ),
     TradingProfile(
+        id="binance-futures-paper-readonly",
+        connector="binance",
+        label="Binance USDⓈ-M Testnet · ccxt Read-Only",
+        environment="paper",
+        transport="broker_sdk",
+        capabilities=READ_CAPABILITIES,
+        readonly=True,
+        config={"profile": "paper", "market_type": "usdm"},
+        notes=(
+            "Reads a Binance USDⓈ-M futures testnet account "
+            "(testnet.binancefuture.com) via ccxt: balances, positions and open "
+            "orders. Testnet keys cannot reach the live host, and this profile "
+            "places no orders."
+        ),
+    ),
+    TradingProfile(
         id="binance-paper-trade",
         connector="binance",
         label="Binance Spot Testnet · ccxt Trading",

@@ -173,3 +173,33 @@ def test_generic_normalizer_accepts_builtin_connector_aliases(connector, raw, ex
         row["cost_price"],
         row["market_price"],
     ) == expected
+
+
+# --- Plan A: USDⓈ-M profiles must not be described as spot sources ----------
+
+
+def test_usdm_profile_reports_a_futures_asset_scope() -> None:
+    from src.trading.profiles import profile_by_id
+
+    futures = profile_compatibility(profile_by_id("binance-futures-paper-readonly"))
+
+    assert futures["level"] == "native"
+    assert futures["asset_scope"] == "futures_positions"
+    assert "USDⓈ-M" in futures["note"]
+
+
+def test_spot_profile_keeps_the_spot_asset_scope() -> None:
+    from src.trading.profiles import profile_by_id
+
+    spot = profile_compatibility(profile_by_id("binance-paper-sdk"))
+
+    assert spot["asset_scope"] == "spot"
+
+
+def test_market_type_refines_the_default_only_when_declared() -> None:
+    from src.trading.profiles import profile_by_id
+
+    # No market_type in the profile config: the connector default still applies.
+    live = profile_compatibility(profile_by_id("binance-live-sdk-readonly"))
+
+    assert live["asset_scope"] == "spot"

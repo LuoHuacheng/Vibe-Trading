@@ -7,7 +7,9 @@ from the service layer, while the Shadow live-readonly profile stays untouched.
 """
 
 from src.trading.connectors.binance import sdk as bn
+from src.trading.connections import is_portfolio_connection_profile
 from src.trading.profiles import list_profiles, profile_by_id
+from src.trading.types import READ_CAPABILITIES
 
 
 def test_futures_profiles_present():
@@ -67,3 +69,31 @@ def test_futures_live_profile_host_is_fapi():
     cfg = bn.build_config(dict(p.config), {})
     assert cfg.is_testnet is False
     assert cfg.host == bn.USDM_LIVE_HOST
+
+
+# --- Plan A: a read-only USDⓈ-M testnet profile for the portfolio page -------
+# The portfolio page only accepts read-only connections, so the tradable futures
+# profiles can never be a source there. This profile is the read-only source: it
+# declares the USDⓈ-M market type without borrowing the spot profile's meaning.
+
+
+def test_futures_readonly_profile_is_portfolio_eligible():
+    p = profile_by_id("binance-futures-paper-readonly")
+    assert p.environment == "paper"
+    assert p.transport == "broker_sdk"
+    assert p.readonly is True
+    assert p.capabilities == READ_CAPABILITIES
+    assert p.config == {"profile": "paper", "market_type": "usdm"}
+    assert is_portfolio_connection_profile(p) is True
+
+
+def test_futures_readonly_profile_host_is_futures_testnet():
+    p = profile_by_id("binance-futures-paper-readonly")
+    cfg = bn.build_config(dict(p.config), {})
+    assert cfg.is_testnet is True
+    assert cfg.host == bn.USDM_TESTNET_HOST
+
+
+def test_futures_readonly_profile_carries_no_order_capability():
+    p = profile_by_id("binance-futures-paper-readonly")
+    assert not any(".place" in cap or "requires_mandate" in cap for cap in p.capabilities)
