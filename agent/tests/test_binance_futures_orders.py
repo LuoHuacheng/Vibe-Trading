@@ -18,9 +18,10 @@ def _cfg(**kw):
 
 
 class FakeUsdmOrders:
-    def __init__(self, positions=None):
+    def __init__(self, positions=None, margin_error=None):
         self.calls = []
         self.positions = positions or []
+        self.margin_error = margin_error
 
     def fetch_positions(self, symbols=None):
         self.calls.append(("fetch_positions", symbols))
@@ -28,6 +29,8 @@ class FakeUsdmOrders:
 
     def set_margin_mode(self, margin_mode, symbol=None, params=None):
         self.calls.append(("set_margin_mode", margin_mode, symbol))
+        if self.margin_error is not None:
+            raise self.margin_error
 
     def set_leverage(self, leverage, symbol=None, params=None):
         self.calls.append(("set_leverage", leverage, symbol))
@@ -135,3 +138,47 @@ def test_futures_place_rejects_margin_mismatch_with_position(fake):
                          margin_mode="cross", leverage=5)
     assert out["status"] == "error" and "isolated" in out["error"]
     assert not [c for c in fake.calls if c[0] == "create_order"]
+
+
+def test_futures_place_tolerates_margin_type_already_set(monkeypatch):
+    """-4046 ("No need to change margin type.") is a no-op, not a failure.
+
+    Margin type persists per symbol on the account: the first order flips it and
+    every later position-less order asking for the same type is answered with
+    -4046. Failing there would refuse every order after the first one.
+    """
+    ex = FakeUsdmOrders(
+        margin_error=Exception(
+            'binanceusdm {"code":-4046,"msg":"No need to change margin type."}'
+        )
+    )
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "ok"
+    assert ("set_leverage", 5, "BTC/USDT:USDT") in ex.calls
+    assert len([c for c in ex.calls if c[0] == "create_order"]) == 1
+
+
+def test_futures_place_tolerates_margin_type_already_set_via_code(monkeypatch):
+    """ccxt sometimes carries the rejection on the code attribute, not the text."""
+    err = Exception("binanceusdm rejected setMarginType")
+    err.code = "-4046"
+    ex = FakeUsdmOrders(margin_error=err)
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "ok"
+    assert len([c for c in ex.calls if c[0] == "create_order"]) == 1
+
+
+def test_futures_place_surfaces_other_margin_errors(monkeypatch):
+    """Every other setMarginType failure still fails the order closed."""
+    ex = FakeUsdmOrders(
+        margin_error=Exception('binanceusdm {"code":-2015,"msg":"Invalid API-key"}')
+    )
+    monkeypatch.setattr(bn, "_exchange", lambda cfg: ex)
+    out = bn.place_order(_cfg(), symbol="BTC/USDT:USDT", side="buy", quantity=0.01,
+                         margin_mode="isolated", leverage=5)
+    assert out["status"] == "error" and "Invalid API-key" in out["error"]
+    assert not [c for c in ex.calls if c[0] == "create_order"]

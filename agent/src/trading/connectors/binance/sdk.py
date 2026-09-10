@@ -1090,15 +1090,39 @@ def _place_usdm_order(
     }
 
 
+#: Binance answers setMarginType with -4046 ("No need to change margin type.")
+#: whenever the symbol already trades on the requested type. ccxt raises that
+#: payload as an exception, so it is matched on text as well as on the code
+#: attribute (ccxt does not always populate the latter for Binance errors).
+_MARGIN_TYPE_ALREADY_SET = "-4046"
+_MARGIN_TYPE_ALREADY_SET_PHRASE = "no need to change margin type"
+
+
+def _margin_type_already_set(exc: BaseException) -> bool:
+    """Return True when setMarginType failed only because nothing had to change.
+
+    Margin type is a *persistent* per-symbol account setting, not a per-order
+    preset: the first USD-M order on a symbol flips it, and every later order
+    that asks for the same type is answered with -4046. Treating that as an
+    error would refuse every position-less order after the first one.
+    """
+    code = getattr(exc, "code", None)
+    if code is not None and str(code).lstrip("-") == _MARGIN_TYPE_ALREADY_SET.lstrip("-"):
+        return True
+    text = str(exc).lower()
+    return _MARGIN_TYPE_ALREADY_SET in text or _MARGIN_TYPE_ALREADY_SET_PHRASE in text
+
+
 def _ensure_futures_margin(ex: Any, symbol: str, margin_mode: str) -> str | None:
-    """Verify or apply the symbol margin type without tripping Binance -4067.
+    """Verify or apply the symbol margin type without tripping Binance -4067/-4046.
 
     Binance rejects setMarginType (-4067, reported as "Position side cannot be
     changed...") whenever the symbol already has an open position, even when the
     requested type matches the current one. When a position exists this helper
     verifies the position's current margin type and skips the call; only
-    position-less symbols actually call set_margin_mode. A failed position
-    read fails closed.
+    position-less symbols actually call set_margin_mode. A position-less symbol
+    whose type already matches is answered with -4046, which is the no-op it
+    says it is and must not fail the order. A failed position read fails closed.
     """
     rows: list[Any] = []
     try:
@@ -1124,6 +1148,8 @@ def _ensure_futures_margin(ex: Any, symbol: str, margin_mode: str) -> str | None
     try:
         ex.set_margin_mode(margin_mode, symbol)
     except Exception as exc:  # noqa: BLE001 - e.g. resting orders block the change
+        if _margin_type_already_set(exc):
+            return None
         return "could not set margin mode " + margin_mode + " on " + symbol + ": " + str(exc)
     return None
 
