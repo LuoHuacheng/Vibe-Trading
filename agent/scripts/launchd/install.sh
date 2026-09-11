@@ -7,7 +7,8 @@
 #   bash agent/scripts/launchd/install.sh status|restart|logs|uninstall
 #
 # 默认值：十个主流 USDT 永续 · 每 300s 一轮 · 288 轮（约 24h，跑完由 KeepAlive
-# 立刻开新一轮）· 交易所侧 trailing 保护（回调 3%）· 最多同时 10 仓 · isolated 5x。
+# 立刻开新一轮）· 交易所侧 both 保护（固定止损 + 移动止损 + 止盈，回调 3%）·
+# 止损距离下限 2×ATR(14,5m) · 最多同时 10 仓 · isolated 5x。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -22,8 +23,9 @@ PYTHON="$ROOT/.venv/bin/python"
 SYMBOLS="BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,BNB/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT,ADA/USDT:USDT,AVAX/USDT:USDT,LINK/USDT:USDT,LTC/USDT:USDT"
 INTERVAL=300
 RUNS=288
-PROTECTION=trailing
+PROTECTION=both
 TRAILING=3
+STOP_FLOOR_ATR=2.0
 MAX_POSITIONS=10
 LEVERAGE=5
 MARGIN_MODE=isolated
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
     --runs) RUNS="$2"; shift 2 ;;
     --protection) PROTECTION="$2"; shift 2 ;;
     --trailing) TRAILING="$2"; shift 2 ;;
+    --stop-floor-atr) STOP_FLOOR_ATR="$2"; shift 2 ;;
     --max-positions) MAX_POSITIONS="$2"; shift 2 ;;
     --leverage) LEVERAGE="$2"; shift 2 ;;
     --margin-mode) MARGIN_MODE="$2"; shift 2 ;;
@@ -67,13 +70,14 @@ render() {
       -e "s|__RUNS__|$RUNS|g" \
       -e "s|__PROTECTION__|$PROTECTION|g" \
       -e "s|__TRAILING__|$TRAILING|g" \
+      -e "s|__STOP_FLOOR_ATR__|$STOP_FLOOR_ATR|g" \
       -e "s|__MAX_POSITIONS__|$MAX_POSITIONS|g" \
       -e "s|__LEVERAGE__|$LEVERAGE|g" \
       -e "s|__MARGIN_MODE__|$MARGIN_MODE|g" > "$PLIST"
   # 精确匹配真正的占位符：模板注释里也含有 __ 形式的说明文字，不能一概而论
-  if grep -qE "__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__" "$PLIST"; then
+  if grep -qE "__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__STOP_FLOOR_ATR__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__" "$PLIST"; then
     echo "render left placeholders behind:" >&2
-    grep -nE "__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__" "$PLIST" >&2
+    grep -nE "__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__STOP_FLOOR_ATR__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__" "$PLIST" >&2
     exit 1
   fi
 }

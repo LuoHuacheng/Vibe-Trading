@@ -49,6 +49,10 @@ COOLDOWN_HOURS = 6.0
 
 #: 多头顺势闸的参考品种：它自己走弱时不开多。
 REGIME_SYMBOL = "BTC/USDT:USDT"
+
+#: 止损距离下限（× ATR(14,5m)）。LLM 给的止损常只有 0.07%~1.8%，落在噪声里；
+#: 夹到 2×ATR 后，脚本判定价与交易所挂单价一致，且不再贴着噪声。0 = 关闭。
+STOP_FLOOR_ATR = 2.0
 LOG_PATH = Path.home() / ".vibe-trading" / "futures_signal_log.jsonl"
 STATE_PATH = Path.home() / ".vibe-trading" / "futures_trade_state.json"
 API_BASE = os.getenv("VIBE_TRADING_API", "http://127.0.0.1:8899")
@@ -350,6 +354,38 @@ def _long_regime_reason(ex, symbol: str = REGIME_SYMBOL) -> str:
     return "" if ok else detail
 
 
+def apply_stop_floor(side: str, entry: float, stop_price: float,
+                     atr_pct: float | None, multiple: float) -> tuple[float, str]:
+    """把止损距离撑到至少 multiple × ATR%；返回 (止损价, 说明)。
+
+    为什么要这道夹子：LLM 给的止损经常只有 0.07%~1.8%，而持仓中位 55 分钟 ≈ 11 根
+    5m 的期望波动约 3.3×ATR —— 止损落在噪声里，被扫是大概率。夹过的价位会同时
+    写进 state 和交易所挂单，保证「脚本判定价 == 交易所挂单价」。
+    """
+    try:
+        atr_value = float(atr_pct)
+    except (TypeError, ValueError):
+        return stop_price, ""
+    if multiple <= 0 or atr_value <= 0 or entry <= 0 or stop_price <= 0:
+        return stop_price, ""
+    min_distance = multiple * atr_value / 100.0 * entry
+    current = abs(entry - stop_price)
+    if current >= min_distance:
+        return stop_price, ""
+    floored = entry - min_distance if str(side) != "short" else entry + min_distance
+    note = (f"atr-floor {current / entry * 100:.2f}% -> {multiple * atr_value:.2f}% "
+            f"({multiple:g}xATR, stop {stop_price:.6g} -> {floored:.6g})")
+    return floored, note
+
+
+def _atr_from_map(atr_map: dict | None, symbol: str) -> float | None:
+    """从快照指标里取 ATR%；兼容 {symbol: atr} 与 {symbol: {atr_pct: atr}} 两种形状。"""
+    entry = (atr_map or {}).get(symbol)
+    if isinstance(entry, dict):
+        return entry.get("atr_pct")
+    return entry
+
+
 def _context_text(symbol: str, context: dict | None, previous_oi: float | None) -> list[str]:
     """衍生品上下文片段：资金费、下次结算、标记/指数基差、持仓量与跨轮变化。"""
     if not context:
@@ -383,7 +419,9 @@ def build_market_snapshot(
     context: dict | None = None,
     previous_oi: dict | None = None,
 ) -> tuple[str, dict[str, float]]:
-    """逐 symbol 拉 K 线并压成一行特征；返回 (文本, {symbol: 现价})。
+    """逐 symbol 拉 K 线并压成一行特征；返回 (文本, {symbol: 现价}, {symbol: 指标})。
+
+    指标里带 atr_pct —— 开仓时的止损下限夹子要用它，所以不能只留在文本里。
 
     每行的字段：现价、5/20/窗口涨跌幅、窗口高低、现价在区间中的位置、
     近 5 根量能比、RSI、ATR%、距 EMA20/EMA50/VWAP 的百分比距离，以及
@@ -392,6 +430,7 @@ def build_market_snapshot(
     """
     lines: list[str] = []
     prices: dict[str, float] = {}
+    metrics: dict[str, dict] = {}
     for symbol in symbols:
         try:
             bars = ex.fetch_ohlcv(symbol, timeframe="5m", limit=bars_limit)
@@ -405,6 +444,7 @@ def build_market_snapshot(
         volumes = [bar[5] for bar in bars]
         last = closes[-1]
         prices[symbol] = last
+        metrics[symbol] = {"last": last}
         window = len(bars)
         highest, lowest = max(highs), min(lows)
         recent_volume = sum(volumes[-5:]) / max(1, len(volumes[-5:]))
@@ -424,6 +464,7 @@ def build_market_snapshot(
         if rsi is not None:
             fields.append(f"rsi={rsi:.1f}")
         atr = _atr_pct(bars)
+        metrics[symbol]["atr_pct"] = atr
         if atr is not None:
             fields.append(f"atr%={atr:.2f}")
         for label, period in (("ema20", 20), ("ema50", 50)):
@@ -435,7 +476,7 @@ def build_market_snapshot(
             fields.append(f"vwap={vwap_distance:+.2f}%")
         fields.extend(_context_text(symbol, context, (previous_oi or {}).get(symbol)))
         lines.append(f"{symbol}: " + " ".join(fields))
-    return "\n".join(lines), prices
+    return "\n".join(lines), prices, metrics
 
 
 def parse_signals(text: str) -> list[dict] | None:
@@ -887,7 +928,8 @@ def arm_protection(place, state: dict, symbol: str, position: dict, *,
 def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                      stop_loss: float, take_profit: float, trailing: float,
                      margin_mode: str, leverage: int, protection: str,
-                     resting: dict | None = None, can_arm: bool = True) -> None:
+                     resting: dict | None = None, can_arm: bool = True,
+                     atr_map: dict | None = None, stop_floor_atr: float = 0.0) -> None:
     """每轮先管持仓：触发止盈止损就以 reduce_only 平仓，未触发则确保有交易所侧保护。"""
     from src.trading.service import place_order
 
@@ -914,6 +956,14 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                 stop_loss_pct=stop_loss,
                 take_profit_pct=take_profit,
             )
+        # ATR 夹子：脚本判定用的价位必须和交易所挂单一致，否则两边各判各的
+        stop_price, floor_note = apply_stop_floor(
+            broker_position["side"], float(broker_position["entry"]), stop_price,
+            _atr_from_map(atr_map, symbol), stop_floor_atr,
+        )
+        if floor_note:
+            _log({"ts": _now(), "symbol": symbol, "status": "levels-adjusted",
+                  "detail": floor_note})
         held = {
             "side": broker_position["side"],
             "entry": broker_position["entry"],
@@ -939,10 +989,15 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                 tracked = {}
             tracked_types = {leg for leg in expected if tracked.get(_LEG_KEYS[leg])}
             size_matches = recorded_qty > 0 and abs(recorded_qty - current_qty) < 1e-9
-            if tracked_types == expected and size_matches:
-                continue  # 记录齐全且仓位没变 → 不查交易所、不动保护
-            if tracked_types and not size_matches:
-                # 仓位数量变了（部分成交/加仓）：旧腿的数量已不匹配，清了重挂
+            recorded_stop = tracked.get("stop_price")
+            stop_matches = (
+                recorded_stop is not None
+                and abs(float(recorded_stop) - stop_price) < 1e-9
+            )
+            if tracked_types == expected and size_matches and stop_matches:
+                continue  # 记录齐全、仓位没变、止损价没被夹过 → 不查交易所、不动保护
+            if tracked_types and (not size_matches or not stop_matches):
+                # 仓位数量变了（部分成交/加仓），或止损价被 ATR 夹子改过：清了重挂
                 disarm_protection(_cancel_algo, state, symbol, trade=trade)
                 tracked_types = set()
             missing = expected - tracked_types
@@ -995,7 +1050,8 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               margin_mode: str, leverage: int, protection: str = "fixed",
               bars_limit: int = DEFAULT_BARS, max_positions: int = DEFAULT_MAX_POSITIONS,
               derivatives: bool = True, cooldown_hours: float = COOLDOWN_HOURS,
-              long_regime_gate: bool = True) -> None:
+              long_regime_gate: bool = True,
+              stop_floor_atr: float = STOP_FLOOR_ATR) -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
     from src.trading.service import place_order
 
@@ -1054,7 +1110,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         except Exception as exc:  # noqa: BLE001 - 上下文缺失不该阻挡交易
             _log({"ts": _now(), "round": "warn", "detail": f"derivatives: {exc}"})
             context = None
-    snapshot, prices = build_market_snapshot(
+    snapshot, prices, metrics = build_market_snapshot(
         symbols,
         ex,
         bars_limit=bars_limit,
@@ -1085,6 +1141,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         state, prices, trade=trade, stop_loss=stop_loss, take_profit=take_profit,
         trailing=trailing, margin_mode=margin_mode, leverage=leverage,
         protection=protection, resting=resting, can_arm=protection_readable,
+        atr_map=metrics, stop_floor_atr=stop_floor_atr,
     )
     save_state(state)
 
@@ -1211,6 +1268,14 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                             signal, side, entry,
                             stop_loss_pct=stop_loss, take_profit_pct=take_profit,
                         )
+                        # 止损下限：判定价 = 挂单价，且都不贴着噪声
+                        stop_price, floor_note = apply_stop_floor(
+                            side, entry, stop_price,
+                            _atr_from_map(metrics, symbol), stop_floor_atr,
+                        )
+                        if floor_note:
+                            _log({"ts": _now(), "symbol": symbol,
+                                  "status": "levels-adjusted", "detail": floor_note})
                         _log({"ts": _now(), "symbol": symbol, "status": "levels",
                               "detail": source, "stop_price": stop_price,
                               "take_profit": target})
@@ -1367,6 +1432,21 @@ def _selftest() -> None:
     parsed = parse_signals('{"signals": [{"symbol": "BTC/USDT:USDT", "side": "hold"}]}')
     assert parsed is not None and len(parsed) == 1 and parsed[0]["side"] == "hold"
 
+    # 止损下限夹子：让「脚本判定价 == 交易所挂单价」，且都不贴着噪声
+    floored, note = apply_stop_floor("long", 100.0, 99.9, 0.5, 2.0)   # 0.1% → 1.0%
+    assert abs(floored - 99.0) < 1e-9 and note, (floored, note)
+    wide, no_note = apply_stop_floor("long", 100.0, 95.0, 0.5, 2.0)   # 本已够宽 → 不动
+    assert wide == 95.0 and no_note == ""
+    short_floored, _ = apply_stop_floor("short", 100.0, 100.1, 0.5, 2.0)
+    assert abs(short_floored - 101.0) < 1e-9
+    assert apply_stop_floor("long", 100.0, 99.9, 0.5, 0.0)[0] == 99.9  # 关闭 → 不动
+    assert apply_stop_floor("long", 100.0, 99.9, None, 2.0)[0] == 99.9 # 没 ATR → 不动
+    # 形状兼容：快照指标是 {symbol: {atr_pct: x}}，传错形状不能炸掉整轮
+    assert _atr_from_map({"BTC/USDT:USDT": {"atr_pct": 0.42}}, "BTC/USDT:USDT") == 0.42
+    assert _atr_from_map({"BTC/USDT:USDT": 0.42}, "BTC/USDT:USDT") == 0.42
+    assert _atr_from_map(None, "BTC/USDT:USDT") is None
+    assert apply_stop_floor("long", 100.0, 99.9, {"atr_pct": 0.5}, 2.0)[0] == 99.9  # 脏值不炸
+
     # 入场闸 1：同品种止损冷却
     state_cd = {"cooldowns": {"ADA/USDT:USDT": "2026-09-10T10:00:00+00:00"}}
     now_s = datetime.fromisoformat("2026-09-10T13:00:00+00:00").timestamp()
@@ -1402,15 +1482,16 @@ def _selftest() -> None:
 
     # 快照行：新字段齐、价格表正确、上下文可拼进来
     ex = _FakeBarsExchange(_synth_bars())
-    text, prices = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100)
+    text, prices, metrics = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100)
+    assert metrics["BTC/USDT:USDT"].get("atr_pct") is not None, metrics
     assert prices == {"BTC/USDT:USDT": prices["BTC/USDT:USDT"]} and "BTC/USDT:USDT" in prices
     for field in ("last=", "chg5=", "rng=[", "pos=", "volRatio=", "rsi=", "atr%=", "ema20=", "vwap="):
         assert field in text, (field, text[:200])
     assert "prev20_min" not in text                   # 名不副实的字段已去掉
     context = {"funding": {"BTC/USDT:USDT": {"funding_rate": -0.0001, "mark_price": 101.0, "index_price": 100.0}},
                "open_interest": {"BTC/USDT:USDT": 110.0}}
-    text, _ = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100,
-                                    context=context, previous_oi={"BTC/USDT:USDT": 100.0})
+    text, _, _ = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100,
+                                       context=context, previous_oi={"BTC/USDT:USDT": 100.0})
     for field in ("fund=", "basis=", "oi=", "oiChg="):
         assert field in text, (field, text[:220])
 
@@ -1487,6 +1568,9 @@ def main() -> int:
                         help=f"同品种止损后的冷静期小时数（默认 {COOLDOWN_HOURS:g}，0=关闭）")
     parser.add_argument("--no-long-regime-gate", action="store_true",
                         help=f"关闭多头顺势闸（默认开：{REGIME_SYMBOL} 走弱时不开多）")
+    parser.add_argument("--stop-floor-atr", dest="stop_floor_atr", type=float,
+                        default=STOP_FLOOR_ATR,
+                        help=f"止损距离下限（× ATR(14,5m)，默认 {STOP_FLOOR_ATR:g}，0=关闭）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
     args = parser.parse_args()
 
@@ -1518,6 +1602,8 @@ def main() -> int:
           f"衍生品上下文 {'关' if args.no_derivatives else '开'}")
     print(f"[futures-loop] 入场闸 | 同品种止损冷却 {args.cooldown_hours:g}h | "
           f"多头顺势闸 {'关' if args.no_long_regime_gate else '开（参考 ' + REGIME_SYMBOL + '）'}")
+    print(f"[futures-loop] 止损下限 {args.stop_floor_atr:g}xATR(14,5m)"
+          + ("（关闭）" if args.stop_floor_atr <= 0 else ""))
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
 
@@ -1537,6 +1623,7 @@ def main() -> int:
                     derivatives=not args.no_derivatives,
                     cooldown_hours=args.cooldown_hours,
                     long_regime_gate=not args.no_long_regime_gate,
+                    stop_floor_atr=args.stop_floor_atr,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})

@@ -27,8 +27,9 @@ bash agent/scripts/launchd/install.sh uninstall
 | `--symbols` | 十个主流 USDT 永续 | **建议固定真实品种**。测试网的成交额是假的，按 top-N 选品会把 `牛来/USDT:USDT` 这类测试网假符号选进来 |
 | `--interval` | 300 | 每轮间隔秒数 |
 | `--runs` | 288 | 最大轮数（288 × 5 分钟 ≈ 24h）；跑完正常退出，`KeepAlive` 立刻开新一轮，状态文件续用 |
-| `--protection` | trailing | `fixed` / `trailing` / `both` / `off` |
+| `--protection` | both | `fixed` / `trailing` / `both` / `off`。**默认 both**：固定止损、移动止损、止盈三条腿全挂交易所，脚本只判定不持有 |
 | `--trailing` | 3 | 移动止损回调百分比（Binance 只接受 0.1~5） |
+| `--stop-floor-atr` | 2 | 止损距离下限（× ATR(14,5m)）。LLM 给的止损常只有 0.07%~1.8%，落在噪声里；夹到 2×ATR 后脚本判定价与交易所挂单价一致。0 = 关闭 |
 | `--max-positions` | 10 | 同时在手最大仓位数——放大品种池前必须有这道闸 |
 | `--leverage` / `--margin-mode` | 5 / isolated | 全局生效 |
 | `--dry-run` | 关 | 只分析不下单（等价于去掉 `--trade`） |
@@ -70,4 +71,5 @@ launchctl kickstart -k gui/501/$L
 - **保护单在 Binance 的 Algo 服务里**，标准挂单接口（含 CLI/网页）看不到；查它用 SDK 的 `get_open_algo_orders` 或看 jsonl。
 - **残留清理把 trailing 一起算上**：Binance 拒绝在 symbol 还挂着单时改保证金模式（`-4067`），孤儿条件单会让那个品种再也开不出新仓。清理名单取「交易所条件单列表 ∪ 本地记录」再减去当前持仓；三种条件单都要收，漏掉 `trailing_stop_market` 就会攒下孤儿单。
 - 持仓真相来自券商，重启后会自动接管并补齐缺失的保护腿。
+- **止损只有一个价**：`--stop-floor-atr` 把 LLM 给的价位撑到至少 2×ATR(14,5m)，并把同一个值同时写进 state 与交易所挂单 —— 脚本判定价 == 交易所挂单价。不夹的话会出现「脚本按 0.5% 判、交易所挂 3%」，实际生效的永远是最紧那条，而且还带 5 分钟盲窗。
 - 止损止盈是**已挂在交易所**的 reduce_only 条件单，进程停了也有效。

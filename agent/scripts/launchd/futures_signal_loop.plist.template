@@ -34,6 +34,8 @@
     <string>__PROTECTION__</string>
     <string>--trailing</string>
     <string>__TRAILING__</string>
+    <string>--stop-floor-atr</string>
+    <string>__STOP_FLOOR_ATR__</string>
     <string>--max-positions</string>
     <string>__MAX_POSITIONS__</string>
     <string>--leverage</string>
