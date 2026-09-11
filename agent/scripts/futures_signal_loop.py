@@ -13,7 +13,7 @@
 
 每轮：
   1. 读合约持仓 → 对每笔持仓做止盈/止损/移动止盈止损，触发即以 reduce_only 平仓；
-  2. 抓成交额 top N 永续的 5m K 线；
+  2. 定品种池（成交额 top N 或 --symbols 固定名单），抓它们的 5m K 线；
   3. 调 LLM 出结构化信号（long/short/hold）；
   4. dry-run 只记录；--trade 才真下单（可开多/开空，已有持仓的品种跳过不叠加）。
 
@@ -352,6 +352,25 @@ def _long_regime_reason(ex, symbol: str = REGIME_SYMBOL) -> str:
     closes = [bar[4] for bar in (bars or [])]
     ok, detail = _regime_verdict(closes)
     return "" if ok else detail
+
+
+def _universe_header(*, n: int, fixed: bool) -> str:
+    """拼 prompt 里的品种池标题，按真实来源措辞。
+
+    固定 ``--symbols`` 与成交额 top N 是两个不同的池子，措辞不能混：早先这里
+    写死 "top N by 24h volume"，传 ``--symbols`` 时会误导 LLM 以为手上这十个
+    是成交额排名。而测试网上成交额是假的、排名毫无意义（见 launchd/README）。
+
+    Args:
+        n: 本轮实际进入快照的品种数。
+        fixed: True = 来自 ``--symbols`` 的固定名单；False = 成交额 top N。
+
+    Returns:
+        一行标题，把「N 个 USD-M 永续」的真实来源讲清楚。
+    """
+    if fixed:
+        return f"Tradable universe ({n} USD-M perpetuals, fixed watchlist):"
+    return f"Top {n} USD-M perpetuals by 24h quote volume:"
 
 
 def apply_stop_floor(side: str, entry: float, stop_price: float,
@@ -1149,7 +1168,10 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
     prompt = (
         SYSTEM_PROMPT.format(max_notional=int(MAX_NOTIONAL))
         + f"\n\nCurrent time (UTC): {_now()}\n"
-        + f"Top {len(symbols)} USD-M perpetuals by 24h volume:\n{snapshot}\n"
+        # 标题按品种池的真实来源措辞：--symbols 是固定名单，不是成交额排名。
+        # n 用 len(symbols)（实际进入快照的品种数），可能少于 symbols_arg。
+        + _universe_header(n=len(symbols), fixed=bool(symbols_arg))
+        + f"\n{snapshot}\n"
         + "Generate trading signals now."
     )
     try:
@@ -1480,6 +1502,15 @@ def _selftest() -> None:
     assert abs(_rel_pct(110.0, 100.0) - 10.0) < 1e-9
     assert _rel_pct(None, 100.0) is None
 
+    # 品种池标题：两种来源措辞必须分开，不能都声称是成交额排名
+    fixed_hdr = _universe_header(n=10, fixed=True)
+    top_hdr = _universe_header(n=10, fixed=False)
+    assert "fixed watchlist" in fixed_hdr, fixed_hdr
+    assert "24h quote volume" not in fixed_hdr, fixed_hdr   # 固定名单不得声称按成交额选
+    assert "24h quote volume" in top_hdr, top_hdr
+    assert "fixed watchlist" not in top_hdr, top_hdr
+    assert "10" in fixed_hdr and "10" in top_hdr
+
     # 快照行：新字段齐、价格表正确、上下文可拼进来
     ex = _FakeBarsExchange(_synth_bars())
     text, prices, metrics = build_market_snapshot(["BTC/USDT:USDT"], ex, bars_limit=100)
@@ -1525,6 +1556,25 @@ def _selftest() -> None:
     finally:
         LOG_PATH = saved_log
 
+    # 品种池参数互斥：--symbols 与 --top 同时给出必须报错，不能静默让 --top 失效
+    import io
+    from contextlib import redirect_stderr
+
+    parser = _build_parser()
+    ok_args = parser.parse_args(["--symbols", "BTC/USDT:USDT,ETH/USDT:USDT"])
+    assert ok_args.symbols == "BTC/USDT:USDT,ETH/USDT:USDT", ok_args
+    assert ok_args.top == DEFAULT_TOP, ok_args.top             # 默认值保留，供 --symbols 为空时兜底
+    assert parser.parse_args([]).top == DEFAULT_TOP            # 两个都不传 → 走 top N
+    with redirect_stderr(io.StringIO()) as err:
+        try:
+            parser.parse_args(["--symbols", "BTC/USDT:USDT", "--top", "5"])
+        except SystemExit as exc:
+            code = exc.code
+        else:
+            code = None
+    assert code == 2, f"--symbols 与 --top 同时给出应报错退出，实际 code={code}"
+    assert "--top" in err.getvalue() and "--symbols" in err.getvalue(), err.getvalue()
+
     print("selftest OK")
 
 
@@ -1537,22 +1587,33 @@ def _round_timeout_handler(signum, frame):  # noqa: ARG001
     raise _RoundTimeout(f"round exceeded {signum} timeout")
 
 
-def main() -> int:
-    """命令行入口。"""
-    import signal
+def _build_parser() -> argparse.ArgumentParser:
+    """构造命令行解析器。
 
+    品种池的两个来源互斥：``--symbols``（固定名单）与 ``--top``（成交额排名）
+    同时给出时无法判断意图，argparse 报错退出，而不是静默让 ``--top`` 失效。
+    抽成独立函数是为了让 ``_selftest`` 能直接断言这条互斥规则。
+
+    Returns:
+        配好全部参数（含品种池互斥组）的解析器。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trade", action="store_true", help="真实下单（默认 dry-run 只记录信号）")
     parser.add_argument("--interval", type=int, default=300, help="轮询间隔秒（默认 300）")
     parser.add_argument("--runs", type=int, default=12, help="最大轮数（默认 12 = 1 小时）")
-    parser.add_argument("--top", type=int, default=DEFAULT_TOP, help=f"成交额 top N（默认 {DEFAULT_TOP}）")
+    # 品种池只有两个来源，互斥：--symbols 固定名单 vs --top 成交额排名。
+    # 同时给出时 argparse 直接报错，而不是静默让 --top 失效（早先就是静默的）。
+    universe = parser.add_mutually_exclusive_group()
+    universe.add_argument("--top", type=int, default=DEFAULT_TOP,
+                          help=f"成交额 top N（默认 {DEFAULT_TOP}）；与 --symbols 互斥")
+    universe.add_argument("--symbols", default="",
+                          help="逗号分隔的固定品种；给出即选中固定名单，与 --top 互斥")
     parser.add_argument("--bars", type=int, default=DEFAULT_BARS,
                         help=f"每个品种拉多少根 5m K 线（默认 {DEFAULT_BARS}）")
     parser.add_argument("--max-positions", dest="max_positions", type=int, default=DEFAULT_MAX_POSITIONS,
                         help=f"同时在手的最大仓位数（默认 {DEFAULT_MAX_POSITIONS}）")
     parser.add_argument("--no-derivatives", action="store_true",
                         help="不拉资金费/持仓量等衍生品上下文")
-    parser.add_argument("--symbols", default="", help="逗号分隔的固定品种，覆盖 top N 选品")
     parser.add_argument("--stop-loss", type=float, default=5.0, help="止损百分比（默认 5）")
     parser.add_argument("--take-profit", type=float, default=8.0, help="止盈百分比（默认 8）")
     parser.add_argument("--trailing", type=float, default=3.0, help="移动止盈回撤百分比（默认 3）")
@@ -1572,6 +1633,14 @@ def main() -> int:
                         default=STOP_FLOOR_ATR,
                         help=f"止损距离下限（× ATR(14,5m)，默认 {STOP_FLOOR_ATR:g}，0=关闭）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
+    return parser
+
+
+def main() -> int:
+    """命令行入口。"""
+    import signal
+
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.selftest:
