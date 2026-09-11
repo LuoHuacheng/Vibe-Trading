@@ -29,7 +29,7 @@ bash agent/scripts/launchd/install.sh uninstall
 | `--runs` | 288 | 最大轮数（288 × 5 分钟 ≈ 24h）；跑完正常退出，`KeepAlive` 立刻开新一轮，状态文件续用 |
 | `--protection` | trailing | `fixed` / `trailing` / `both` / `off` |
 | `--trailing` | 3 | 移动止损回调百分比（Binance 只接受 0.1~5） |
-| `--max-positions` | 5 | 同时在手最大仓位数——放大品种池前必须有这道闸 |
+| `--max-positions` | 10 | 同时在手最大仓位数——放大品种池前必须有这道闸 |
 | `--leverage` / `--margin-mode` | 5 / isolated | 全局生效 |
 | `--dry-run` | 关 | 只分析不下单（等价于去掉 `--trade`） |
 | `--python` | 仓库 `.venv/bin/python` | 换解释器时用 |
@@ -68,5 +68,6 @@ launchctl kickstart -k gui/501/$L
 
 - **测试网很不稳**：`exchangeInfo` 超时、`openAlgoOrders` 读空/读部分、LLM 503 都会出现。循环会跳过该轮、下一轮补；保护单是否齐全**以本地记录为准**，不依赖那个会读丢的列表接口。
 - **保护单在 Binance 的 Algo 服务里**，标准挂单接口（含 CLI/网页）看不到；查它用 SDK 的 `get_open_algo_orders` 或看 jsonl。
+- **残留清理把 trailing 一起算上**：Binance 拒绝在 symbol 还挂着单时改保证金模式（`-4067`），孤儿条件单会让那个品种再也开不出新仓。清理名单取「交易所条件单列表 ∪ 本地记录」再减去当前持仓；三种条件单都要收，漏掉 `trailing_stop_market` 就会攒下孤儿单。
 - 持仓真相来自券商，重启后会自动接管并补齐缺失的保护腿。
 - 止损止盈是**已挂在交易所**的 reduce_only 条件单，进程停了也有效。

@@ -7,7 +7,7 @@
 #   bash agent/scripts/launchd/install.sh status|restart|logs|uninstall
 #
 # 默认值：十个主流 USDT 永续 · 每 300s 一轮 · 288 轮（约 24h，跑完由 KeepAlive
-# 立刻开新一轮）· 交易所侧 trailing 保护（回调 3%）· 最多同时 5 仓 · isolated 5x。
+# 立刻开新一轮）· 交易所侧 trailing 保护（回调 3%）· 最多同时 10 仓 · isolated 5x。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +24,7 @@ INTERVAL=300
 RUNS=288
 PROTECTION=trailing
 TRAILING=3
-MAX_POSITIONS=5
+MAX_POSITIONS=10
 LEVERAGE=5
 MARGIN_MODE=isolated
 TRADE=1

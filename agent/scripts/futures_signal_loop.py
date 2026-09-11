@@ -40,8 +40,15 @@ READ_PROFILE = "binance-futures-paper-readonly"
 TRADE_PROFILE = "binance-futures-paper-trade"
 DEFAULT_TOP = 10
 DEFAULT_BARS = 100
-DEFAULT_MAX_POSITIONS = 5
+DEFAULT_MAX_POSITIONS = 10
 MAX_NOTIONAL = 1000.0
+
+#: 同品种止损后的冷静期（小时）。实测最集中的亏损来自「同一品种被反复止损又立刻
+#: 再进」：18h 窗口里 ADA 一个品种这样贡献了 -15.7，而按 6h 冷却回放能省下约 12。
+COOLDOWN_HOURS = 6.0
+
+#: 多头顺势闸的参考品种：它自己走弱时不开多。
+REGIME_SYMBOL = "BTC/USDT:USDT"
 LOG_PATH = Path.home() / ".vibe-trading" / "futures_signal_log.jsonl"
 STATE_PATH = Path.home() / ".vibe-trading" / "futures_trade_state.json"
 API_BASE = os.getenv("VIBE_TRADING_API", "http://127.0.0.1:8899")
@@ -165,7 +172,11 @@ def _signal_msg(sig: dict, result: dict | None = None) -> str:
 
 
 def load_state() -> dict:
-    """返回 {"peaks": {symbol: price}}；缺失或损坏时返回空结构。"""
+    """返回本地状态；缺失或损坏时返回空结构。
+
+    结构：{"peaks": {symbol: 极值}, "protection": {symbol: 已挂腿},
+    "open_interest": {...}, "cooldowns": {symbol: 上次止损时间}}。
+    """
     if STATE_PATH.exists():
         try:
             data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -173,10 +184,11 @@ def load_state() -> dict:
                 data.setdefault("peaks", {})
                 data.setdefault("protection", {})
                 data.setdefault("open_interest", {})
+                data.setdefault("cooldowns", {})
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
             pass
-    return {"peaks": {}, "protection": {}, "open_interest": {}}
+    return {"peaks": {}, "protection": {}, "open_interest": {}, "cooldowns": {}}
 
 
 def save_state(state: dict) -> None:
@@ -267,6 +279,75 @@ def _rel_pct(value: float | None, reference: float | None) -> float | None:
     if value is None or not reference:
         return None
     return (value / reference - 1) * 100
+
+
+#: 触发冷却的平仓原因前缀（脚本侧止损/移动止损）。止盈平仓不冷却。
+_COOLDOWN_REASONS = ("stop-loss", "trailing-stop")
+
+
+def _hours_since(iso_ts: str, now_s: float | None = None) -> float | None:
+    """距今多少小时；时间戳不可解析时返回 None。"""
+    try:
+        parsed = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now_dt = (
+        datetime.fromtimestamp(now_s, timezone.utc) if now_s is not None
+        else datetime.now(timezone.utc)
+    )
+    return (now_dt - parsed).total_seconds() / 3600.0
+
+
+def _record_cooldown(state: dict, symbol: str, reason: str) -> None:
+    """止损类平仓后给该品种上冷却（止盈不算）。"""
+    if not any(str(reason).startswith(prefix) for prefix in _COOLDOWN_REASONS):
+        return
+    state.setdefault("cooldowns", {})[symbol] = _now()
+
+
+def _cooldown_reason(state: dict, symbol: str, cooldown_hours: float,
+                    now_s: float | None = None) -> str:
+    """同品种止损冷却闸：返回拦截原因，放行返回空串。"""
+    if cooldown_hours <= 0:
+        return ""
+    recorded = (state.get("cooldowns") or {}).get(symbol)
+    if not recorded:
+        return ""
+    age = _hours_since(recorded, now_s)
+    if age is None or age < 0:
+        return ""
+    if age < cooldown_hours:
+        return f"cooldown {age:.1f}h/{cooldown_hours:g}h since last stop-out"
+    return ""
+
+
+def _regime_verdict(closes: list[float]) -> tuple[bool, str]:
+    """多头顺势闸判定（纯函数）：参考品种要在 EMA50 上方且窗口内为正。"""
+    if len(closes) < 51:
+        return False, "regime: not enough bars"
+    ema50 = _ema(closes, 50)
+    last = closes[-1]
+    if ema50 is None or ema50 <= 0:
+        return False, "regime: EMA50 unavailable"
+    change = _pct_change(closes, min(99, len(closes) - 1))
+    if last <= ema50:
+        return False, f"regime: px {last:.6g} <= EMA50 {ema50:.6g}"
+    if change is None or change <= 0:
+        return False, f"regime: window change {0.0 if change is None else change:+.2f}% <= 0"
+    return True, f"regime ok: px/EMA50 {_rel_pct(last, ema50):+.2f}%, chg {change:+.2f}%"
+
+
+def _long_regime_reason(ex, symbol: str = REGIME_SYMBOL) -> str:
+    """多头闸取数：读不到就拦（宁可不开多，也不在弱势里开多）。"""
+    try:
+        bars = ex.fetch_ohlcv(symbol, timeframe="5m", limit=100)
+    except Exception as exc:  # noqa: BLE001 - 读不到按拦截处理
+        return f"regime: {symbol} unreadable ({exc})"
+    closes = [bar[4] for bar in (bars or [])]
+    ok, detail = _regime_verdict(closes)
+    return "" if ok else detail
 
 
 def _context_text(symbol: str, context: dict | None, previous_oi: float | None) -> list[str]:
@@ -653,11 +734,16 @@ def _read_protection_rows() -> list[dict]:
 
 
 def _resting_protection_orders() -> dict[str, list[dict]]:
-    """返回 {symbol: [条件单行]} —— 交易所上还挂着的 stop/take-profit。
+    """返回 {symbol: [条件单行]} —— 交易所上还挂着的 stop/take-profit/trailing。
 
     这些单**不在**普通挂单接口里：Binance 把条件单放进独立的 Algo 服务，
     fetch_open_orders() 永远看不到它们（实测踩过）。所以这里必须用
     get_open_algo_orders()，否则既发现不了已挂的保护，也找不到要撤的兄弟单。
+
+    三种条件单**都要**收进来，不能只收 stop/take-profit：漏掉
+    trailing_stop_market 时，「仓位已平 → 撤残留」看不见移动止损，孤儿单就
+    一直留在交易所上（实测后果：Binance 以 -4067 拒绝再改该 symbol 的保证金
+    模式，于是那个品种再也开不出新仓）。
     """
     rows = _read_protection_rows()
     result: dict[str, list[dict]] = {}
@@ -665,7 +751,7 @@ def _resting_protection_orders() -> dict[str, list[dict]]:
         if not isinstance(row, dict):
             continue
         order_type = str(row.get("order_type") or "").strip().lower()
-        if order_type not in ("stop_market", "take_profit_market"):
+        if order_type not in ("stop_market", "trailing_stop_market", "take_profit_market"):
             continue
         symbol = str(row.get("symbol") or "")
         if symbol:
@@ -896,6 +982,8 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
             _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
                   "status": "order", "reason": reason, "result": result})
             if str(result.get("status")) == "ok":
+                # 止损类平仓 → 该品种进冷静期，别让同一个坑立刻再钓一次
+                _record_cooldown(state, symbol, reason)
                 tg_send(f"🔴 平仓 {symbol}  {quantity:.6f}  — {reason}")
         except Exception as exc:  # noqa: BLE001 - 单笔失败不终止循环
             _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
@@ -906,7 +994,8 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               stop_loss: float, take_profit: float, trailing: float,
               margin_mode: str, leverage: int, protection: str = "fixed",
               bars_limit: int = DEFAULT_BARS, max_positions: int = DEFAULT_MAX_POSITIONS,
-              derivatives: bool = True) -> None:
+              derivatives: bool = True, cooldown_hours: float = COOLDOWN_HOURS,
+              long_regime_gate: bool = True) -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
     from src.trading.service import place_order
 
@@ -939,11 +1028,16 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
             # 交易所侧保护）。已有仓位的脚本侧止盈止损继续生效。
             protection_readable = False
             _log({"ts": _now(), "round": "warn", "detail": f"algo orders unreadable: {exc}"})
-        for symbol in [sym for sym in resting if sym not in state["positions"]]:
-            _log({"ts": _now(), "symbol": symbol, "status": "cleanup",
-                  "detail": "position closed; cancelling leftover protection"})
-            disarm_protection(_cancel_algo, state, symbol, trade=trade,
-                              resting_orders=resting.get(symbol))
+        if protection_readable:
+            # 两边取并集：只按交易所列表清理，会把「仓位已平但本地记录还在」
+            # 的情况（例如止盈在交易所侧成交、我们没参与那次平仓）留成孤儿
+            # 记录，下一轮又拿它当退出价。读失败时不碰保护，交给下一轮。
+            stale = (set(resting) | set(state.get("protection") or {})) - set(state["positions"])
+            for symbol in sorted(stale):
+                _log({"ts": _now(), "symbol": symbol, "status": "cleanup",
+                      "detail": "position closed; cancelling leftover protection"})
+                disarm_protection(_cancel_algo, state, symbol, trade=trade,
+                                  resting_orders=resting.get(symbol))
 
     # 2) 选品 → 衍生品上下文 → 特征快照
     symbols = symbols_arg or fetch_top_symbols(ex, top)
@@ -1035,6 +1129,7 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         return
 
     # 4) 执行
+    long_gate: str | None = None  # 多头顺势闸（懒加载：每轮最多读一次参考品种）
     for signal in signals:
         symbol = str(signal.get("symbol") or "").strip()
         side = str(signal.get("side") or "hold").strip().lower()
@@ -1059,6 +1154,15 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
             # 已有持仓不叠加：仓位管理交给止盈止损，避免越亏越加
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
                   "detail": "position already open"})
+            continue
+        blocked = _cooldown_reason(state, symbol, cooldown_hours)
+        if not blocked and side == "long" and long_regime_gate:
+            if long_gate is None:
+                long_gate = _long_regime_reason(ex)
+            blocked = long_gate
+        if blocked:
+            _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
+                  "detail": blocked})
             continue
         if not protection_readable:
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
@@ -1263,6 +1367,28 @@ def _selftest() -> None:
     parsed = parse_signals('{"signals": [{"symbol": "BTC/USDT:USDT", "side": "hold"}]}')
     assert parsed is not None and len(parsed) == 1 and parsed[0]["side"] == "hold"
 
+    # 入场闸 1：同品种止损冷却
+    state_cd = {"cooldowns": {"ADA/USDT:USDT": "2026-09-10T10:00:00+00:00"}}
+    now_s = datetime.fromisoformat("2026-09-10T13:00:00+00:00").timestamp()
+    assert _cooldown_reason(state_cd, "ADA/USDT:USDT", 6.0, now_s) != ""      # 3h < 6h → 拦
+    assert _cooldown_reason(state_cd, "ADA/USDT:USDT", 2.0, now_s) == ""      # 3h > 2h → 放
+    assert _cooldown_reason(state_cd, "LTC/USDT:USDT", 6.0, now_s) == ""      # 没记录 → 放
+    assert _cooldown_reason(state_cd, "ADA/USDT:USDT", 0.0, now_s) == ""      # 冷却关闭
+    assert _cooldown_reason({"cooldowns": {"X/USDT:USDT": "垃圾时间戳"}},
+                            "X/USDT:USDT", 6.0, now_s) == ""                  # 坏时间戳不误拦
+    assert _hours_since("not-a-time") is None
+    cd_state = {}
+    _record_cooldown(cd_state, "ADA/USDT:USDT", "stop-loss 0.2081 <= 0.2090 (entry 0.2118)")
+    assert "ADA/USDT:USDT" in cd_state["cooldowns"]
+    _record_cooldown(cd_state, "LTC/USDT:USDT", "take-profit 53.25 >= 53.20 (entry 52.39)")
+    assert "LTC/USDT:USDT" not in cd_state["cooldowns"]                        # 止盈不冷却
+
+    # 入场闸 2：多头顺势闸（纯函数）
+    assert _regime_verdict([float(i) for i in range(1, 101)])[0] is True        # 稳步上行 → 放行
+    assert _regime_verdict([float(100 - i) for i in range(100)])[0] is False    # 稳步下行 → 拦
+    assert _regime_verdict([1.0] * 60)[0] is False                              # 贴平 EMA50 → 拦
+    assert _regime_verdict([1.0] * 10)[0] is False                              # 样本不足 → 拦
+
     # 指标：纯函数，用构造序列验证
     rising = [float(i) for i in range(1, 101)]
     assert _ema(rising, 10) is not None and _ema(rising, 10) < rising[-1]
@@ -1357,6 +1483,10 @@ def main() -> int:
                              "（推荐）、both=三者都挂、off=不挂")
     parser.add_argument("--no-protection", action="store_true",
                         help="等同 --protection off（只靠脚本轮询止损）")
+    parser.add_argument("--cooldown-hours", dest="cooldown_hours", type=float, default=COOLDOWN_HOURS,
+                        help=f"同品种止损后的冷静期小时数（默认 {COOLDOWN_HOURS:g}，0=关闭）")
+    parser.add_argument("--no-long-regime-gate", action="store_true",
+                        help=f"关闭多头顺势闸（默认开：{REGIME_SYMBOL} 走弱时不开多）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
     args = parser.parse_args()
 
@@ -1386,6 +1516,8 @@ def main() -> int:
     universe = f"固定 {len(symbols_arg)} 个品种" if symbols_arg else f"成交额 top {args.top}"
     print(f"[futures-loop] 品种 {universe} | 每品种 {args.bars} 根 5m | 最多同时 {args.max_positions} 仓 | "
           f"衍生品上下文 {'关' if args.no_derivatives else '开'}")
+    print(f"[futures-loop] 入场闸 | 同品种止损冷却 {args.cooldown_hours:g}h | "
+          f"多头顺势闸 {'关' if args.no_long_regime_gate else '开（参考 ' + REGIME_SYMBOL + '）'}")
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
 
@@ -1403,6 +1535,8 @@ def main() -> int:
                     leverage=args.leverage, protection=protection_mode,
                     bars_limit=args.bars, max_positions=args.max_positions,
                     derivatives=not args.no_derivatives,
+                    cooldown_hours=args.cooldown_hours,
+                    long_regime_gate=not args.no_long_regime_gate,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})
