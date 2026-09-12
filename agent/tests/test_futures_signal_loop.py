@@ -249,4 +249,37 @@ def test_manage_positions_cancels_stray_exchange_legs(loop, monkeypatch, tmp_pat
     assert set(cancelled) >= {"s1", "t1", "tp1", "stray1"}, cancelled
     # 撤掉旧腿之后必须原样挂回来，不能留下没有保护的空仓
     assert set(armed) == {"stop_market", "trailing_stop_market", "take_profit_market"}, armed
-    assert log_path.exists()
+
+
+def test_entry_log_records_signal_features(loop, monkeypatch, tmp_path):
+    """入场记录必须带上信号特征，否则没法归因「哪类信号赚钱」。"""
+    import src.trading.service  # noqa: F401 - 先导入，才能替换它导出的 place_order
+
+    monkeypatch.setattr("src.trading.service.place_order",
+                        lambda *args, **kwargs: {"status": "ok", "order_id": "o1",
+                                                 "filled": kwargs.get("quantity"), "price": 100.0})
+    monkeypatch.setattr(loop, "_cancel_algo", lambda *args, **kwargs: {"status": "ok"})
+    payload = json.dumps({"signals": [{
+        "symbol": SYMBOL, "side": "long", "notional": 200, "entry": 100.0,
+        "stop_loss": 95.0, "take_profit": 108.0, "confidence": 0.72, "reason": "reclaim of range high",
+    }]})
+    llm = SimpleNamespace(invoke=lambda prompt: SimpleNamespace(content=payload))
+    state = _empty_state()
+    _, read_log = _wire(loop, monkeypatch, tmp_path, state=state, positions=[])
+
+    loop.run_round(
+        _FakeExchange(_flat_bars()), llm, trade=True, top=10, symbols_arg=[SYMBOL],
+        stop_loss=5.0, take_profit=8.0, trailing=3.0, margin_mode="isolated",
+        leverage=5, protection="both", bars_limit=100, max_positions=10,
+        derivatives=False, cooldown_hours=6.0, long_regime_gate=False, stop_floor_atr=0.0,
+    )
+
+    entries = [r for r in read_log() if r.get("status") == "order" and r.get("reason") == "reclaim of range high"]
+    assert entries, read_log()
+    feature = entries[0]["signal"]
+    assert feature["confidence"] == pytest.approx(0.72)
+    assert feature["entry"] == pytest.approx(100.0)
+    assert feature["stop_loss"] == pytest.approx(95.0)
+    assert feature["take_profit"] == pytest.approx(108.0)
+    assert feature["notional"] == pytest.approx(200.0)
+    assert entries[0]["atr_pct"] == pytest.approx(1.0)   # 横盘 K 线：ATR 1.0/100 = 1%

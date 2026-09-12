@@ -1359,7 +1359,19 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                 session_id=f"futures-loop-{int(time.time())}",
             )
             _log({"ts": _now(), "symbol": symbol, "side": side, "quantity": quantity,
-                  "status": "order", "reason": reason, "result": result})
+                  "status": "order", "reason": reason,
+                  # 信号自己的特征必须落盘：没有 confidence / 点位就无法回答
+                  # 「哪类信号赚钱」，参数只能靠猜。实际生效的止损止盈另有
+                  # levels / levels-adjusted 两条记录。
+                  "signal": {
+                      "confidence": _as_float(signal.get("confidence")),
+                      "entry": _as_float(signal.get("entry")),
+                      "stop_loss": _as_float(signal.get("stop_loss")),
+                      "take_profit": _as_float(signal.get("take_profit")),
+                      "notional": notional,
+                  },
+                  "atr_pct": _as_float(_atr_from_map(metrics, symbol)),
+                  "result": result})
             if str(result.get("status")) == "ok":
                 tg_send(_signal_msg(signal, result))
                 filled = float(result.get("filled") or 0) or quantity
