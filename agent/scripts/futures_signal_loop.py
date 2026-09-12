@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -143,6 +144,28 @@ def _fmt(value: float | None, digits: int = 4) -> str:
         return f"{float(value):.{digits}f}"
     except (TypeError, ValueError):
         return "—"
+
+
+def _as_float(value: object) -> float | None:
+    """把外部来源（状态文件 / 券商 / LLM）的数值转成 float；非数值返回 None。
+
+    这些值会直接进入 ``<= 0`` 一类的守卫，而 float() 或比较抛出的 TypeError 会
+    穿出 manage_positions 一路冒到 main 的「单轮异常」处理器 —— 整轮作废，所有
+    品种的持仓管理一起跳过（实测：保护记录里 stop_price 是个对象就够触发）。
+    脏值必须在这里退化成「按缺失处理」，而不是把一轮的交易全丢掉。
+    bool 不算数值：True 当 1.0 用只会把脏数据掩盖过去。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _traceback_tail(limit: int = 12, max_chars: int = 2000) -> str:
+    """当前异常的栈（截断）。只在 except 块里调用才有意义。"""
+    return "".join(traceback.format_exc(limit=limit))[-max_chars:]
 
 
 def _refresh_portfolio() -> None:
@@ -302,6 +325,35 @@ def _hours_since(iso_ts: str, now_s: float | None = None) -> float | None:
         else datetime.now(timezone.utc)
     )
     return (now_dt - parsed).total_seconds() / 3600.0
+
+
+def _exchange_side_stop_reason(tracked: object, resting_rows: list[dict] | None) -> str:
+    """仓位消失是不是交易所侧止损打掉的？判得了返回冷却原因，判不了返回空串。
+
+    只认能确证的那一种签名：本地记录里止损/移动止损的 id 已不在交易所的未成交
+    条件单里（成交或消失了），而止盈腿还挂着。止盈一旦成交会把止盈单消耗掉，
+    所以「止盈还在 + 止损不在」只能是止损成交 —— 这正是脚本自己没参与、因此
+    从没记过冷却的那一类（protection=both 下绝大多数止损都走这条路）。
+
+    证据不足一律返回空串：条件单列表在测试网会偶发读丢，宁可漏一次冷却，也不
+    拿残缺的列表去冷却一个没止损的品种（白等 6 小时）。
+    """
+    if not isinstance(tracked, dict):
+        return ""
+    stop_ids = {str(tracked[key]) for key in ("stop_order_id", "trailing_order_id") if tracked.get(key)}
+    tp_id = tracked.get("take_profit_order_id")
+    if not stop_ids or not tp_id:
+        return ""
+    open_ids = {
+        str(row.get("order_id"))
+        for row in (resting_rows or [])
+        if isinstance(row, dict) and row.get("order_id") is not None
+    }
+    if stop_ids & open_ids:
+        return ""                       # 止损腿还挂着 → 这次平仓不是它干的
+    if str(tp_id) not in open_ids:
+        return ""                       # 止盈也没了 → 分不清哪条腿成交
+    return "stop-loss (exchange-side fill)"
 
 
 def _record_cooldown(state: dict, symbol: str, reason: str) -> None:
@@ -706,9 +758,11 @@ def check_exit(
     最高价、空头跟踪最低价），传 0 表示禁用——交易所侧移动止损在跑时由它
     接管，两边不能同时裁决。
     """
-    entry = float(position.get("entry") or 0)
-    stop = float(stop_price or 0)
-    target = float(take_profit or 0)
+    entry = _as_float(position.get("entry")) or 0.0
+    stop = _as_float(stop_price) or 0.0
+    target = _as_float(take_profit) or 0.0
+    price = _as_float(price) or 0.0
+    trailing = _as_float(trailing) or 0.0
     if entry <= 0 or price <= 0 or stop <= 0 or target <= 0:
         return None
     side = str(position.get("side") or "long").lower()
@@ -722,10 +776,10 @@ def check_exit(
     if not long_side and price <= target:
         return f"take-profit {price:.4f} <= {target:.4f} (entry {entry:.4f})"
 
-    if not trailing or trailing <= 0:
+    if trailing <= 0:
         return None
 
-    extreme = float(position.get("peak") or entry)
+    extreme = _as_float(position.get("peak")) or entry
     if long_side:
         if price > extreme:
             position["peak"] = price
@@ -959,34 +1013,40 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
     if resting is None:
         resting = _resting_protection_orders() if legs else {}
     for symbol, broker_position in list((state.get("positions") or {}).items()):
-        price = prices.get(symbol)
+        price = _as_float(prices.get(symbol))
         if not price or price <= 0:
             continue
-        tracked = (state.get("protection") or {}).get(symbol) or {}
-        if tracked.get("stop_price") and tracked.get("take_profit"):
-            stop_price = float(tracked["stop_price"])
-            target = float(tracked["take_profit"])
+        entry = _as_float(broker_position.get("entry")) or 0.0
+        tracked = (state.get("protection") or {}).get(symbol)
+        if not isinstance(tracked, dict):
+            # 记录被写坏（手工改过/写了一半）：当没有记录处理，别让 .get 打断整轮
+            tracked = {}
+        recorded_stop = _as_float(tracked.get("stop_price"))
+        recorded_target = _as_float(tracked.get("take_profit"))
+        if recorded_stop and recorded_target:
+            stop_price, target = recorded_stop, recorded_target
         else:
             # 首次接管或本地文件丢失：用 --stop-loss/--take-profit 从入场价换算
             stop_price, target, _ = resolve_exit_levels(
                 {},
                 broker_position["side"],
-                float(broker_position["entry"]),
+                entry,
                 stop_loss_pct=stop_loss,
                 take_profit_pct=take_profit,
             )
         # ATR 夹子：脚本判定用的价位必须和交易所挂单一致，否则两边各判各的
         stop_price, floor_note = apply_stop_floor(
-            broker_position["side"], float(broker_position["entry"]), stop_price,
+            broker_position["side"], entry, stop_price,
             _atr_from_map(atr_map, symbol), stop_floor_atr,
         )
         if floor_note:
             _log({"ts": _now(), "symbol": symbol, "status": "levels-adjusted",
                   "detail": floor_note})
+        peak = _as_float((state.get("peaks") or {}).get(symbol))
         held = {
             "side": broker_position["side"],
-            "entry": broker_position["entry"],
-            "peak": (state.get("peaks") or {}).get(symbol) or broker_position["entry"],
+            "entry": entry,
+            "peak": peak or entry,
         }
         reason = check_exit(held, price, stop_price=stop_price, take_profit=target, trailing=script_trailing)
         state.setdefault("peaks", {})[symbol] = held["peak"]
@@ -999,25 +1059,31 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
             # 测试网会偶发读丢已挂的腿，照着「读到的才存在」补挂就会挂出重复单
             # （实测发生过）。交易所读取只用于「仓位已消失 → 清残留」。
             expected = set(legs)
-            tracked = (state.get("protection") or {}).get(symbol) or {}
-            current_qty = abs(float(broker_position.get("quantity") or 0))
-            recorded_qty = float(tracked.get("quantity") or 0)
+            tracked = (state.get("protection") or {}).get(symbol)
+            if not isinstance(tracked, dict):
+                tracked = {}
+            current_qty = abs(_as_float(broker_position.get("quantity")) or 0.0)
+            recorded_qty = _as_float(tracked.get("quantity")) or 0.0
             if tracked and str(tracked.get("mode") or "") != protection:
-                # 保护模式换过：用记录里的 id 撤掉旧腿（不依赖交易所列表），再按新模式挂
-                disarm_protection(_cancel_algo, state, symbol, trade=trade)
+                # 保护模式换过：撤掉旧腿（本地 id + 交易所列表），再按新模式挂
+                disarm_protection(_cancel_algo, state, symbol, trade=trade,
+                                  resting_orders=resting.get(symbol))
                 tracked = {}
             tracked_types = {leg for leg in expected if tracked.get(_LEG_KEYS[leg])}
             size_matches = recorded_qty > 0 and abs(recorded_qty - current_qty) < 1e-9
-            recorded_stop = tracked.get("stop_price")
+            recorded_stop = _as_float(tracked.get("stop_price"))
             stop_matches = (
                 recorded_stop is not None
-                and abs(float(recorded_stop) - stop_price) < 1e-9
+                and abs(recorded_stop - stop_price) < 1e-9
             )
             if tracked_types == expected and size_matches and stop_matches:
                 continue  # 记录齐全、仓位没变、止损价没被夹过 → 不查交易所、不动保护
             if tracked_types and (not size_matches or not stop_matches):
-                # 仓位数量变了（部分成交/加仓），或止损价被 ATR 夹子改过：清了重挂
-                disarm_protection(_cancel_algo, state, symbol, trade=trade)
+                # 仓位数量变了（部分成交/加仓），或止损价被 ATR 夹子改过：清了重挂。
+                # 带上交易所列表：只撤本地记录的 id 时，该品种上多挂出来的孤儿腿
+                # （例如部分撤单失败留下的）会一直活到 -4067 把保证金模式锁死。
+                disarm_protection(_cancel_algo, state, symbol, trade=trade,
+                                  resting_orders=resting.get(symbol))
                 tracked_types = set()
             missing = expected - tracked_types
             if missing:
@@ -1039,7 +1105,7 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
             continue
         # 触发：先撤交易所侧挂单，再市价平仓（避免两边同时动作）
         disarm_protection(_cancel_algo, state, symbol, trade=trade, resting_orders=resting.get(symbol))
-        quantity = abs(float(broker_position["quantity"]))
+        quantity = abs(_as_float(broker_position.get("quantity")) or 0.0)
         if quantity <= 0:
             continue
         close_side = "sell" if held["side"] == "long" else "buy"
@@ -1082,15 +1148,23 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
     except Exception as exc:  # noqa: BLE001
         _log({"ts": _now(), "round": "error", "detail": f"positions: {exc}"})
         return
-    state["positions"] = {
-        str(row.get("symbol")): {
-            "side": str(row.get("side") or ("short" if float(row.get("quantity") or 0) < 0 else "long")),
-            "quantity": float(row.get("quantity") or 0),
-            "entry": float(row.get("entry_price") or row.get("price") or 0),
+    # 券商返回的持仓逐字段过边界：任何一格是脏值（网络层偶发返回对象/字符串），
+    # 都不该让这一轮的所有持仓管理一起消失。
+    state["positions"] = {}
+    for row in raw_positions:
+        if not isinstance(row, dict) or not row.get("symbol"):
+            continue
+        quantity = _as_float(row.get("quantity")) or 0.0
+        if quantity == 0:
+            continue
+        entry = _as_float(row.get("entry_price"))
+        if entry is None:
+            entry = _as_float(row.get("price"))
+        state["positions"][str(row["symbol"])] = {
+            "side": str(row.get("side") or ("short" if quantity < 0 else "long")),
+            "quantity": quantity,
+            "entry": entry or 0.0,
         }
-        for row in raw_positions
-        if row.get("symbol") and float(row.get("quantity") or 0) != 0
-    }
 
     # 1b) 交易所侧残留：仓位已经没了，止损/止盈还挂在那儿 → 撤掉
     resting: dict[str, list[dict]] = {}
@@ -1109,6 +1183,16 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
             # 记录，下一轮又拿它当退出价。读失败时不碰保护，交给下一轮。
             stale = (set(resting) | set(state.get("protection") or {})) - set(state["positions"])
             for symbol in sorted(stale):
+                # 仓位在交易所侧消失＝保护单成交打掉的，脚本自己没参与那次平仓，
+                # 所以 _record_cooldown 都没被调用过 —— 冷却闸在这里补记，否则
+                # 「同品种止损冷却 6h」在 protection=both 下永远不生效。
+                reason = _exchange_side_stop_reason(
+                    (state.get("protection") or {}).get(symbol), resting.get(symbol)
+                )
+                if reason:
+                    _log({"ts": _now(), "symbol": symbol, "status": "cooldown",
+                          "detail": reason})
+                    _record_cooldown(state, symbol, reason)
                 _log({"ts": _now(), "symbol": symbol, "status": "cleanup",
                       "detail": "position closed; cancelling leftover protection"})
                 disarm_protection(_cancel_algo, state, symbol, trade=trade,
@@ -1556,6 +1640,39 @@ def _selftest() -> None:
     finally:
         LOG_PATH = saved_log
 
+    # 脏数值边界：状态文件/券商/LLM 给的非数值必须退化成「按缺失处理」。
+    # 实测：保护记录里 stop_price 是个对象时，float(...) 抛出的 TypeError 会
+    # 穿出 manage_positions，把整轮（所有品种的持仓管理）一起带走。
+    assert _as_float("1.5") == 1.5 and _as_float(3) == 3.0
+    assert _as_float({"a": 1}) is None and _as_float([1]) is None and _as_float("x") is None
+    assert _as_float(None) is None
+    assert _as_float(True) is None                    # bool 不算数值，别当 1.0 用
+    # 脏值进 check_exit 也不能抛，只能按「判不了」返回 None
+    assert check_exit({"side": "long", "entry": {"x": 1}}, 100.0,
+                      stop_price={"s": 1}, take_profit=None, trailing=3) is None
+    assert check_exit({"side": "long", "entry": 100.0, "peak": {"p": 1}}, 100.0,
+                      stop_price=95.0, take_profit=108.0, trailing=3) is None
+
+    # 交易所侧止损 → 下一轮补记冷却；证据不足一律不记
+    live_tp = [{"order_id": "tp1", "order_type": "take_profit_market"}]
+    stop_filled = {"stop_order_id": "s1", "trailing_order_id": "t1",
+                   "take_profit_order_id": "tp1"}
+    assert _exchange_side_stop_reason(stop_filled, live_tp) != ""
+    assert _exchange_side_stop_reason(stop_filled, live_tp + [{"order_id": "s1"}]) == ""
+    assert _exchange_side_stop_reason(stop_filled, []) == ""      # 止盈也没了 → 分不清
+    assert _exchange_side_stop_reason({}, live_tp) == ""          # 没有本地记录
+    assert _exchange_side_stop_reason("garbage", live_tp) == ""   # 记录本身是脏值
+    cd = {}
+    _record_cooldown(cd, "BTC/USDT:USDT", _exchange_side_stop_reason(stop_filled, live_tp))
+    assert "BTC/USDT:USDT" in cd.get("cooldowns", {})
+
+    # 轮次异常必须留下栈：只记 exc 时定位不到出错的那一行
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        tail = _traceback_tail()
+    assert "Traceback" in tail and "ValueError: boom" in tail, tail
+
     # 品种池参数互斥：--symbols 与 --top 同时给出必须报错，不能静默让 --top 失效
     import io
     from contextlib import redirect_stderr
@@ -1698,7 +1815,10 @@ def main() -> int:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})
                 tg_send(f"⚠️ 第 {index + 1} 轮超时（已跳过）：{exc}")
             except Exception as exc:  # noqa: BLE001 - 单轮任何异常都不能终止循环
-                _log({"ts": _now(), "round": "error", "detail": f"round failed: {exc}"})
+                # 只记 exc 时定位不到出错的那一行（实测 03:21 那条 'dict <= 0'
+                # 查了一整轮）：栈尾一起落盘，下次不用靠猜。
+                _log({"ts": _now(), "round": "error", "detail": f"round failed: {exc}",
+                      "traceback": _traceback_tail()})
                 tg_send(f"⚠️ 第 {index + 1} 轮异常（已跳过）：{exc}")
             finally:
                 signal.alarm(0)

@@ -53,7 +53,7 @@ launchd 启动的进程环境极简，所以 plist 里显式给了 `PATH`；工�
 | `~/.vibe-trading/futures_signal_log.jsonl` | **权威操作记录**：信号、下单、保护、清理、每轮状态 |
 | `~/.vibe-trading/futures_trade_state.json` | 峰谷值、已挂保护单 id、上轮持仓量 |
 
-排查优先看 jsonl：其中有 `status` 字段（`signal` / `order` / `protect` / `cancel` / `cleanup` / `idle` / `warn` / `error`）。
+排查优先看 jsonl：其中有 `status` 字段（`signal` / `order` / `protect` / `cancel` / `cleanup` / `cooldown` / `idle` / `warn` / `error`）。`cooldown` 表示「仓位是被交易所侧止损打掉的，已给该品种上冷静期」。
 
 ## 手动控制（不经过本脚本）
 
@@ -70,6 +70,7 @@ launchctl kickstart -k gui/501/$L
 - **测试网很不稳**：`exchangeInfo` 超时、`openAlgoOrders` 读空/读部分、LLM 503 都会出现。循环会跳过该轮、下一轮补；保护单是否齐全**以本地记录为准**，不依赖那个会读丢的列表接口。
 - **保护单在 Binance 的 Algo 服务里**，标准挂单接口（含 CLI/网页）看不到；查它用 SDK 的 `get_open_algo_orders` 或看 jsonl。
 - **残留清理把 trailing 一起算上**：Binance 拒绝在 symbol 还挂着单时改保证金模式（`-4067`），孤儿条件单会让那个品种再也开不出新仓。清理名单取「交易所条件单列表 ∪ 本地记录」再减去当前持仓；三种条件单都要收，漏掉 `trailing_stop_market` 就会攒下孤儿单。
+- **仓位还在、但腿对不上时也要按交易所列表清**：仓位已消失的品种走上面的并集清理；仓位**还在**但本地记录与仓位不符（数量对不上、止损价被夹过、保护模式换过）时，同样把该 symbol 交易所侧读到的腿一起撤掉再重挂 —— 否则该品种上多挂出来的孤儿腿永远清不掉。
 - 持仓真相来自券商，重启后会自动接管并补齐缺失的保护腿。
 - **止损只有一个价**：`--stop-floor-atr` 把 LLM 给的价位撑到至少 2×ATR(14,5m)，并把同一个值同时写进 state 与交易所挂单 —— 脚本判定价 == 交易所挂单价。不夹的话会出现「脚本按 0.5% 判、交易所挂 3%」，实际生效的永远是最紧那条，而且还带 5 分钟盲窗。
 - 止损止盈是**已挂在交易所**的 reduce_only 条件单，进程停了也有效。
