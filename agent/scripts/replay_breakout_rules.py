@@ -42,6 +42,10 @@ SYMBOLS = ("BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "
 #: 单笔名义额（USDT）——与线上 --max-positions 下的单笔规模同量级，便于和实盘对比。
 NOTIONAL = 300.0
 
+#: 本测试网账户实测费率（fapiPrivateGetCommissionRate）：maker 0.02% / taker 0.04%。
+#: 入场可以挂 post-only 吃 maker；止损止盈是条件市价单，只能吃 taker。
+MAKER_FEE_PCT = 0.02
+
 DEFAULT_CACHE = Path("/tmp/vibe-replay-cache")
 
 
@@ -56,27 +60,62 @@ def _load_replay():
 
 def fetch_bars(ex, ccxt_symbol: str, timeframe: str, start_ms: int, end_ms: int,
                cache_dir: Path = DEFAULT_CACHE) -> list[list[float]]:
-    """取 K 线，按「品种+周期+区间」落盘缓存；同区间重跑不再打网络。"""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache = cache_dir / f"{ccxt_symbol.replace('/', '_').replace(':', '_')}_{timeframe}_{start_ms}_{end_ms}.json"
-    if cache.exists():
-        return json.loads(cache.read_text(encoding="utf-8"))
-    bars: list[list[float]] = []
+    """取 K 线：缓存 + 只补缺的那一段，返回**请求区间内**的 bar（按时间升序）。
+
+    缓存键按小时对齐：`now` 每次跑都不同，用精确区间当键会让缓存永远不命中，
+    每跑一次都重新拉 180 页。命中后只补最后一根到 end_ms 之间的缺口。
+    """
     interval = {"1m": 60_000, "5m": 300_000}.get(timeframe, 300_000)
-    cursor = start_ms
-    while cursor < end_ms:
-        chunk = ex.fetch_ohlcv(ccxt_symbol, timeframe=timeframe, since=cursor, limit=1000)
-        if not chunk:
-            break
-        bars.extend(chunk)
-        # 每页至少推进一根：交易所若返回一根停在 since 上的 K 线，按「末根 +1ms」
-        # 推进会退化成几百万次请求（实测直接把进程挂死）。
-        cursor = max(int(chunk[-1][0]) + interval, cursor + interval)
-        time.sleep(0.15)
-    deduped = {int(bar[0]): bar for bar in bars if start_ms <= bar[0] <= end_ms}
-    ordered = [deduped[key] for key in sorted(deduped)]
-    cache.write_text(json.dumps(ordered), encoding="utf-8")
-    return ordered
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # 每个品种一个文件、只往里补缺的那段：用「品种+精确区间」当键的话，`now` 一变
+    # 键就变，每跑一次都从头拉 180 页。
+    cache = cache_dir / f"{ccxt_symbol.replace('/', '_').replace(':', '_')}_{timeframe}.json"
+    cached: list[list[float]] = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else []
+    spans: list[tuple[int, int]] = []
+    if not cached:
+        spans.append((start_ms, end_ms))
+    else:
+        if cached[0][0] > start_ms + interval:                 # 前面缺
+            spans.append((start_ms, int(cached[0][0])))
+        if cached[-1][0] < end_ms - interval:                  # 后面缺（最后一根可能未收盘）
+            spans.append((int(cached[-1][0]) + interval, end_ms))
+    fresh: list[list[float]] = []
+    for span_start, span_end in spans:
+        cursor = span_start
+        while cursor < span_end:
+            chunk = ex.fetch_ohlcv(ccxt_symbol, timeframe=timeframe, since=cursor, limit=1000)
+            if not chunk:
+                break
+            fresh.extend(chunk)
+            # 每页至少推进一根：交易所若返回一根停在 since 上的 K 线，按「末根 +1ms」
+            # 推进会退化成几百万次请求（实测直接把进程挂死）。
+            cursor = max(int(chunk[-1][0]) + interval, cursor + interval)
+            time.sleep(0.15)
+    if fresh:
+        merged = {int(bar[0]): bar for bar in cached + fresh}
+        cached = [merged[key] for key in sorted(merged)]
+        cache.write_text(json.dumps(cached), encoding="utf-8")
+    return [bar for bar in cached if start_ms <= bar[0] <= end_ms]
+
+
+def regime_series(closes: list[float], period: int = 50) -> list[bool]:
+    """逐根的 BTC 顺势标记，口径与生产 `_regime_verdict` 完全一致。
+
+    生产那份每次都要重算整段 EMA，这里改成增量推进：17k 根 5m 逐根重算会把回放
+    拖成十几分钟。正确性由测试对着 `_regime_verdict` 逐根比对。
+    """
+    flags = [False] * len(closes)
+    if len(closes) < period + 1:
+        return flags
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for idx in range(period, len(closes)):
+        ema = closes[idx] * k + ema * (1 - k)
+        lookback = min(99, idx)
+        base = closes[idx - lookback]
+        change = (closes[idx] / base - 1) * 100 if base else None
+        flags[idx] = bool(ema > 0 and closes[idx] > ema and change is not None and change > 0)
+    return flags
 
 
 def find_entries(bars: list[list[float]], symbol: str, *, lookback: int = 20, vol_ratio: float = 1.5,
@@ -123,6 +162,8 @@ def main() -> int:
     parser.add_argument("--take-profit", type=float, default=8.0, help="固定止盈%（默认 8，与线上一致）")
     parser.add_argument("--max-hold-bars", type=int, default=96, help="最长持有（根，默认 96=8h@5m）")
     parser.add_argument("--pullback-expiry", type=int, default=6, help="回踩限价单有效期（根，默认 6）")
+    parser.add_argument("--maker-expiry", default="1,6",
+                        help="post-only 入场有效期（根，逗号分隔，默认 1,6）")
     parser.add_argument("--json", default="", help="结果写出路径")
     args = parser.parse_args()
 
@@ -194,6 +235,21 @@ def main() -> int:
                                        max_hold_bars=args.max_hold_bars) for s in samples]
         variants.append(rp._summarize(f"移动止损 {trailing:g}%", results, len(samples)))
 
+    # D 组：maker 入场（就在信号价挂 post-only），出场仍吃 taker
+    maker_expiries = [int(item) for item in args.maker_expiry.split(",") if item.strip()]
+    for expiry in maker_expiries:
+        label = f"maker {expiry}根"
+        results = []
+        for s in samples:
+            outcome = rp.simulate_limit_entry(s["bars"], s["idx"], s["side"], s["price"], s["quantity"],
+                                              pullback_pct=0.0, expiry_bars=expiry,
+                                              stop_pct=max(2 * s["atr"], 0.05),
+                                              fee_pct=MAKER_FEE_PCT, exit_fee_pct=rp.FEE_PCT,
+                                              **base_bracket)
+            if outcome:
+                results.append(outcome)
+        variants.append(rp._summarize(f"入场 {label}", results, len(samples)))
+
     header = (f"{'变体':<18}{'成交':>6}{'净盈亏':>10}{'胜率':>7}{'均盈':>7}{'均亏':>7}"
               f"{'期望/笔':>9}{'止损':>6}{'移动':>6}{'超时':>6}")
     print(header)
@@ -215,6 +271,39 @@ def main() -> int:
     control = rp.bootstrap_skip_control(samples, base_bracket, pull["filled"], trials=300)
     print(f"\n对照｜随机只做 {control['keep']} 笔：均值 {control['mean']:.2f}，"
           f"5%~95% [{control['p05']:.2f}, {control['p95']:.2f}]  ← 回踩变体 {pull['net']:.2f}")
+
+    # E 组：顺势闸。与生产同口径的 BTC 标记（px>EMA50 且近 100 根涨跌>0 = risk-on）
+    btc_bars = fetch_bars(ex, "BTC/USDT:USDT", args.timeframe, start_ms, end_ms)
+    flags = regime_series([bar[4] for bar in btc_bars])
+    regime_by_ts = {int(bar[0]): flag for bar, flag in zip(btc_bars, flags)}
+    for s in samples:
+        s["risk_on"] = regime_by_ts.get(int(s["ts"]))
+    usable = [s for s in samples if s.get("risk_on") is not None]
+    ungated_net = variants[0]["net"]
+    print(f"\n顺势闸（同口径 BTC 标记，覆盖 {len(usable)}/{len(samples)} 笔；"
+          f"全量基线净 {ungated_net:+.2f}）")
+    gate_specs = (
+        ("空头闸：risk-on 不做空", lambda s: not (s["side"] == "short" and s["risk_on"])),
+        ("多头闸：risk-off 不做多", lambda s: not (s["side"] == "long" and s["risk_on"] is False)),
+        ("双闸", lambda s: not ((s["side"] == "short" and s["risk_on"])
+                                or (s["side"] == "long" and s["risk_on"] is False))),
+    )
+    for label, keep in gate_specs:
+        kept = [s for s in usable if keep(s)]
+        skipped = [s for s in usable if not keep(s)]
+        kept_row = rp._summarize(label, [rp.simulate_bracket(s["bars"], s["idx"], s["side"], s["price"],
+                                                            s["quantity"],
+                                                            stop_pct=max(2 * s["atr"], 0.05),
+                                                            **base_bracket) for s in kept], len(usable))
+        skipped_pnl = [rp.simulate_bracket(s["bars"], s["idx"], s["side"], s["price"], s["quantity"],
+                                           stop_pct=max(2 * s["atr"], 0.05), **base_bracket)["pnl"]
+                       for s in skipped]
+        ci = rp.bootstrap_mean_ci(skipped_pnl)
+        verdict = ("删的是亏损单" if ci["p95"] < 0
+                   else "删的是盈利单" if ci["p05"] > 0 else "分不出来")
+        print(f"  {label:<20} 保留 {kept_row['filled']:>4} 笔 → 净 {kept_row['net']:+8.2f}，"
+              f"期望/笔 {kept_row['expectancy']:+.3f} | 闸掉 {ci['n']:>4} 笔每笔 {ci['mean']:+.3f} "
+              f"[{ci['p05']:+.3f}, {ci['p95']:+.3f}] {verdict}")
 
     # 费前/费后：毛边小于手续费时，参数怎么调都是在给交易所打工
     base_results = [rp.simulate_bracket(s["bars"], s["idx"], s["side"], s["price"], s["quantity"],

@@ -104,10 +104,35 @@ def test_limit_entry_fills_on_pullback_or_skips(rp):
                                   pullback_pct=0.5, expiry_bars=6, **bracket)
     assert out is not None
 
-    # pullback_pct=0 等价于市价那条路
-    market = rp.simulate_limit_entry(no_dip, 0, "long", 100.0, 1.0,
-                                     pullback_pct=0.0, expiry_bars=6, **bracket)
-    assert market is not None
+    # pullback_pct=0 = 就在参考价挂 post-only：碰到即成交，碰不到就不做
+    touch = rp.simulate_limit_entry(dip, 0, "long", 100.0, 1.0,
+                                    pullback_pct=0.0, expiry_bars=6, **bracket)
+    assert touch is not None and touch["exit_price"] is not None
+    never_touched = [_bar(i, 101.0, 100.5, 100.8, 100.9) for i in range(6)]
+    assert rp.simulate_limit_entry(never_touched, 0, "long", 100.0, 1.0,
+                                   pullback_pct=0.0, expiry_bars=6, **bracket) is None
+
+
+def test_maker_entry_pays_less_on_the_entry_leg_only(rp):
+    """maker 入场 + taker 出场：两条腿费率不同，必须分开算。"""
+    bars = [_bar(0, 100, 100, 100, 100), _bar(1, 100, 102, 99.9, 101)]
+    taker = rp.simulate_bracket(bars, 0, "long", 100.0, 10.0,
+                                stop_pct=5.0, trailing_pct=0.0, take_profit_pct=2.0)
+    maker = rp.simulate_bracket(bars, 0, "long", 100.0, 10.0,
+                                stop_pct=5.0, trailing_pct=0.0, take_profit_pct=2.0,
+                                fee_pct=0.02, exit_fee_pct=0.04)
+    assert maker["gross"] == pytest.approx(taker["gross"])
+    assert maker["fees"] == pytest.approx(100.0 * 10 * 0.02 / 100 + 102.0 * 10 * 0.04 / 100)
+    assert maker["fees"] < taker["fees"]
+
+
+def test_bootstrap_mean_ci_flags_a_losing_subset(rp):
+    """被闸掉的那批单均值显著为负时，区间整体应落在 0 以下。"""
+    losing = rp.bootstrap_mean_ci([-2.0, -1.5, -2.5, -1.0, -3.0, -2.2])
+    assert losing["mean"] < 0 and losing["p95"] < 0
+    mixed = rp.bootstrap_mean_ci([1.0, -1.0])
+    assert mixed["p05"] <= 0 <= mixed["p95"]
+    assert rp.bootstrap_mean_ci([])["n"] == 0
 
 
 def test_to_five_minute_aggregates_ohlcv(rp):

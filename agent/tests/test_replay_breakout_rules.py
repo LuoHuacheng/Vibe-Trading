@@ -64,6 +64,25 @@ def test_min_gap_suppresses_back_to_back_signals(bp):
     assert len(bp.find_entries(bars, "SOL/USDT:USDT", lookback=20, vol_ratio=1.5, min_gap_bars=0)) == 2
 
 
+def test_regime_series_matches_production_verdict(bp):
+    """增量版顺势标记必须与生产 _regime_verdict 逐根一致（口径不能漂）。"""
+    import importlib.util
+
+    fl_path = Path(bp.__file__).with_name("futures_signal_loop.py")
+    spec = importlib.util.spec_from_file_location("fl_regime_under_test", fl_path)
+    fl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fl)
+
+    closes = ([100.0 + i * 0.7 for i in range(60)]          # 稳步上行 → risk-on
+              + [142.0 - i * 0.9 for i in range(60)]        # 稳步下行 → risk-off
+              + [88.0 + (i % 3) * 0.1 for i in range(60)])  # 磨平 → 涨跌为 0
+    flags = bp.regime_series(closes)
+    assert not any(flags[:50])                              # 样本不足一律 False
+    for idx in range(50, len(closes), 5):
+        assert flags[idx] == fl._regime_verdict(closes[:idx + 1])[0], idx
+    assert any(flags) and not all(flags)                    # 两种状态都出现过
+
+
 def test_fetch_bars_caches_to_disk(bp, tmp_path):
     """同区间第二次取数必须命中缓存，不再打网络。"""
     calls = []
@@ -73,11 +92,12 @@ def test_fetch_bars_caches_to_disk(bp, tmp_path):
             calls.append(since)
             return [[since, 1.0, 1.0, 1.0, 1.0, 1.0]]
 
-    start, end = 1_700_000_000_000, 1_700_000_000_000 + 900_000
+    start, end = 1_700_000_000_000, 1_700_000_000_000 + 3600_000
     first = bp.fetch_bars(_Ex(), "BTC/USDT:USDT", "5m", start, end, cache_dir=tmp_path)
+    fetched = len(calls)
     second = bp.fetch_bars(_Ex(), "BTC/USDT:USDT", "5m", start, end, cache_dir=tmp_path)
-    assert first == second and len(first) == 3
-    assert len(calls) == 3                       # 第二次没有新请求
+    assert first == second and first
+    assert len(calls) == fetched                 # 第二次一根都没重新拉
     assert list(tmp_path.glob("*.json"))         # 缓存文件确实落盘
 
 
@@ -92,7 +112,8 @@ def test_fetch_bars_advances_even_on_a_stuck_page(bp, tmp_path):
 
     start = 1_700_000_000_000
     bars = bp.fetch_bars(_Stuck(), "LTC/USDT:USDT", "5m", start, start + 1_500_000, cache_dir=tmp_path)
-    assert len(calls) <= 6                       # 每页至少推进一根，不会退化成死循环
+    # 每页至少推进一根：调用次数与窗口/周期同量级，不会退化成几百万次
+    assert len(calls) <= (1_500_000 + 3_600_000) // 300_000 + 3
     assert len(bars) == 1                        # 越界/重复的行被去重
 
 
@@ -104,4 +125,4 @@ def test_fetch_bars_dedupes_and_sorts(bp, tmp_path):
 
     start, end = 1_700_000_000_000, 1_700_000_000_000 + 300_000
     bars = bp.fetch_bars(_Ex(), "ETH/USDT:USDT", "5m", start, end, cache_dir=tmp_path)
-    assert len(bars) == 1 and bars[0][0] == start
+    assert len(bars) == 1 and start <= bars[0][0] <= end

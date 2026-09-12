@@ -161,8 +161,13 @@ def to_five_minute(bars: list[list[float]]) -> list[list[float]]:
 def simulate_bracket(bars: list[list[float]], start_idx: int, side: str, entry: float,
                      quantity: float, *, stop_pct: float, trailing_pct: float,
                      take_profit_pct: float, fee_pct: float = FEE_PCT,
+                     exit_fee_pct: float | None = None,
                      max_hold_bars: int = 480) -> dict:
-    """从 bars[start_idx] 起按三条腿模拟出场，返回一笔的完整结果。"""
+    """从 bars[start_idx] 起按三条腿模拟出场，返回一笔的完整结果。
+
+    fee_pct 是入场腿费率；exit_fee_pct 缺省与它相同。分开是为了给「maker 入场 +
+    taker 出场」（挂单省一半入场费，但止损止盈只能是市价）一个准确的口径。
+    """
     long_side = side == "long"
     stop = entry * (1 - stop_pct / 100) if long_side else entry * (1 + stop_pct / 100)
     target = entry * (1 + take_profit_pct / 100) if long_side else entry * (1 - take_profit_pct / 100)
@@ -190,7 +195,8 @@ def simulate_bracket(bars: list[list[float]], start_idx: int, side: str, entry: 
     if exit_price is None:
         exit_price = bars[end - 1][4] if end > start_idx else entry
     gross = (exit_price - entry) * quantity if long_side else (entry - exit_price) * quantity
-    fees = (entry + exit_price) * quantity * fee_pct / 100
+    exit_rate = fee_pct if exit_fee_pct is None else exit_fee_pct
+    fees = entry * quantity * fee_pct / 100 + exit_price * quantity * exit_rate / 100
     if long_side:
         mfe = (margin_high / entry - 1) * 100
         mae = (margin_low / entry - 1) * 100
@@ -203,9 +209,11 @@ def simulate_bracket(bars: list[list[float]], start_idx: int, side: str, entry: 
 
 def simulate_limit_entry(bars: list[list[float]], start_idx: int, side: str, ref_price: float,
                          quantity: float, *, pullback_pct: float, expiry_bars: int, **bracket) -> dict | None:
-    """等回踩 pullback_pct% 才成交：N 根内没碰到就跳过这笔（返回 None）。"""
-    if pullback_pct <= 0:
-        return simulate_bracket(bars, start_idx, side, ref_price, quantity, **bracket)
+    """挂限价单入场：N 根内没碰到就跳过这笔（返回 None）。
+
+    pullback_pct = 0 → 就在参考价挂 post-only（吃 maker 费，只需一个 tick 的让步）；
+    > 0 → 等回踩这么多百分点。成交价一律是限价，不假设更优的成交。
+    """
     long_side = side == "long"
     limit = ref_price * (1 - pullback_pct / 100) if long_side else ref_price * (1 + pullback_pct / 100)
     end = min(len(bars), start_idx + expiry_bars)
@@ -265,6 +273,25 @@ def paired_bootstrap_diff(samples: list[dict], bracket: dict, distance_a, distan
             "p05": means[int(0.05 * (len(means) - 1))],
             "p95": means[int(0.95 * (len(means) - 1))],
             "trials": trials}
+
+
+def bootstrap_mean_ci(values: list[float], trials: int = 2000, seed: int = 13) -> dict:
+    """一组数的均值的自助区间。
+
+    用来判定「被顺势闸挡掉的那批单」是不是真的在亏：区间整体 < 0 才说明这道闸是在
+    删亏损单，而不是把盈利单一起删掉。
+    """
+    import random
+
+    if not values:
+        return {"n": 0, "mean": 0.0, "p05": 0.0, "p95": 0.0}
+    rng = random.Random(seed)
+    means = []
+    for _ in range(trials):
+        means.append(sum(values[rng.randrange(len(values))] for _ in range(len(values))) / len(values))
+    means.sort()
+    return {"n": len(values), "mean": sum(values) / len(values),
+            "p05": means[int(0.05 * (len(means) - 1))], "p95": means[int(0.95 * (len(means) - 1))]}
 
 
 def _split_half(samples: list[dict]) -> tuple[list[dict], list[dict]]:
