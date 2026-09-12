@@ -283,3 +283,88 @@ def test_entry_log_records_signal_features(loop, monkeypatch, tmp_path):
     assert feature["take_profit"] == pytest.approx(108.0)
     assert feature["notional"] == pytest.approx(200.0)
     assert entries[0]["atr_pct"] == pytest.approx(1.0)   # 横盘 K 线：ATR 1.0/100 = 1%
+
+
+def test_place_entry_uses_post_only_then_falls_back(loop):
+    """post-only 立即成交吃 maker；被拒/超时撤单转市价；半成交补剩余。"""
+    def make_env(limit_result=None, market_price=101.0):
+        state = {"placed": [], "cancelled": []}
+
+        def place(**kwargs):
+            state["placed"].append(dict(kwargs))
+            if kwargs.get("order_type") == "limit":
+                return limit_result or {"status": "ok", "order_id": "L1", "filled": 0.0, "price": None}
+            return {"status": "ok", "order_id": "M1", "filled": kwargs.get("quantity"),
+                    "price": market_price}
+
+        def cancel(order_id):
+            state["cancelled"].append(order_id)
+            return {"status": "ok"}
+
+        return state, place, cancel
+
+    def call(place, read_order, cancel, **kwargs):
+        for key, value in (("side", "buy"), ("quantity", 2.0), ("limit_price", 100.0),
+                           ("maker", True), ("maker_wait", 1.0)):
+            kwargs.setdefault(key, value)
+        return loop.place_entry(place, read_order, cancel, sleep=lambda _s: None, **kwargs)
+
+    # 1) 立即成交 → maker，成交量/均价取自订单快照
+    state, place, cancel = make_env()
+    out = call(place, lambda _oid: {"status": "ok", "order_status": "closed",
+                                    "filled": 2.0, "average": 100.0}, cancel)
+    assert out["entry_style"] == "maker" and out["filled"] == 2.0 and out["price"] == 100.0
+    assert state["placed"][0]["post_only"] is True and state["cancelled"] == []
+
+    # 2) post-only 被拒（会立即吃单）→ 直接市价，不丢这一笔
+    state, place, cancel = make_env(limit_result={"status": "error",
+                                                  "error": "Order would immediately match and take"})
+    out = call(place, lambda _oid: {"status": "ok", "order_status": "new"}, cancel)
+    assert out["entry_style"] == "market" and "immediately match" in out["maker_reject"]
+    assert [item["order_type"] for item in state["placed"]] == ["limit", "market"]
+
+    # 3) 一直挂着 → 撤单 + 市价补全额
+    state, place, cancel = make_env()
+    out = call(place, lambda _oid: {"status": "ok", "order_status": "new", "filled": 0.0},
+               cancel, side="sell", quantity=3.0)
+    assert state["cancelled"] == ["L1"]
+    assert out["entry_style"] == "maker+market" and out["filled"] == 3.0
+
+    # 4) 半成交后超时 → maker 部分保留，缺口市价补，均价按两腿加权
+    state, place, cancel = make_env()
+
+    def partial(_oid):
+        if state["cancelled"]:
+            return {"status": "ok", "order_status": "canceled", "filled": 1.0, "average": 99.0}
+        return {"status": "ok", "order_status": "new", "filled": 1.0, "average": 99.0}
+
+    out = call(place, partial, cancel, quantity=2.0, limit_price=99.0)
+    assert out["entry_style"] == "maker+market" and out["filled"] == 2.0
+    assert out["price"] == pytest.approx((1.0 * 99.0 + 1.0 * 101.0) / 2.0)
+
+    # 5) 读状态失败 → 撤单转市价（不把仓位悬着）
+    state, place, cancel = make_env()
+    out = call(place, lambda _oid: {"status": "error", "error": "network"}, cancel, quantity=1.0)
+    assert state["cancelled"] == ["L1"] and out["entry_style"] == "maker+market"
+
+    # 6) maker 关掉 → 直接市价，不碰限价路径
+    state, place, cancel = make_env()
+    out = call(place, lambda _oid: {"status": "ok", "order_status": "new"},
+               cancel, maker=False, quantity=1.0)
+    assert out["entry_style"] == "market" and state["placed"][0]["order_type"] == "market"
+
+
+def test_maker_entry_price_uses_own_side_of_the_book(loop):
+    """买单挂买一、卖单挂卖一：挂对手价会被交易所当吃单拒绝。"""
+    class _Ex:
+        def fetch_ticker(self, symbol):
+            return {"bid": 99.5, "ask": 100.5}
+
+    assert loop.maker_entry_price(_Ex(), "BTC/USDT:USDT", "buy") == 99.5
+    assert loop.maker_entry_price(_Ex(), "BTC/USDT:USDT", "sell") == 100.5
+
+    class _Broken:
+        def fetch_ticker(self, symbol):
+            raise RuntimeError("no book")
+
+    assert loop.maker_entry_price(_Broken(), "BTC/USDT:USDT", "buy") == 0.0

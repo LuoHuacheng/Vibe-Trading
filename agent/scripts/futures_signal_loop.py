@@ -703,6 +703,77 @@ def _distance_pct(entry: float, level: float) -> float:
     return abs(level - entry) / entry * 100 if entry > 0 else 0.0
 
 
+#: post-only 入场的默认等待秒数：等到就吃 maker 费，等不到就撤单补市价。
+MAKER_ENTRY_WAIT = 15.0
+
+
+def maker_entry_price(ex, symbol: str, order_side: str) -> float:
+    """post-only 该挂哪一档：买单挂买一、卖单挂卖一。
+
+    挂在对手价会被 Binance 当成吃单整单拒绝（-5022），所以必须落在本方最优价。
+    盘口读不到就返回 0 → 调用方退回市价，不拿一笔交易去赌。
+    """
+    try:
+        ticker = ex.fetch_ticker(symbol)
+    except Exception:  # noqa: BLE001 - 盘口读不到就退回市价
+        return 0.0
+    price = _as_float((ticker or {}).get("bid" if order_side == "buy" else "ask"))
+    return price if price and price > 0 else 0.0
+
+
+def place_entry(place, read_order, cancel, *, side: str, quantity: float, limit_price: float,
+                maker: bool, maker_wait: float, sleep=time.sleep, **order_kwargs) -> dict:
+    """开仓：先试 post-only（maker 费），被拒或超时就补市价。
+
+    出场是条件市价单，只能吃 taker；只有入场这一腿能省（本账户 maker 0.02% /
+    taker 0.04%，回放里 maker 入场在 5m/1m 上成交率 99.3%~99.8%）。返回值和
+    place_order 同形状并多带 entry_style，调用方不必分支。
+    """
+    def market(**extra) -> dict:
+        extra.setdefault("quantity", quantity)
+        return place(side=side, order_type="market", **extra, **order_kwargs)
+
+    if not maker or maker_wait <= 0 or limit_price <= 0:
+        return {**market(), "entry_style": "market"}
+    posted = place(side=side, quantity=quantity, order_type="limit", limit_price=limit_price,
+                   post_only=True, **order_kwargs) or {}
+    order_id = str(posted.get("order_id") or "")
+    if str(posted.get("status")) != "ok" or not order_id:
+        # 会被立刻吃掉的单会被整单拒绝（-5022）或限价参数不合法 → 直接市价
+        return {**market(), "entry_style": "market",
+                "maker_reject": str(posted.get("error") or "")}
+    deadline = time.time() + maker_wait
+    while time.time() < deadline:
+        sleep(1.0)
+        snapshot = read_order(order_id) or {}
+        if str(snapshot.get("status")) != "ok":
+            break                        # 读不到状态就别把仓位悬着，撤单转市价
+        status = str(snapshot.get("order_status") or "").lower()
+        if status in ("closed", "filled"):
+            return {**posted, "status": "ok", "order_status": status,
+                    "filled": _as_float(snapshot.get("filled")) or quantity,
+                    "price": _as_float(snapshot.get("average")) or limit_price,
+                    "entry_style": "maker"}
+        if status in ("canceled", "cancelled", "rejected", "expired"):
+            break
+    # 超时或其他终态：撤掉剩余，缺口用市价补，别让本笔变成半仓
+    cancel(order_id)
+    final = read_order(order_id) or {}
+    maker_filled = _as_float(final.get("filled")) or 0.0
+    maker_price = _as_float(final.get("average")) or limit_price
+    remaining = max(0.0, quantity - maker_filled)
+    if remaining <= 0:
+        return {**posted, "status": "ok", "order_status": "closed", "filled": maker_filled,
+                "price": maker_price, "entry_style": "maker"}
+    top_up = market(quantity=remaining) or {}
+    market_filled = _as_float(top_up.get("filled")) or 0.0
+    market_price = _as_float(top_up.get("price")) or maker_price
+    total = maker_filled + market_filled
+    blended = (maker_filled * maker_price + market_filled * market_price) / total if total > 0 else 0.0
+    return {**top_up, "status": str(top_up.get("status") or "error"), "filled": total,
+            "price": blended, "entry_style": "maker+market", "maker_filled": maker_filled}
+
+
 def resolve_exit_levels(
     signal: dict,
     side: str,
@@ -1136,9 +1207,10 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               bars_limit: int = DEFAULT_BARS, max_positions: int = DEFAULT_MAX_POSITIONS,
               derivatives: bool = True, cooldown_hours: float = COOLDOWN_HOURS,
               long_regime_gate: bool = True,
-              stop_floor_atr: float = STOP_FLOOR_ATR) -> None:
+              stop_floor_atr: float = STOP_FLOOR_ATR,
+              maker_entry: bool = True, maker_wait: float = MAKER_ENTRY_WAIT) -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
-    from src.trading.service import place_order
+    from src.trading.service import cancel_order, get_order, place_order
 
     state = load_state()
 
@@ -1353,10 +1425,18 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
 
         order_side = "buy" if side == "long" else "sell"
         try:
-            result = place_order(
-                symbol, TRADE_PROFILE, side=order_side, quantity=quantity,
-                order_type="market", margin_mode=margin_mode, leverage=leverage,
-                session_id=f"futures-loop-{int(time.time())}",
+            def _place(**kwargs) -> dict:  # noqa: E306 - 闭包把本笔的 symbol/profile 绑好
+                return place_order(symbol, TRADE_PROFILE,
+                                   session_id=f"futures-loop-{int(time.time())}", **kwargs)
+
+            result = place_entry(
+                _place,
+                lambda order_id: get_order(order_id, TRADE_PROFILE, symbol=symbol),
+                lambda order_id: cancel_order(order_id, TRADE_PROFILE, symbol=symbol),
+                side=order_side, quantity=quantity,
+                limit_price=maker_entry_price(ex, symbol, order_side) if maker_entry else 0.0,
+                maker=maker_entry, maker_wait=maker_wait,
+                margin_mode=margin_mode, leverage=leverage,
             )
             _log({"ts": _now(), "symbol": symbol, "side": side, "quantity": quantity,
                   "status": "order", "reason": reason,
@@ -1371,6 +1451,8 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                       "notional": notional,
                   },
                   "atr_pct": _as_float(_atr_from_map(metrics, symbol)),
+                  # maker / maker+market / market：费率归因要靠它
+                  "entry_style": (result or {}).get("entry_style"),
                   "result": result})
             if str(result.get("status")) == "ok":
                 tg_send(_signal_msg(signal, result))
@@ -1761,6 +1843,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-floor-atr", dest="stop_floor_atr", type=float,
                         default=STOP_FLOOR_ATR,
                         help=f"止损距离下限（× ATR(14,5m)，默认 {STOP_FLOOR_ATR:g}，0=关闭）")
+    parser.add_argument("--no-maker-entry", action="store_true",
+                        help="关掉 post-only 入场（默认开：maker 0.02%% vs taker 0.04%%）")
+    parser.add_argument("--maker-entry-wait", dest="maker_entry_wait", type=float,
+                        default=MAKER_ENTRY_WAIT,
+                        help=f"post-only 等待秒数，超时撤单转市价（默认 {MAKER_ENTRY_WAIT:g}）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
     return parser
 
@@ -1802,6 +1889,10 @@ def main() -> int:
           f"多头顺势闸 {'关' if args.no_long_regime_gate else '开（参考 ' + REGIME_SYMBOL + '）'}")
     print(f"[futures-loop] 止损下限 {args.stop_floor_atr:g}xATR(14,5m)"
           + ("（关闭）" if args.stop_floor_atr <= 0 else ""))
+    maker_entry = not args.no_maker_entry
+    print(f"[futures-loop] 入场 "
+          + (f"post-only 挂买一/卖一，{args.maker_entry_wait:g}s 未成交则撤单转市价"
+             if maker_entry else "市价（maker 关）"))
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
 
@@ -1822,6 +1913,7 @@ def main() -> int:
                     cooldown_hours=args.cooldown_hours,
                     long_regime_gate=not args.no_long_regime_gate,
                     stop_floor_atr=args.stop_floor_atr,
+                    maker_entry=maker_entry, maker_wait=args.maker_entry_wait,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})

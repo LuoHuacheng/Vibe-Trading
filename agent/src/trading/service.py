@@ -703,6 +703,7 @@ def place_order(
     margin_mode: str | None = None,
     leverage: int | None = None,
     reduce_only: bool = False,
+    post_only: bool = False,
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -750,6 +751,10 @@ def place_order(
         place_kwargs["leverage"] = leverage
     if reduce_only:
         place_kwargs["reduce_only"] = True
+    if post_only and "post_only" in placement_params:
+        # Maker-only entries: only forwarded to connectors that declare the seam,
+        # so other brokers see the same call they always did.
+        place_kwargs["post_only"] = True
 
     if profile.environment == "paper":
         return _with_profile(profile, module.place_order(config, **place_kwargs))
@@ -777,6 +782,28 @@ def place_order(
         session_id=session_id,
     )
     return _with_profile(profile, result)
+
+
+def get_order(
+    order_id: str,
+    profile_id: str | None = None,
+    *,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Read one order's fill state through a connector profile.
+
+    Maker-only entries need it: after a post-only limit is placed the caller must
+    tell a fill from a still-resting order. Connectors without the seam return
+    the standard unsupported envelope.
+    """
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "orders.read")
+    module = _sdk_module(profile.connector)
+    if not hasattr(module, "get_order"):
+        return _unsupported(profile, "orders.read")
+    config = _sdk_config(profile, module, {})
+    return _with_profile(profile, module.get_order(config, order_id, symbol=symbol))
 
 
 def cancel_order(

@@ -801,6 +801,7 @@ def place_order(
     reduce_only: bool = False,
     stop_price: float | None = None,
     callback_rate: float | None = None,
+    post_only: bool = False,
 ) -> dict[str, Any]:
     """Place a spot or USDⓈ-M futures order via ccxt's ``create_order``.
 
@@ -879,6 +880,7 @@ def place_order(
             reduce_only=reduce_only,
             stop_price=stop_price,
             callback_rate=callback_rate,
+            post_only=post_only,
         )
 
     if (
@@ -901,6 +903,8 @@ def place_order(
     type_clean = str(order_type or "").strip().lower()
     if type_clean not in ("market", "limit"):
         return {"status": "error", "error": "order_type must be 'market' or 'limit'."}
+    if post_only and type_clean != "limit":
+        return {"status": "error", "error": "post_only is only valid for limit orders."}
 
     qty_given = quantity is not None
     notional_given = notional is not None
@@ -942,6 +946,11 @@ def place_order(
         if tif is None:
             return {"status": "error", "error": "time_in_force must be one of 'day', 'gtc', 'ioc', 'fok'."}
         params["timeInForce"] = tif
+        if post_only:
+            # Maker-only 的正确写法是 timeInForce=GTX：实测传 postOnly=True 会被
+            # ccxt/交易所静默忽略，单子照吃 taker（而 GTX 会以 -5022 整单拒绝）。
+            # 调用方据此转市价，而不是悄悄把 maker 变成 taker。
+            params["timeInForce"] = "GTX"
         amount: float | None = qty_value
         price: float | None = price_value
     elif notional_given:
@@ -992,6 +1001,7 @@ def _place_usdm_order(
     reduce_only: bool,
     stop_price: float | None = None,
     callback_rate: float | None = None,
+    post_only: bool = False,
 ) -> dict[str, Any]:
     """Place a USDⓈ-M futures order on a tradable (non-Shadow) usdm profile.
 
@@ -1017,6 +1027,10 @@ def _place_usdm_order(
         }
     conditional = type_clean in _CONDITIONAL_ORDER_TYPES
     trailing = type_clean == "trailing_stop_market"
+    if post_only and type_clean != "limit":
+        # usdm 分支在 spot 校验之前就 return 了，这条必须在这里再挡一次，
+        # 否则 post_only 会被静默忽略、当成 taker 成交。
+        return {"status": "error", "error": "post_only is only valid for limit orders."}
 
     margin_clean = str(margin_mode or "").strip().lower()
     if not margin_mode or not margin_clean:
@@ -1109,6 +1123,10 @@ def _place_usdm_order(
         if tif is None:
             return {"status": "error", "error": "time_in_force must be one of 'day', 'gtc', 'ioc', 'fok'."}
         params["timeInForce"] = tif
+        if post_only:
+            # Maker-only：USDⓈ-M 用 timeInForce=GTX（实测 postOnly=True 被静默
+            # 忽略，会以 taker 成交；GTX 才回 -5022 整单拒绝）。
+            params["timeInForce"] = "GTX"
         amount: float | None = qty_value
         price: float | None = price_value
     elif conditional:
@@ -1247,6 +1265,58 @@ def _ensure_futures_margin(ex: Any, symbol: str, margin_mode: str) -> str | None
             )
         return "could not set margin mode " + margin_mode + " on " + symbol + ": " + str(exc)
     return None
+
+
+def get_order(
+    config: BinanceConfig | None = None,
+    order_id: str = "",
+    *,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Read one order's fill state. Binance also requires the order's symbol.
+
+    Written for maker-only entries: after placing a post-only limit the caller
+    must know whether it filled (count it as the entry) or is still resting
+    (cancel it and decide). The open-order list cannot answer that — an id leaves
+    it both on a fill and on a cancel.
+
+    Returns:
+        On success: ``{"status": "ok", "order_id", "symbol", "order_status",
+        "filled", "amount", "average", "price"}``. On failure:
+        ``{"status": "error", "error": str}`` (fail-closed).
+    """
+    cfg = config or load_config()
+    order_id_clean = str(order_id or "").strip()
+    if not order_id_clean:
+        return {"status": "error", "error": "order_id is required to read an order."}
+    if symbol is None or not str(symbol).strip():
+        return {"status": "error", "error": "Binance order reads require symbol."}
+
+    try:
+        _assert_host(cfg)
+    except BinanceConfigError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    clean_symbol = normalize_futures_symbol(symbol) if cfg.market_type == "usdm" else normalize_symbol(symbol)
+    if not clean_symbol:
+        return {"status": "error", "error": f"could not resolve a valid trading pair from symbol '{symbol}'."}
+
+    try:
+        ex = _exchange(cfg)
+        order = ex.fetch_order(order_id_clean, clean_symbol)
+    except Exception as exc:  # noqa: BLE001 - surface any ccxt/auth/network error as fail-closed
+        return {"status": "error", "error": str(exc)}
+
+    return {
+        "status": "ok",
+        "order_id": str(_obj_get(order, "id", order_id_clean)),
+        "symbol": _obj_get(order, "symbol", clean_symbol),
+        "order_status": str(_obj_get(order, "status", "")),
+        "filled": _to_float(_obj_get(order, "filled")),
+        "amount": _to_float(_obj_get(order, "amount")),
+        "average": _to_float(_obj_get(order, "average")),
+        "price": _to_float(_obj_get(order, "price")),
+    }
 
 
 def cancel_order(
