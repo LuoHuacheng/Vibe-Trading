@@ -353,6 +353,46 @@ def test_place_entry_uses_post_only_then_falls_back(loop):
                cancel, maker=False, quantity=1.0)
     assert out["entry_style"] == "market" and state["placed"][0]["order_type"] == "market"
 
+    # 7) 市价腿只回 average（ccxt 的市价单 price 常是 None）→ 必须用 average 当成交价，
+    #    否则入场价会回退成限价单的价格（实测得到过 60000 这种离市价几千刀的假价）
+    state = {"placed": [], "cancelled": []}
+
+    def place2(**kwargs):
+        state["placed"].append(dict(kwargs))
+        if kwargs.get("order_type") == "limit":
+            return {"status": "ok", "order_id": "L1", "filled": 0.0, "price": None}
+        return {"status": "ok", "order_id": "M1", "filled": kwargs.get("quantity"),
+                "price": None, "average": 77200.0}
+
+    def cancel2(order_id):
+        state["cancelled"].append(order_id)
+        return {"status": "ok"}
+
+    out = call(place2, lambda _oid: {"status": "ok", "order_status": "new", "filled": 0.0},
+               cancel2, quantity=2.0, limit_price=60000.0)
+    assert out["filled"] == 2.0
+    assert out["price"] == pytest.approx(77200.0)
+
+    # 8) 连 average 都没有（实测 place_order 响应 price/average 都是 None）→
+    #    必须回读一次订单把成交价拿回来，否则入场价会变成限价单的 60000
+    state = {"placed": [], "cancelled": []}
+
+    def place3(**kwargs):
+        state["placed"].append(dict(kwargs))
+        if kwargs.get("order_type") == "limit":
+            return {"status": "ok", "order_id": "L1", "filled": 0.0, "price": None}
+        return {"status": "ok", "order_id": "M1", "filled": kwargs.get("quantity"),
+                "price": None, "average": None}
+
+    def reader(order_id):
+        if order_id == "M1":
+            return {"status": "ok", "order_status": "closed", "filled": 2.0, "average": 77200.0}
+        return {"status": "ok", "order_status": "new", "filled": 0.0}
+
+    out = call(place3, reader, cancel2, quantity=2.0, limit_price=60000.0)
+    assert out["filled"] == 2.0
+    assert out["price"] == pytest.approx(77200.0)
+
 
 def test_maker_entry_price_uses_own_side_of_the_book(loop):
     """买单挂买一、卖单挂卖一：挂对手价会被交易所当吃单拒绝。"""

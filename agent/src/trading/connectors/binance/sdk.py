@@ -983,6 +983,9 @@ def place_order(
         "filled": _obj_get(order, "filled"),
         "amount": _obj_get(order, "amount"),
         "price": _obj_get(order, "price"),
+        # 市价单的 price 常是 None/0，真实成交均价在 average 里；入场价算错会连带
+        # 把止损止盈一起算错，所以两个都带上。
+        "average": _to_float(_obj_get(order, "average")),
     }
 
 
@@ -1182,6 +1185,9 @@ def _place_usdm_order(
         "filled": _obj_get(order, "filled"),
         "amount": _obj_get(order, "amount"),
         "price": _obj_get(order, "price"),
+        # 市价单 price 常为 None，真实成交均价在 average；入场价算错会连带
+        # 把止损止盈一起算错（实测踩过：价格回退成了限价单的 60000）。
+        "average": _to_float(_obj_get(order, "average")),
         "market_type": "usdm",
     }
 

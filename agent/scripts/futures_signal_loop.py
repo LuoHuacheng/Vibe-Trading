@@ -733,14 +733,29 @@ def place_entry(place, read_order, cancel, *, side: str, quantity: float, limit_
         extra.setdefault("quantity", quantity)
         return place(side=side, order_type="market", **extra, **order_kwargs)
 
+    def fill_price(result: dict) -> float:
+        """成交均价。place_order 的响应经常不带价（实测市价单 price/average 都是
+        None），但同一订单 fetch_order 带 —— 入场价算错会把止损止盈一起算错，
+        所以缺价时补一次读单。读不到就返回 0，由调用方回退。"""
+        price = _as_float((result or {}).get("average")) or _as_float((result or {}).get("price"))
+        if price:
+            return price
+        result_id = str((result or {}).get("order_id") or "")
+        if not result_id:
+            return 0.0
+        snapshot = read_order(result_id) or {}
+        return (_as_float(snapshot.get("average")) or _as_float(snapshot.get("price")) or 0.0)
+
     if not maker or maker_wait <= 0 or limit_price <= 0:
-        return {**market(), "entry_style": "market"}
+        result = market()
+        return {**result, "price": fill_price(result) or None, "entry_style": "market"}
     posted = place(side=side, quantity=quantity, order_type="limit", limit_price=limit_price,
                    post_only=True, **order_kwargs) or {}
     order_id = str(posted.get("order_id") or "")
     if str(posted.get("status")) != "ok" or not order_id:
         # 会被立刻吃掉的单会被整单拒绝（-5022）或限价参数不合法 → 直接市价
-        return {**market(), "entry_style": "market",
+        result = market()
+        return {**result, "price": fill_price(result) or None, "entry_style": "market",
                 "maker_reject": str(posted.get("error") or "")}
     deadline = time.time() + maker_wait
     while time.time() < deadline:
@@ -767,7 +782,9 @@ def place_entry(place, read_order, cancel, *, side: str, quantity: float, limit_
                 "price": maker_price, "entry_style": "maker"}
     top_up = market(quantity=remaining) or {}
     market_filled = _as_float(top_up.get("filled")) or 0.0
-    market_price = _as_float(top_up.get("price")) or maker_price
+    # 市价腿的成交价也要读出来：缺了它会把入场价算成限价单的价（实测得到 60000
+    # 这种离市价几千刀的假价），止损止盈跟着全错。
+    market_price = fill_price(top_up) or maker_price
     total = maker_filled + market_filled
     blended = (maker_filled * maker_price + market_filled * market_price) / total if total > 0 else 0.0
     return {**top_up, "status": str(top_up.get("status") or "error"), "filled": total,
