@@ -34,6 +34,12 @@
     <string>__PROTECTION__</string>
     <string>--trailing</string>
     <string>__TRAILING__</string>
+    <string>--min-confidence</string>
+    <string>__MIN_CONFIDENCE__</string>
+    <string>--reentry-cooldown-min</string>
+    <string>__REENTRY_COOLDOWN_MIN__</string>
+    <string>--max-signals-per-round</string>
+    <string>__MAX_SIGNALS_PER_ROUND__</string>
     <string>--stop-floor-atr</string>
     <string>__STOP_FLOOR_ATR__</string>
     <string>--max-positions</string>

@@ -48,6 +48,16 @@ MAX_NOTIONAL = 1000.0
 #: 再进」：18h 窗口里 ADA 一个品种这样贡献了 -15.7，而按 6h 冷却回放能省下约 12。
 COOLDOWN_HOURS = 6.0
 
+#: 任意平仓后同品种的再入场冷却（分钟）。与 COOLDOWN_HOURS 不同：那个只认止损，
+#: 实测反复进出（不只止损那几笔）同样在烧手续费。
+REENTRY_COOLDOWN_MIN = 15.0
+
+#: 低于该置信度的信号不开仓。confidence 早先只落盘、从不作闸，低置信信号照开。
+MIN_CONFIDENCE = 0.6
+
+#: 每轮最多开几个新仓（0 = 不限）。一轮多开会把保证金一次性铺满。
+MAX_SIGNALS_PER_ROUND = 3
+
 #: 多头顺势闸的参考品种：它自己走弱时不开多。
 REGIME_SYMBOL = "BTC/USDT:USDT"
 
@@ -92,12 +102,16 @@ FIELD LEGEND (one line per symbol; chg/ema/vwap/fund/basis numbers are percentag
 - oi: open interest, oiChg: percent change since the previous round
 
 Rules:
-- Prefer setups where several fields agree (trend, position in range, volume, RSI). A single reading is not a signal.
+- Require at least THREE fields to agree (trend, position in range, volume, RSI) before any entry. One or two readings is not a signal.
 - A funding-rate extreme together with a fast oiChg is a squeeze setup, not a trend.
 - Never exceed {max_notional} USDT notional per order.
 - Respect liquidation: a stop_loss must be much closer than a realistic liquidation price.
 - Only react to clear momentum or reversal setups. When unsure, hold.
 - Orders below the exchange minimum notional are skipped by the runner, so do not size below ~100 USDT.
+- LONG only when last is above ema50 and chg20 > 0. SHORT only when last is below ema50 and chg20 < 0. A setup against that trend must be skipped, not traded.
+- take_profit must be at least 1.2x the stop_loss distance from entry. A target closer than that does not cover the fee.
+- If atr% is above 2.5, require confidence >= 0.75: wide tape is where tight stops get swept.
+- confidence must reflect how many fields agree: three fields ~0.60-0.70, four or more ~0.75+. Never output one fixed value.
 
 OUTPUT FORMAT (absolute requirement):
 Your entire reply must be ONE valid JSON object and NOTHING else.
@@ -202,7 +216,8 @@ def load_state() -> dict:
     """返回本地状态；缺失或损坏时返回空结构。
 
     结构：{"peaks": {symbol: 极值}, "protection": {symbol: 已挂腿},
-    "open_interest": {...}, "cooldowns": {symbol: 上次止损时间}}。
+    "open_interest": {...}, "cooldowns": {symbol: 上次止损时间},
+    "last_exit": {symbol: 上次平仓时间}}。
     """
     if STATE_PATH.exists():
         try:
@@ -212,10 +227,12 @@ def load_state() -> dict:
                 data.setdefault("protection", {})
                 data.setdefault("open_interest", {})
                 data.setdefault("cooldowns", {})
+                data.setdefault("last_exit", {})
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
             pass
-    return {"peaks": {}, "protection": {}, "open_interest": {}, "cooldowns": {}}
+    return {"peaks": {}, "protection": {}, "open_interest": {}, "cooldowns": {},
+            "last_exit": {}}
 
 
 def save_state(state: dict) -> None:
@@ -379,6 +396,28 @@ def _cooldown_reason(state: dict, symbol: str, cooldown_hours: float,
     return ""
 
 
+def _record_exit(state: dict, symbol: str) -> None:
+    """记下「这个品种刚平过仓」，供再入场冷却使用（任何平仓都记，不只止损）。"""
+    state.setdefault("last_exit", {})[symbol] = _now()
+
+
+def _reentry_reason(state: dict, symbol: str, cooldown_min: float,
+                    now_s: float | None = None) -> str:
+    """同品种再入场冷却闸：返回拦截原因，放行返回空串。"""
+    if cooldown_min <= 0:
+        return ""
+    recorded = (state.get("last_exit") or {}).get(symbol)
+    if not recorded:
+        return ""
+    age = _hours_since(recorded, now_s)
+    if age is None or age < 0:
+        return ""
+    minutes = age * 60.0
+    if minutes < cooldown_min:
+        return f"reentry cooldown {minutes:.1f}m/{cooldown_min:g}m since last exit"
+    return ""
+
+
 def _regime_verdict(closes: list[float]) -> tuple[bool, str]:
     """多头顺势闸判定（纯函数）：参考品种要在 EMA50 上方且窗口内为正。"""
     if len(closes) < 51:
@@ -395,6 +434,22 @@ def _regime_verdict(closes: list[float]) -> tuple[bool, str]:
     return True, f"regime ok: px/EMA50 {_rel_pct(last, ema50):+.2f}%, chg {change:+.2f}%"
 
 
+def _regime_verdict_bear(closes: list[float]) -> tuple[bool, str]:
+    """空头顺势闸判定（_regime_verdict 的镜像）：参考品种要在 EMA50 下方且窗口内为负。"""
+    if len(closes) < 51:
+        return False, "regime: not enough bars"
+    ema50 = _ema(closes, 50)
+    last = closes[-1]
+    if ema50 is None or ema50 <= 0:
+        return False, "regime: EMA50 unavailable"
+    change = _pct_change(closes, min(99, len(closes) - 1))
+    if last >= ema50:
+        return False, f"regime: px {last:.6g} >= EMA50 {ema50:.6g}"
+    if change is None or change >= 0:
+        return False, f"regime: window change {0.0 if change is None else change:+.2f}% >= 0"
+    return True, f"regime ok: px/EMA50 {_rel_pct(last, ema50):+.2f}%, chg {change:+.2f}%"
+
+
 def _long_regime_reason(ex, symbol: str = REGIME_SYMBOL) -> str:
     """多头闸取数：读不到就拦（宁可不开多，也不在弱势里开多）。"""
     try:
@@ -403,6 +458,17 @@ def _long_regime_reason(ex, symbol: str = REGIME_SYMBOL) -> str:
         return f"regime: {symbol} unreadable ({exc})"
     closes = [bar[4] for bar in (bars or [])]
     ok, detail = _regime_verdict(closes)
+    return "" if ok else detail
+
+
+def _short_regime_reason(ex, symbol: str = REGIME_SYMBOL) -> str:
+    """空头闸取数：读不到就拦（宁可不开空，也不在强势里开空）。"""
+    try:
+        bars = ex.fetch_ohlcv(symbol, timeframe="5m", limit=100)
+    except Exception as exc:  # noqa: BLE001 - 读不到按拦截处理
+        return f"regime: {symbol} unreadable ({exc})"
+    closes = [bar[4] for bar in (bars or [])]
+    ok, detail = _regime_verdict_bear(closes)
     return "" if ok else detail
 
 
@@ -722,8 +788,12 @@ def maker_entry_price(ex, symbol: str, order_side: str) -> float:
 
 
 def place_entry(place, read_order, cancel, *, side: str, quantity: float, limit_price: float,
-                maker: bool, maker_wait: float, sleep=time.sleep, **order_kwargs) -> dict:
-    """开仓：先试 post-only（maker 费），被拒或超时就补市价。
+                maker: bool, maker_wait: float, market_fallback: bool = True,
+                sleep=time.sleep, **order_kwargs) -> dict:
+    """开仓：先试 post-only（maker 费），被拒或超时按 market_fallback 决定是否补市价。
+
+    market_fallback=False 时不为了成交去吃 taker：maker 没等到就撤单放弃这一笔，
+    下一轮再说。
 
     出场是条件市价单，只能吃 taker；只有入场这一腿能省（本账户 maker 0.02% /
     taker 0.04%，回放里 maker 入场在 5m/1m 上成交率 99.3%~99.8%）。返回值和
@@ -780,6 +850,11 @@ def place_entry(place, read_order, cancel, *, side: str, quantity: float, limit_
     if remaining <= 0:
         return {**posted, "status": "ok", "order_status": "closed", "filled": maker_filled,
                 "price": maker_price, "entry_style": "maker"}
+    if not market_fallback:
+        # 关掉市价兜底：maker 没成交就放弃这一笔，别为了成交去吃 taker。
+        return {**posted, "status": "canceled", "order_status": "canceled",
+                "filled": maker_filled, "price": maker_price or None,
+                "entry_style": "maker", "maker_fallback": "skipped"}
     top_up = market(quantity=remaining) or {}
     market_filled = _as_float(top_up.get("filled")) or 0.0
     # 市价腿的成交价也要读出来：缺了它会把入场价算成限价单的价（实测得到 60000
@@ -1112,6 +1187,9 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
         recorded_stop = _as_float(tracked.get("stop_price"))
         recorded_target = _as_float(tracked.get("take_profit"))
         if recorded_stop and recorded_target:
+            # 已记录的止损是权威：不再按新 ATR 重算。ATR 每轮都在变，重算会把
+            # 止损一路推远（实测 AVAX 18:27→19:11 被推 6 次，每次都因「价位对不上
+            # → 撤腿重挂」），风险越滚越大，还留下一段无保护空窗。
             stop_price, target = recorded_stop, recorded_target
         else:
             # 首次接管或本地文件丢失：用 --stop-loss/--take-profit 从入场价换算
@@ -1122,14 +1200,15 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
                 stop_loss_pct=stop_loss,
                 take_profit_pct=take_profit,
             )
-        # ATR 夹子：脚本判定用的价位必须和交易所挂单一致，否则两边各判各的
-        stop_price, floor_note = apply_stop_floor(
-            broker_position["side"], entry, stop_price,
-            _atr_from_map(atr_map, symbol), stop_floor_atr,
-        )
-        if floor_note:
-            _log({"ts": _now(), "symbol": symbol, "status": "levels-adjusted",
-                  "detail": floor_note})
+            # ATR 夹子只在定这批价位时用一次：脚本判定用的价位必须和交易所挂单
+            # 一致，否则两边各判各的。
+            stop_price, floor_note = apply_stop_floor(
+                broker_position["side"], entry, stop_price,
+                _atr_from_map(atr_map, symbol), stop_floor_atr,
+            )
+            if floor_note:
+                _log({"ts": _now(), "symbol": symbol, "status": "levels-adjusted",
+                      "detail": floor_note})
         peak = _as_float((state.get("peaks") or {}).get(symbol))
         held = {
             "side": broker_position["side"],
@@ -1212,6 +1291,7 @@ def manage_positions(state: dict, prices: dict[str, float], *, trade: bool,
             if str(result.get("status")) == "ok":
                 # 止损类平仓 → 该品种进冷静期，别让同一个坑立刻再钓一次
                 _record_cooldown(state, symbol, reason)
+                _record_exit(state, symbol)
                 tg_send(f"🔴 平仓 {symbol}  {quantity:.6f}  — {reason}")
         except Exception as exc:  # noqa: BLE001 - 单笔失败不终止循环
             _log({"ts": _now(), "symbol": symbol, "side": close_side, "quantity": quantity,
@@ -1223,9 +1303,13 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
               margin_mode: str, leverage: int, protection: str = "fixed",
               bars_limit: int = DEFAULT_BARS, max_positions: int = DEFAULT_MAX_POSITIONS,
               derivatives: bool = True, cooldown_hours: float = COOLDOWN_HOURS,
-              long_regime_gate: bool = True,
+              long_regime_gate: bool = True, short_regime_gate: bool = True,
+              reentry_cooldown_min: float = REENTRY_COOLDOWN_MIN,
+              min_confidence: float = MIN_CONFIDENCE,
+              max_signals_per_round: int = MAX_SIGNALS_PER_ROUND,
               stop_floor_atr: float = STOP_FLOOR_ATR,
-              maker_entry: bool = True, maker_wait: float = MAKER_ENTRY_WAIT) -> None:
+              maker_entry: bool = True, maker_wait: float = MAKER_ENTRY_WAIT,
+              maker_fallback: bool = False) -> None:
     """跑一轮：先管持仓，再取信号，再（可选）开仓。"""
     from src.trading.service import cancel_order, get_order, place_order
 
@@ -1282,6 +1366,8 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                     _log({"ts": _now(), "symbol": symbol, "status": "cooldown",
                           "detail": reason})
                     _record_cooldown(state, symbol, reason)
+                # 仓位没了就是平过仓：交易所侧成交也要补记，否则再入场冷却漏这一半
+                _record_exit(state, symbol)
                 _log({"ts": _now(), "symbol": symbol, "status": "cleanup",
                       "detail": "position closed; cancelling leftover protection"})
                 disarm_protection(_cancel_algo, state, symbol, trade=trade,
@@ -1381,7 +1467,9 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         return
 
     # 4) 执行
-    long_gate: str | None = None  # 多头顺势闸（懒加载：每轮最多读一次参考品种）
+    long_gate: str | None = None    # 多头顺势闸（懒加载：每轮最多读一次参考品种）
+    short_gate: str | None = None   # 空头顺势闸（同上）
+    placed_this_round = 0
     for signal in signals:
         symbol = str(signal.get("symbol") or "").strip()
         side = str(signal.get("side") or "hold").strip().lower()
@@ -1391,6 +1479,10 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         except (TypeError, ValueError):
             notional = 0.0
 
+        if max_signals_per_round and placed_this_round >= max_signals_per_round:
+            _log({"ts": _now(), "round": "warn",
+                  "detail": f"max signals per round ({max_signals_per_round}) reached"})
+            break
         if symbol not in symbols:
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "rejected",
                   "detail": "not in universe"})
@@ -1402,16 +1494,28 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
         if side not in ("long", "short"):
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "hold", "reason": reason})
             continue
+        confidence = _as_float(signal.get("confidence"))
+        if confidence is not None and confidence < min_confidence:
+            # confidence 早先只落盘、从不作闸：低置信信号照开，是胜率的直接漏点。
+            _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
+                  "detail": f"confidence {confidence:.2f} < {min_confidence:g}"})
+            continue
         if symbol in state["positions"]:
             # 已有持仓不叠加：仓位管理交给止盈止损，避免越亏越加
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
                   "detail": "position already open"})
             continue
         blocked = _cooldown_reason(state, symbol, cooldown_hours)
+        if not blocked:
+            blocked = _reentry_reason(state, symbol, reentry_cooldown_min)
         if not blocked and side == "long" and long_regime_gate:
             if long_gate is None:
                 long_gate = _long_regime_reason(ex)
             blocked = long_gate
+        if not blocked and side == "short" and short_regime_gate:
+            if short_gate is None:
+                short_gate = _short_regime_reason(ex)
+            blocked = short_gate
         if blocked:
             _log({"ts": _now(), "symbol": symbol, "side": side, "status": "skipped",
                   "detail": blocked})
@@ -1453,8 +1557,10 @@ def run_round(ex, llm, *, trade: bool, top: int, symbols_arg: list[str],
                 side=order_side, quantity=quantity,
                 limit_price=maker_entry_price(ex, symbol, order_side) if maker_entry else 0.0,
                 maker=maker_entry, maker_wait=maker_wait,
+                market_fallback=maker_fallback,
                 margin_mode=margin_mode, leverage=leverage,
             )
+            placed_this_round += 1
             _log({"ts": _now(), "symbol": symbol, "side": side, "quantity": quantity,
                   "status": "order", "reason": reason,
                   # 信号自己的特征必须落盘：没有 confidence / 点位就无法回答
@@ -1844,7 +1950,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="不拉资金费/持仓量等衍生品上下文")
     parser.add_argument("--stop-loss", type=float, default=5.0, help="止损百分比（默认 5）")
     parser.add_argument("--take-profit", type=float, default=8.0, help="止盈百分比（默认 8）")
-    parser.add_argument("--trailing", type=float, default=3.0, help="移动止盈回撤百分比（默认 3）")
+    parser.add_argument("--trailing", type=float, default=1.5,
+                        help="移动止盈回撤百分比（默认 1.5；实测 3%% 比止损宽 3~5 倍，从不触发）")
     parser.add_argument("--leverage", type=int, default=5, help="杠杆倍数（默认 5）")
     parser.add_argument("--margin-mode", default="isolated", choices=("isolated", "cross"),
                         help="保证金模式（默认 isolated）")
@@ -1864,7 +1971,21 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="关掉 post-only 入场（默认开：maker 0.02%% vs taker 0.04%%）")
     parser.add_argument("--maker-entry-wait", dest="maker_entry_wait", type=float,
                         default=MAKER_ENTRY_WAIT,
-                        help=f"post-only 等待秒数，超时撤单转市价（默认 {MAKER_ENTRY_WAIT:g}）")
+                        help=f"post-only 等待秒数，超时按 --maker-fallback-market 处理"
+                             f"（默认 {MAKER_ENTRY_WAIT:g}）")
+    parser.add_argument("--maker-fallback-market", action="store_true",
+                        help="maker 超时后转市价（默认关：只撤单跳过，不吃 taker 费）")
+    parser.add_argument("--reentry-cooldown-min", dest="reentry_cooldown_min", type=float,
+                        default=REENTRY_COOLDOWN_MIN,
+                        help=f"任意平仓后同品种再入场冷却分钟数（默认 {REENTRY_COOLDOWN_MIN:g}，0=关闭）")
+    parser.add_argument("--min-confidence", dest="min_confidence", type=float,
+                        default=MIN_CONFIDENCE,
+                        help=f"开仓最低信号置信度（默认 {MIN_CONFIDENCE:g}，0=关闭）")
+    parser.add_argument("--max-signals-per-round", dest="max_signals_per_round", type=int,
+                        default=MAX_SIGNALS_PER_ROUND,
+                        help=f"每轮最多开仓数（默认 {MAX_SIGNALS_PER_ROUND}，0=不限）")
+    parser.add_argument("--no-short-regime-gate", action="store_true",
+                        help=f"关闭空头顺势闸（默认开：{REGIME_SYMBOL} 走强时不开空）")
     parser.add_argument("--selftest", action="store_true", help="运行离线自测（不下单不触网）")
     return parser
 
@@ -1903,12 +2024,16 @@ def main() -> int:
     print(f"[futures-loop] 品种 {universe} | 每品种 {args.bars} 根 5m | 最多同时 {args.max_positions} 仓 | "
           f"衍生品上下文 {'关' if args.no_derivatives else '开'}")
     print(f"[futures-loop] 入场闸 | 同品种止损冷却 {args.cooldown_hours:g}h | "
-          f"多头顺势闸 {'关' if args.no_long_regime_gate else '开（参考 ' + REGIME_SYMBOL + '）'}")
+          f"再入场冷却 {args.reentry_cooldown_min:g}m | 最低置信度 {args.min_confidence:g} | "
+          f"每轮上限 {args.max_signals_per_round or '∞'} 仓")
+    print(f"[futures-loop] 顺势闸 | 多头 {'关' if args.no_long_regime_gate else '开'}"
+          f" | 空头 {'关' if args.no_short_regime_gate else '开'}（参考 {REGIME_SYMBOL}）")
     print(f"[futures-loop] 止损下限 {args.stop_floor_atr:g}xATR(14,5m)"
           + ("（关闭）" if args.stop_floor_atr <= 0 else ""))
     maker_entry = not args.no_maker_entry
     print(f"[futures-loop] 入场 "
-          + (f"post-only 挂买一/卖一，{args.maker_entry_wait:g}s 未成交则撤单转市价"
+          + (f"post-only 挂买一/卖一，{args.maker_entry_wait:g}s 未成交则"
+             + ("撤单转市价" if args.maker_fallback_market else "撤单跳过（不吃 taker）")
              if maker_entry else "市价（maker 关）"))
     print(f"[futures-loop] 日志: {LOG_PATH}")
     print(f"[futures-loop] 峰值状态: {STATE_PATH}")
@@ -1929,8 +2054,13 @@ def main() -> int:
                     derivatives=not args.no_derivatives,
                     cooldown_hours=args.cooldown_hours,
                     long_regime_gate=not args.no_long_regime_gate,
+                    short_regime_gate=not args.no_short_regime_gate,
+                    reentry_cooldown_min=args.reentry_cooldown_min,
+                    min_confidence=args.min_confidence,
+                    max_signals_per_round=args.max_signals_per_round,
                     stop_floor_atr=args.stop_floor_atr,
                     maker_entry=maker_entry, maker_wait=args.maker_entry_wait,
+                    maker_fallback=args.maker_fallback_market,
                 )
             except _RoundTimeout as exc:
                 _log({"ts": _now(), "round": "timeout", "detail": f"round timed out after {round_timeout}s"})

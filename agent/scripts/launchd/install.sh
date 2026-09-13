@@ -7,8 +7,9 @@
 #   bash agent/scripts/launchd/install.sh status|restart|logs|uninstall
 #
 # 默认值：十个主流 USDT 永续 · 每 300s 一轮 · 288 轮（约 24h，跑完由 KeepAlive
-# 立刻开新一轮）· 交易所侧 both 保护（固定止损 + 移动止损 + 止盈，回调 3%）·
-# 止损距离下限 2×ATR(14,5m) · 最多同时 10 仓 · isolated 5x。
+# 立刻开新一轮）· 交易所侧 both 保护（固定止损 + 移动止损 + 止盈，回调 1.5%）·
+# 最低置信度 0.6 · 再入场冷却 15m · 每轮最多 3 仓 · 止损距离下限 2×ATR(14,5m) ·
+# 最多同时 10 仓 · isolated 5x。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +25,10 @@ SYMBOLS="BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,BNB/USDT:USDT,XRP/USDT:USDT,D
 INTERVAL=300
 RUNS=288
 PROTECTION=both
-TRAILING=3
+TRAILING=1.5
+MIN_CONFIDENCE=0.6
+REENTRY_COOLDOWN_MIN=15
+MAX_SIGNALS_PER_ROUND=3
 STOP_FLOOR_ATR=2.0
 MAX_POSITIONS=10
 LEVERAGE=5
@@ -45,6 +49,9 @@ while [ $# -gt 0 ]; do
     --runs) RUNS="$2"; shift 2 ;;
     --protection) PROTECTION="$2"; shift 2 ;;
     --trailing) TRAILING="$2"; shift 2 ;;
+    --min-confidence) MIN_CONFIDENCE="$2"; shift 2 ;;
+    --reentry-cooldown-min) REENTRY_COOLDOWN_MIN="$2"; shift 2 ;;
+    --max-signals-per-round) MAX_SIGNALS_PER_ROUND="$2"; shift 2 ;;
     --stop-floor-atr) STOP_FLOOR_ATR="$2"; shift 2 ;;
     --max-positions) MAX_POSITIONS="$2"; shift 2 ;;
     --leverage) LEVERAGE="$2"; shift 2 ;;
@@ -70,14 +77,18 @@ render() {
       -e "s|__RUNS__|$RUNS|g" \
       -e "s|__PROTECTION__|$PROTECTION|g" \
       -e "s|__TRAILING__|$TRAILING|g" \
+      -e "s|__MIN_CONFIDENCE__|$MIN_CONFIDENCE|g" \
+      -e "s|__REENTRY_COOLDOWN_MIN__|$REENTRY_COOLDOWN_MIN|g" \
+      -e "s|__MAX_SIGNALS_PER_ROUND__|$MAX_SIGNALS_PER_ROUND|g" \
       -e "s|__STOP_FLOOR_ATR__|$STOP_FLOOR_ATR|g" \
       -e "s|__MAX_POSITIONS__|$MAX_POSITIONS|g" \
       -e "s|__LEVERAGE__|$LEVERAGE|g" \
       -e "s|__MARGIN_MODE__|$MARGIN_MODE|g" > "$PLIST"
   # 精确匹配真正的占位符：模板注释里也含有 __ 形式的说明文字，不能一概而论
-  if grep -qE "__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__STOP_FLOOR_ATR__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__" "$PLIST"; then
+  placeholders="__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__MIN_CONFIDENCE__|__REENTRY_COOLDOWN_MIN__|__MAX_SIGNALS_PER_ROUND__|__STOP_FLOOR_ATR__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__"
+  if grep -qE "$placeholders" "$PLIST"; then
     echo "render left placeholders behind:" >&2
-    grep -nE "__ROOT__|__PYTHON__|__SYMBOLS__|__INTERVAL__|__RUNS__|__PROTECTION__|__TRAILING__|__STOP_FLOOR_ATR__|__MAX_POSITIONS__|__LEVERAGE__|__MARGIN_MODE__|__TRADE_FLAG__" "$PLIST" >&2
+    grep -nE "$placeholders" "$PLIST" >&2
     exit 1
   fi
 }

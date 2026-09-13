@@ -28,7 +28,11 @@ bash agent/scripts/launchd/install.sh uninstall
 | `--interval` | 300 | 每轮间隔秒数 |
 | `--runs` | 288 | 最大轮数（288 × 5 分钟 ≈ 24h）；跑完正常退出，`KeepAlive` 立刻开新一轮，状态文件续用 |
 | `--protection` | both | `fixed` / `trailing` / `both` / `off`。**默认 both**：固定止损、移动止损、止盈三条腿全挂交易所，脚本只判定不持有 |
-| `--trailing` | 3 | 移动止损回调百分比（Binance 只接受 0.1~5） |
+| `--trailing` | 1.5 | 移动止损回调百分比（Binance 只接受 0.1~5）。**别调回 3**：3% 比实际止损距离宽 3~5 倍，等于永不触发 |
+| `--min-confidence` | 0.6 | 开仓最低信号置信度。0 = 关闭。低于阈值的信号记 `skipped` 不下单 |
+| `--reentry-cooldown-min` | 15 | 任意平仓后同品种再入场冷却分钟数（止损另有 `--cooldown-hours`）。0 = 关闭 |
+| `--max-signals-per-round` | 3 | 每轮最多开仓数。0 = 不限 |
+| `--maker-fallback-market` | 关 | maker 超时后是否转市价。**默认关**：只撤单跳过，不为成交去吃 taker 费 |
 | `--stop-floor-atr` | 2 | 止损距离下限（× ATR(14,5m)）。LLM 给的止损常只有 0.07%~1.8%，落在噪声里；夹到 2×ATR 后脚本判定价与交易所挂单价一致。0 = 关闭 |
 | `--max-positions` | 10 | 同时在手最大仓位数——放大品种池前必须有这道闸 |
 | `--leverage` / `--margin-mode` | 5 / isolated | 全局生效 |

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -408,3 +409,141 @@ def test_maker_entry_price_uses_own_side_of_the_book(loop):
             raise RuntimeError("no book")
 
     assert loop.maker_entry_price(_Broken(), "BTC/USDT:USDT", "buy") == 0.0
+
+
+# ---------------------------------------------------------------- 交易闸与参数
+
+def test_parser_defaults_are_tightened(loop):
+    """移动止盈收紧到 1.5%，confidence 闸与再入场冷却默认开。"""
+    args = loop._build_parser().parse_args([])
+    assert args.trailing == pytest.approx(1.5)
+    assert args.min_confidence == pytest.approx(0.6)
+    assert args.reentry_cooldown_min == pytest.approx(15.0)
+    assert args.maker_fallback_market is False
+
+
+def test_manage_positions_keeps_recorded_stop_despite_atr_floor(loop, monkeypatch, tmp_path):
+    """已记录的止损是权威：ATR 变了也不重算，否则止损每轮被推远（实测 AVAX 重挂 6 次）。"""
+    import src.trading.service  # noqa: F401 - 先导入，才能替换它导出的 place_order
+
+    state = _empty_state()
+    state["positions"] = {SYMBOL: {"side": "long", "quantity": 1.0, "entry": 100.0}}
+    state["protection"] = {SYMBOL: {
+        "stop_price": 95.0, "take_profit": 108.0, "quantity": 1.0, "mode": "both",
+        "stop_order_id": "s1", "trailing_order_id": "t1", "take_profit_order_id": "tp1",
+    }}
+    state["peaks"] = {SYMBOL: 100.0}
+    log_path, read_log = _wire(loop, monkeypatch, tmp_path, state=state, positions=[])
+    cancelled: list[str] = []
+    armed: list[str] = []
+    monkeypatch.setattr(loop, "_cancel_algo",
+                        lambda oid, *a, **k: cancelled.append(str(oid)) or {"status": "ok"})
+    monkeypatch.setattr("src.trading.service.place_order",
+                        lambda *a, **k: armed.append(str(k.get("order_type")))
+                        or {"status": "ok", "order_id": "n-" + str(k.get("order_type"))})
+
+    loop.manage_positions(
+        state, {SYMBOL: 100.0}, trade=True, stop_loss=5.0, take_profit=8.0, trailing=1.5,
+        margin_mode="isolated", leverage=5, protection="both", resting={},
+        atr_map={SYMBOL: 5.0}, stop_floor_atr=2.0,
+    )
+
+    # 全部闸都放行时这一轮不写任何日志，文件可能不存在
+    records = read_log() if log_path.exists() else []
+    assert not [r for r in records if r.get("status") == "levels-adjusted"], records
+    assert cancelled == [], cancelled
+    assert armed == [], armed
+    assert state["protection"][SYMBOL]["stop_price"] == pytest.approx(95.0)
+
+
+def test_place_entry_can_skip_market_fallback(loop):
+    """market_fallback=False：maker 超时只撤单，不转 taker。"""
+    state = {"placed": [], "cancelled": []}
+
+    def place(**kwargs):
+        state["placed"].append(dict(kwargs))
+        return {"status": "ok", "order_id": "L1", "filled": 0.0, "price": None}
+
+    def cancel(order_id):
+        state["cancelled"].append(order_id)
+        return {"status": "ok"}
+
+    out = loop.place_entry(
+        place, lambda _o: {"status": "ok", "order_status": "new", "filled": 0.0}, cancel,
+        side="buy", quantity=2.0, limit_price=100.0, maker=True, maker_wait=1.0,
+        market_fallback=False, sleep=lambda _s: None,
+    )
+
+    assert [p["order_type"] for p in state["placed"]] == ["limit"]
+    assert state["cancelled"] == ["L1"]
+    assert out["status"] != "ok"
+    assert out["filled"] == pytest.approx(0.0)
+
+
+def test_short_regime_verdict_blocks_short_in_uptrend(loop):
+    """空头闸：BTC 在 EMA50 上方且窗口为正时不开空（本轮空头 3/3 全亏）。"""
+    down = [100.0 - i * 0.2 for i in range(80)]
+    up = [100.0 + i * 0.2 for i in range(80)]
+    ok, _ = loop._regime_verdict_bear(down)
+    blocked, detail = loop._regime_verdict_bear(up)
+    assert ok is True
+    assert blocked is False and detail
+
+
+def test_run_round_short_regime_gate_skips_short(loop, monkeypatch, tmp_path):
+    """横盘 BTC 不算空头顺势 → 空信号被闸掉，不下单。"""
+    payload = json.dumps({"signals": [{
+        "symbol": SYMBOL, "side": "short", "notional": 200, "entry": 100.0,
+        "stop_loss": 105.0, "take_profit": 92.0, "confidence": 0.9, "reason": "breakdown",
+    }]})
+    llm = SimpleNamespace(invoke=lambda prompt: SimpleNamespace(content=payload))
+    state = _empty_state()
+    _, read_log = _wire(loop, monkeypatch, tmp_path, state=state, positions=[])
+
+    loop.run_round(
+        _FakeExchange(_flat_bars()), llm, trade=True, top=10, symbols_arg=[SYMBOL],
+        stop_loss=5.0, take_profit=8.0, trailing=1.5, margin_mode="isolated",
+        leverage=5, protection="both", bars_limit=100, max_positions=10,
+        derivatives=False, cooldown_hours=6.0, long_regime_gate=False,
+        stop_floor_atr=0.0, short_regime_gate=True, min_confidence=0.0,
+    )
+
+    records = read_log()
+    assert [r for r in records if r.get("status") == "skipped"
+            and "regime" in str(r.get("detail"))], records
+    assert not [r for r in records if r.get("status") == "order"], records
+
+
+def test_reentry_cooldown_blocks_open_after_exit(loop):
+    """任意平仓后同品种冷却期内不再开（治反复进出，不只止损）。"""
+    state = {"last_exit": {SYMBOL: loop._now()}}
+    assert loop._reentry_reason(state, SYMBOL, 15.0) != ""
+    assert loop._reentry_reason(state, SYMBOL, 0.0) == ""
+    assert loop._reentry_reason({}, SYMBOL, 15.0) == ""
+    old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(timespec="seconds")
+    assert loop._reentry_reason({"last_exit": {SYMBOL: old}}, SYMBOL, 15.0) == ""
+
+
+def test_min_confidence_skips_low_confidence_signal(loop, monkeypatch, tmp_path):
+    """confidence 落盘了就必须当闸用：低于阈值的信号不下单。"""
+    payload = json.dumps({"signals": [{
+        "symbol": SYMBOL, "side": "long", "notional": 200, "entry": 100.0,
+        "stop_loss": 95.0, "take_profit": 108.0, "confidence": 0.4, "reason": "weak setup",
+    }]})
+    llm = SimpleNamespace(invoke=lambda prompt: SimpleNamespace(content=payload))
+    state = _empty_state()
+    _, read_log = _wire(loop, monkeypatch, tmp_path, state=state, positions=[])
+    monkeypatch.setattr(loop, "_long_regime_reason", lambda ex, symbol=SYMBOL: "")
+
+    loop.run_round(
+        _FakeExchange(_flat_bars()), llm, trade=True, top=10, symbols_arg=[SYMBOL],
+        stop_loss=5.0, take_profit=8.0, trailing=1.5, margin_mode="isolated",
+        leverage=5, protection="both", bars_limit=100, max_positions=10,
+        derivatives=False, cooldown_hours=6.0, long_regime_gate=True,
+        stop_floor_atr=0.0, min_confidence=0.6,
+    )
+
+    records = read_log()
+    assert [r for r in records if r.get("status") == "skipped"
+            and "confidence" in str(r.get("detail"))], records
+    assert not [r for r in records if r.get("status") == "order"], records
