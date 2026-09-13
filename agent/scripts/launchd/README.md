@@ -1,17 +1,19 @@
 # launchd 常驻：Binance USDⓈ-M 测试网合约信号循环
 
-把 `agent/scripts/futures_signal_loop.py` 装成 macOS 用户级 launchd 服务：开机/登录自启、崩溃自动重启、日志落盘。
+把 `agent/scripts/futures_signal_loop.py` 装成 macOS 用户级 launchd 服务：**手动启停**（不随登录自启）、崩溃自动重启、日志落盘。
 
 > ⚠️ **只打测试网**（`testnet.binancefuture.com`）。实盘那条路需要 mandate 门禁，本服务不含它。
 
 ## 快速开始
 
 ~~~~bash
-# 1) 先干跑观察（只分析、不下单）
-bash agent/scripts/launchd/install.sh install --dry-run
+# 1) 只安装：渲染 plist 到 ~/.vibe-trading/launchd/，不装载、不运行
+bash agent/scripts/launchd/install.sh install --dry-run   # 先干跑观察（只分析、不下单）
+bash agent/scripts/launchd/install.sh install             # 确认信号合理后切真下单（测试网）
 
-# 2) 确认信号合理后切真下单（测试网）
-bash agent/scripts/launchd/install.sh install
+# 2) 手动启动 / 停止 —— install 本身永远不启动任何东西
+bash agent/scripts/launchd/install.sh start
+bash agent/scripts/launchd/install.sh stop
 
 # 3) 看状态 / 日志 / 重启 / 卸载
 bash agent/scripts/launchd/install.sh status
@@ -42,9 +44,19 @@ bash agent/scripts/launchd/install.sh uninstall
 ## 生成的 plist
 
 - 模板：`futures_signal_loop.plist.template`（占位符 `__ROOT__`/`__PYTHON__`/`__SYMBOLS__` 等）
-- 渲染后：`~/Library/LaunchAgents/com.vibe-trading.futures-signal-loop.plist`
+- 渲染后：`~/.vibe-trading/launchd/com.vibe-trading.futures-signal-loop.plist`
 
-关键字段：`RunAtLoad`（登录自启）、`KeepAlive`（任何退出都重启）、`ThrottleInterval 30`（防重启风暴）、`ProgramArguments` 带 `-u`（stdout 不缓冲，日志实时）。
+**刻意不放 `~/Library/LaunchAgents/`。** launchd 只在登录时自动装载那个目录里的 plist，所以放进去就等于"登录自启"。放 `~/.vibe-trading/launchd/` 则相反：没人显式 `launchctl bootstrap` 它就不存在，重启后也不会自己回来。
+
+关键字段：
+
+- `RunAtLoad` = `false`：装载不等于运行。
+- `KeepAlive` = `true`：任何退出都重启（`--runs` 跑完算"一轮结束"，不是"该停"）。
+  ⚠️ 实测坑：**`KeepAlive` 一在，launchd 会在任务"一被装载"时立刻启动它，`RunAtLoad=false` 拦不住**（`KeepAlive` 写成 `{SuccessfulExit: true}` 也一样）。
+  所以唯一的运行入口是 `start`（bootstrap），`stop` 必须用 `bootout` —— 单纯 `kill` 进程会被 KeepAlive 立刻拉回来。
+- `ThrottleInterval 30`（防重启风暴）、`ProgramArguments` 带 `-u`（stdout 不缓冲，日志实时）。
+
+`install` 和 `uninstall` 都会顺手清掉旧位置 `~/Library/LaunchAgents/com.vibe-trading.futures-signal-loop.plist`（老版本装在那里，留着它登录照样跑）；`status` 若发现旧文件还在会告警。
 
 launchd 启动的进程环境极简，所以 plist 里显式给了 `PATH`；工作目录设为仓库根，脚本据此解析 `agent/.env` 与 `~/.vibe-trading`。
 
@@ -63,10 +75,10 @@ launchd 启动的进程环境极简，所以 plist 里显式给了 `PATH`；工�
 
 ~~~~bash
 L=com.vibe-trading.futures-signal-loop
+P=~/.vibe-trading/launchd/$L.plist
 launchctl print gui/501/$L | head -20
-launchctl bootout   gui/501/$L
-launchctl bootstrap gui/501 ~/Library/LaunchAgents/$L.plist
-launchctl kickstart -k gui/501/$L
+launchctl bootstrap gui/501 "$P"   # 启动（KeepAlive 会让它立刻跑）
+launchctl bootout   gui/501/$L     # 停止（kill 无效，会被 KeepAlive 拉回来）
 ~~~~
 
 ## 已知运行时特性

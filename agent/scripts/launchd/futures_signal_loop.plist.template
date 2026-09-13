@@ -52,10 +52,18 @@
 
   <key>WorkingDirectory</key>
   <string>__ROOT__</string>
+  <!-- 不随登录自启：这份 plist 渲染到 ~/.vibe-trading/launchd/，不是
+       ~/Library/LaunchAgents/。launchd 只在登录时自动装载后者，所以放在前者
+       意味着「没人 bootstrap 就不存在」。RunAtLoad 保持 false：装载不等于运行，
+       真正的启动入口只有一个 —— install.sh start。
+       不要把它拷进 ~/Library/LaunchAgents/，原因见下面 KeepAlive。 -->
   <key>RunAtLoad</key>
-  <true/>
+  <false/>
   <!-- Restart on any exit: the loop is bounded by --runs, so a clean exit
-       means "a cycle finished", not "stay down". -->
+       means "a cycle finished", not "stay down".
+       坑：KeepAlive=true 会让 launchd 在「任务一被装载」时立刻启动它（实测
+       RunAtLoad=false 也拦不住），所以这份 plist 一旦放进 ~/Library/LaunchAgents/
+       就等于登录自启。这也是它必须放在 ~/.vibe-trading/launchd/ 的原因。 -->
   <key>KeepAlive</key>
   <true/>
   <key>ThrottleInterval</key>
